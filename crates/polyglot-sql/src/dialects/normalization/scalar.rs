@@ -7528,6 +7528,31 @@ pub(super) fn rewrite(
                                         inferred_type: None,
                                     })))
                                 }
+                                DialectType::DataFusion
+                                    if source == DialectType::Snowflake
+                                        && f.name.eq_ignore_ascii_case("ARRAY_CONTAINS") =>
+                                {
+                                    // Snowflake ARRAY_CONTAINS(value, array) has the
+                                    // opposite arg order to DataFusion's
+                                    // array_contains(array, element). Swap, and drop a
+                                    // `value::VARIANT` cast (no VARIANT type in DataFusion).
+                                    let mut args = f.args;
+                                    let array = args.pop().unwrap();
+                                    let value = match args.pop().unwrap() {
+                                        Expression::Cast(c)
+                                            if matches!(&c.to,
+                                                crate::expressions::DataType::Custom { name }
+                                                if name.eq_ignore_ascii_case("VARIANT")) =>
+                                        {
+                                            (*c).this
+                                        }
+                                        other => other,
+                                    };
+                                    Ok(Expression::Function(Box::new(Function::new(
+                                        "array_contains".to_string(),
+                                        vec![array, value],
+                                    ))))
+                                }
                                 _ => Ok(Expression::Function(Box::new(Function::new(
                                     "ARRAY_CONTAINS".to_string(),
                                     f.args,
@@ -11035,9 +11060,11 @@ pub(super) fn rewrite(
                         _ => Ok(Expression::CombinedParameterizedAgg(cpa)),
                     }
                 } else if let Expression::ToNumber(tn) = e {
-                    // TO_NUMBER(x) with no format/precision/scale -> CAST(x AS DOUBLE)
+                    // TO_NUMBER(x) -> CAST(x AS DOUBLE); TRY_TO_NUMBER(x) -> TRY_CAST
+                    // (safe form returns NULL on non-numeric input instead of erroring).
+                    let is_safe = tn.safe.is_some();
                     let arg = *tn.this;
-                    Ok(Expression::Cast(Box::new(crate::expressions::Cast {
+                    let cast = crate::expressions::Cast {
                         this: arg,
                         to: crate::expressions::DataType::Double {
                             precision: None,
@@ -11048,7 +11075,12 @@ pub(super) fn rewrite(
                         format: None,
                         default: None,
                         inferred_type: None,
-                    })))
+                    };
+                    if is_safe {
+                        Ok(Expression::TryCast(Box::new(cast)))
+                    } else {
+                        Ok(Expression::Cast(Box::new(cast)))
+                    }
                 } else {
                     Ok(e)
                 }
