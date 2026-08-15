@@ -630,6 +630,49 @@ fn is_default_presto_date_format(fmt: &str) -> bool {
     fmt == "%Y-%m-%d" || fmt == "%F"
 }
 
+/// Whether `e` is a lone, unquoted, unqualified `ALL` — how DuckDB's
+/// `ORDER BY ALL` keyword is parsed (as a column/identifier/var, not a keyword).
+#[cfg(feature = "transpile")]
+fn is_order_by_all_marker(e: &Expression) -> bool {
+    match e {
+        Expression::Column(c) => {
+            c.table.is_none() && !c.name.quoted && c.name.name.eq_ignore_ascii_case("all")
+        }
+        Expression::Identifier(i) => !i.quoted && i.name.eq_ignore_ascii_case("all"),
+        Expression::Var(v) => v.this.eq_ignore_ascii_case("all"),
+        _ => false,
+    }
+}
+
+/// Expand DuckDB `ORDER BY ALL` into positional `ORDER BY 1..n` over the
+/// projection list (universally supported), preserving the sort direction.
+/// Left untouched when the projection has a star — the column count is unknown.
+#[cfg(feature = "transpile")]
+fn expand_duckdb_order_by_all(
+    mut sel: Box<crate::expressions::Select>,
+) -> Box<crate::expressions::Select> {
+    use crate::expressions::{Expression as E, Ordered};
+    let matches = sel.order_by.as_ref().is_some_and(|ob| {
+        ob.expressions.len() == 1 && is_order_by_all_marker(&ob.expressions[0].this)
+    });
+    let expandable =
+        !sel.expressions.is_empty() && !sel.expressions.iter().any(|e| matches!(e, E::Star(_)));
+    if matches && expandable {
+        let n = sel.expressions.len() as i64;
+        let ob = sel.order_by.as_mut().unwrap();
+        let (desc, nulls_first) = (ob.expressions[0].desc, ob.expressions[0].nulls_first);
+        ob.expressions = (1..=n)
+            .map(|i| {
+                let mut o = Ordered::asc(E::number(i));
+                o.desc = desc;
+                o.nulls_first = nulls_first;
+                o
+            })
+            .collect();
+    }
+    sel
+}
+
 /// Applies a transform function bottom-up through an entire expression tree.
 ///
 /// The public entrypoint uses an explicit task stack for the recursion-heavy shapes
@@ -2286,6 +2329,22 @@ where
             Expression::ArrayPosition(f)
         }
 
+        // Single-child typed variants a dialect arm may restructure: descend into
+        // `this` so the child is fully transformed (and normalized) first — e.g.
+        // `array_size(array_construct(1,2,3))` needs its inner `array_construct`
+        // lowered to `[1,2,3]` before the outer node is rewritten. (`Dot` is
+        // deliberately not here: descending into it generically regresses
+        // qualified references and CAST-to-struct types on other targets, so a
+        // dialect arm that needs it descends explicitly.)
+        Expression::ArraySize(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::ArraySize(f)
+        }
+        Expression::LastDay(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::LastDay(f)
+        }
+
         // Pass through leaf nodes unchanged
         other => other,
     };
@@ -3391,7 +3450,26 @@ impl Dialect {
         target: T,
         opts: TranspileOptions,
     ) -> Result<Vec<String>> {
-        target.with_dialect(|td| self.transpile_inner(sql, td, &opts))
+        target.with_dialect(|td| self.transpile_inner(sql, td, &opts, None))
+    }
+
+    /// Transpile with a schema for **type-aware disambiguation**. Column types
+    /// from `schema` are inferred onto the AST (via `annotate_types`) before the
+    /// target transform, so dialect rewrites can consult `inferred_type` — e.g.
+    /// `len(list_col)` lowers to `array_length` rather than the string `length`.
+    /// Requires the `semantic` feature (type inference lives there).
+    #[cfg(all(feature = "transpile", feature = "semantic"))]
+    pub fn transpile_with_schema<T: TranspileTarget>(
+        &self,
+        sql: &str,
+        target: T,
+        opts: TranspileOptions,
+        schema: &dyn crate::schema::Schema,
+    ) -> Result<Vec<String>> {
+        let source = self.dialect_type;
+        let annotate =
+            |e: &mut Expression| crate::optimizer::annotate_types(e, Some(schema), Some(source));
+        target.with_dialect(|td| self.transpile_inner(sql, td, &opts, Some(&annotate)))
     }
 
     #[cfg(feature = "transpile")]
@@ -3400,6 +3478,10 @@ impl Dialect {
         sql: &str,
         target_dialect: &Dialect,
         opts: &TranspileOptions,
+        // Optional per-statement annotation applied before the target transform
+        // (used for schema-aware type inference). Kept as a closure so this
+        // signature does not reference the `semantic`-gated schema/optimizer types.
+        annotate: Option<&dyn Fn(&mut Expression)>,
     ) -> Result<Vec<String>> {
         let mut effective_opts = opts.clone();
         effective_opts.complexity_guard =
@@ -3428,6 +3510,16 @@ impl Dialect {
         expressions
             .into_iter()
             .map(|expr| {
+                // Schema-aware transpilation: apply the optional annotation pass
+                // (type inference) so target rewrites can disambiguate
+                // type-dependent forms (e.g. `len(list_col)` -> `array_length`).
+                let expr = if let Some(annotate) = annotate {
+                    let mut e = expr;
+                    annotate(&mut e);
+                    e
+                } else {
+                    expr
+                };
                 // DuckDB source: normalize VARCHAR/CHAR to TEXT (DuckDB doesn't support
                 // VARCHAR length constraints). This emulates Python sqlglot's DuckDB parser
                 // where VARCHAR_LENGTH = None and VARCHAR maps to TEXT.
@@ -3438,6 +3530,10 @@ impl Dialect {
                             Ok(Expression::DataType(DT::Text))
                         }
                         Expression::DataType(DT::Char { .. }) => Ok(Expression::DataType(DT::Text)),
+                        // DuckDB `ORDER BY ALL` -> positional `ORDER BY 1..n`.
+                        Expression::Select(sel) => {
+                            Ok(Expression::Select(expand_duckdb_order_by_all(sel)))
+                        }
                         _ => Ok(e),
                     })?
                 } else {
