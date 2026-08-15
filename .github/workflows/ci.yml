@@ -53,7 +53,10 @@ jobs:
 
   rust-test:
     needs: quality
-    runs-on: ubuntu-latest
+    # Larger GitHub-hosted runner (16 GB RAM, 150 GB SSD). The standard runner's
+    # small disk was exhausted by the accumulated debug+release target dirs during
+    # the FFI release build (killed with exit 143).
+    runs-on: ubuntu-latest-m
     env:
       POLYGLOT_API_CONTRACT: ${{ github.workspace }}/docs/api-capabilities.json
     steps:
