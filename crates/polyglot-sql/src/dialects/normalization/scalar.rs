@@ -11060,16 +11060,34 @@ pub(super) fn rewrite(
                         _ => Ok(Expression::CombinedParameterizedAgg(cpa)),
                     }
                 } else if let Expression::ToNumber(tn) = e {
-                    // TO_NUMBER(x) -> CAST(x AS DOUBLE); TRY_TO_NUMBER(x) -> TRY_CAST
-                    // (safe form returns NULL on non-numeric input instead of erroring).
+                    // TO_NUMBER(x) -> CAST(x AS <numeric>); TRY_TO_NUMBER(x) ->
+                    // TRY_CAST (safe form returns NULL on bad input instead of erroring).
+                    //
+                    // Snowflake's default TO_NUMBER type is NUMBER(38,0) — an integer,
+                    // so e.g. TO_NUMBER('3.5') = 4. Match that with DECIMAL(38,0) only
+                    // for `snowflake -> datafusion`: the rounding is a Snowflake *source*
+                    // semantic (Oracle/Teradata TO_NUMBER keep the fraction), and this
+                    // arm only runs for the no-precision/scale form (see the
+                    // GenericFunctionNormalize dispatch in normalization/mod.rs), so the
+                    // default (38,0) is the only case. Every other source/target pairing
+                    // keeps the historical DOUBLE lowering.
                     let is_safe = tn.safe.is_some();
+                    let to =
+                        if source == DialectType::Snowflake && target == DialectType::DataFusion {
+                            crate::expressions::DataType::Decimal {
+                                precision: Some(38),
+                                scale: Some(0),
+                            }
+                        } else {
+                            crate::expressions::DataType::Double {
+                                precision: None,
+                                scale: None,
+                            }
+                        };
                     let arg = *tn.this;
                     let cast = crate::expressions::Cast {
                         this: arg,
-                        to: crate::expressions::DataType::Double {
-                            precision: None,
-                            scale: None,
-                        },
+                        to,
                         double_colon_syntax: false,
                         trailing_comments: Vec::new(),
                         format: None,

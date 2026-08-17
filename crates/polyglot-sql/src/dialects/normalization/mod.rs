@@ -86,8 +86,7 @@ pub(super) fn normalize(
     let expr = statements::normalize_root(expr, &context);
 
     transform_recursive(expr, &|e| {
-        if matches!(source, DialectType::DataFusion) && matches!(target, DialectType::DuckDB)
-        {
+        if matches!(source, DialectType::DataFusion) && matches!(target, DialectType::DuckDB) {
             if let Expression::Function(ref function) = e {
                 if function.name.eq_ignore_ascii_case("NOW") && function.args.is_empty() {
                     return Ok(Expression::CurrentTimestamp(

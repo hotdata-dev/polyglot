@@ -601,3 +601,48 @@ fn test_snowflake_put_long_path_stage_uuid() {
         result.err()
     );
 }
+
+/// TO_NUMBER's default type is Snowflake's NUMBER(38,0); for the DataFusion
+/// target it must lower to DECIMAL(38,0) (so TO_NUMBER('3.5') rounds to 4),
+/// but only for a Snowflake source — Oracle/Teradata TO_NUMBER keep the
+/// fraction, and every other target keeps the historical DOUBLE lowering.
+#[test]
+fn to_number_decimal_only_for_snowflake_to_datafusion() {
+    let sf_df = transpile(
+        "SELECT TO_NUMBER('3.5') AS v",
+        DialectType::Snowflake,
+        DialectType::DataFusion,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        sf_df.contains("DECIMAL(38, 0)") || sf_df.contains("DECIMAL(38,0)"),
+        "snowflake->datafusion should cast to DECIMAL(38,0), got: {sf_df}"
+    );
+
+    // Snowflake -> non-DataFusion target keeps DOUBLE.
+    let sf_duck = transpile(
+        "SELECT TO_NUMBER('3.5') AS v",
+        DialectType::Snowflake,
+        DialectType::DuckDB,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        sf_duck.to_uppercase().contains("DOUBLE"),
+        "snowflake->duckdb should keep DOUBLE, got: {sf_duck}"
+    );
+
+    // Non-Snowflake source -> DataFusion keeps DOUBLE (no NUMBER(38,0) rounding).
+    let oracle_df = transpile(
+        "SELECT TO_NUMBER('3.5') AS v",
+        DialectType::Oracle,
+        DialectType::DataFusion,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        oracle_df.to_uppercase().contains("DOUBLE"),
+        "oracle->datafusion should keep DOUBLE, got: {oracle_df}"
+    );
+}
