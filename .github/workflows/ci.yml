@@ -160,7 +160,11 @@ jobs:
 
   go-sdk:
     needs: rust-test
-    runs-on: ubuntu-latest
+    # Larger GitHub-hosted runner (16 GB RAM, 150 GB SSD), matching rust-test:
+    # the "Build FFI for Go integration tests" step below runs the same
+    # `ffi_release` build, whose target dir exhausted the standard runner's small
+    # disk and killed the job with exit 143.
+    runs-on: ubuntu-latest-m
     env:
       POLYGLOT_API_CONTRACT: ${{ github.workspace }}/docs/api-capabilities.json
     steps:
