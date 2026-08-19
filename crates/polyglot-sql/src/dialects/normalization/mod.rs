@@ -2329,6 +2329,18 @@ pub(super) fn normalize(
                             | DialectType::Teradata => Action::None,
                             _ => Action::Scalar(scalar::Action::GenericFunctionNormalize),
                         }
+                    } else if tn.safe.is_some()
+                        && tn.format.is_none()
+                        && tn.precision.is_none()
+                        && tn.scale.is_none()
+                        && matches!(target, DialectType::DataFusion)
+                    {
+                        // TRY_TO_NUMBER(x) single-arg: DataFusion (the hotdata engine
+                        // target) has no TRY_TO_NUMBER, so lower it like the non-safe form.
+                        // The scalar rewrite emits TRY_CAST(x AS DECIMAL(38,0)) for a
+                        // Snowflake source, TRY_CAST(x AS DOUBLE) otherwise. Other targets
+                        // keep upstream's native TRY_TO_NUMBER pass-through below.
+                        Action::Scalar(scalar::Action::GenericFunctionNormalize)
                     } else {
                         Action::None
                     }
