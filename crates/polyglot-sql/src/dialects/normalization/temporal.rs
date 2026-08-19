@@ -11,6 +11,7 @@ use crate::expressions::*;
 #[derive(Debug)]
 pub(super) enum Action {
     PostgresDatePartForTsql,
+    SnowflakeCurrentToClickHouse,
     ConvertTimezoneToExpr,
     EpochConvert,
     EpochMsConvert,
@@ -57,6 +58,7 @@ pub(super) fn rewrite(
     let expression = (|| -> Result<Expression> {
         match action {
             Action::PostgresDatePartForTsql => rewrite_postgres_date_part_for_tsql(e),
+            Action::SnowflakeCurrentToClickHouse => rewrite_snowflake_current_to_clickhouse(e),
             Action::ConvertTimezoneToExpr => {
                 // Convert Function("CONVERT_TIMEZONE", args) to Expression::ConvertTimezone
                 // This prevents Redshift's transform_expr from expanding 2-arg to 3-arg with 'UTC'
@@ -2712,6 +2714,80 @@ pub(super) fn rewrite(
     })()?;
 
     Ok(RewriteOutcome::Rewritten(expression))
+}
+
+fn rewrite_snowflake_current_to_clickhouse(expression: Expression) -> Result<Expression> {
+    fn default_precision() -> Expression {
+        Expression::number(9)
+    }
+
+    fn now64(precision: Expression, trailing_comments: Vec<String>) -> Expression {
+        let mut function = Function::new("now64".to_string(), vec![precision]);
+        function.trailing_comments = trailing_comments;
+        Expression::Function(Box::new(function))
+    }
+
+    fn time64(precision: Expression, trailing_comments: Vec<String>) -> Expression {
+        let current = now64(precision.clone(), Vec::new());
+        let mut function = Function::new("toTime64".to_string(), vec![current, precision]);
+        function.trailing_comments = trailing_comments;
+        Expression::Function(Box::new(function))
+    }
+
+    let rewritten = match expression {
+        Expression::CurrentTimestamp(current) => now64(
+            current
+                .precision
+                .map(|precision| Expression::number(precision.into()))
+                .unwrap_or_else(default_precision),
+            Vec::new(),
+        ),
+        Expression::CurrentTimestampLTZ(current) => now64(
+            current
+                .precision
+                .map(|precision| Expression::number(precision.into()))
+                .unwrap_or_else(default_precision),
+            Vec::new(),
+        ),
+        Expression::Localtimestamp(current) => now64(
+            current
+                .this
+                .map(|precision| *precision)
+                .unwrap_or_else(default_precision),
+            Vec::new(),
+        ),
+        Expression::CurrentTime(current) => time64(
+            current
+                .precision
+                .map(|precision| Expression::number(precision.into()))
+                .unwrap_or_else(default_precision),
+            Vec::new(),
+        ),
+        Expression::Localtime(current) => time64(
+            current
+                .this
+                .map(|precision| *precision)
+                .unwrap_or_else(default_precision),
+            Vec::new(),
+        ),
+        Expression::Function(function) => {
+            let mut function = *function;
+            let name = function.name.to_ascii_uppercase();
+            let precision = function
+                .args
+                .drain(..)
+                .next()
+                .unwrap_or_else(default_precision);
+            if matches!(name.as_str(), "CURRENT_TIME" | "LOCALTIME") {
+                time64(precision, function.trailing_comments)
+            } else {
+                now64(precision, function.trailing_comments)
+            }
+        }
+        other => other,
+    };
+
+    Ok(rewritten)
 }
 
 #[derive(Debug, Clone, Copy)]

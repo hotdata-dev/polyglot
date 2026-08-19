@@ -1048,3 +1048,42 @@ fn test_validate_with_schema_valid_aliases_in_join_on() {
     );
     assert!(result.valid, "{:?}", result.errors);
 }
+
+#[test]
+fn test_validate_with_schema_accepts_struct_field_access_issue_408() {
+    let schema: ValidationSchema = serde_json::from_value(serde_json::json!({
+        "tables": [{
+            "name": "source_table",
+            "columns": [
+                {"name": "nested_items", "type": "STRUCT(field_value VARCHAR)[]"},
+                {"name": "composite_value", "type": "STRUCT(field_value VARCHAR, label VARCHAR)"}
+            ]
+        }]
+    }))
+    .expect("schema");
+    let options = SchemaValidationOptions::default();
+
+    for sql in [
+        "SELECT composite_value.field_value AS output_value FROM source_table",
+        "SELECT item.field_value AS output_value FROM source_table s \
+         CROSS JOIN UNNEST(s.nested_items) AS expanded(item)",
+    ] {
+        let result = validate_with_schema(sql, DialectType::DuckDB, &schema, &options);
+        assert!(
+            result.valid,
+            "validation failed for {sql:?}: {:?}",
+            result.errors
+        );
+    }
+
+    let negative = validate_with_schema(
+        "SELECT missing.field_value FROM source_table",
+        DialectType::DuckDB,
+        &schema,
+        &options,
+    );
+    assert!(!negative.valid);
+    assert!(negative.errors.iter().any(|error| {
+        error.code == validation_codes::E_UNRESOLVED_REFERENCE && error.message.contains("missing")
+    }));
+}

@@ -5,12 +5,12 @@
 //! need the full AST or full lineage graph should continue using those lower
 //! level APIs directly.
 
-use crate::ast_transforms::get_output_column_names;
+use crate::ast_transforms::get_output_column_names_for_dialect;
 use crate::dialects::{Dialect, DialectType};
 use crate::expressions::{DataType, Expression, JoinKind, TableRef, With};
 use crate::lineage::{lineage_by_index_from_expression, LineageNode};
 use crate::optimizer::annotate_types::annotate_types;
-use crate::optimizer::qualify_columns::{qualify_columns, QualifyColumnsOptions};
+use crate::optimizer::qualify_schema_aware_expression;
 use crate::schema::{MappingSchema, Schema};
 use crate::scope::{build_scope, Scope, SourceInfo, SourceKind};
 use crate::traversal::{contains_aggregate, ExpressionWalk};
@@ -193,13 +193,14 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
         .map(|schema| analysis_mapping_schema(schema, options.dialect));
     let schema_info = options.schema.as_ref().map(AnalysisSchemaInfo::from_schema);
     let cte_facts = top_level_cte_facts(&original_expression, options.dialect)?;
-    let star_projections = star_projection_facts(&original_expression, mapping_schema.as_ref());
+    let star_projections = star_projection_facts(
+        &original_expression,
+        mapping_schema.as_ref(),
+        options.dialect,
+    );
 
     if let Some(schema) = mapping_schema.as_ref() {
-        let qualify_options = QualifyColumnsOptions::new()
-            .with_dialect(options.dialect)
-            .with_allow_partial(true);
-        expression = qualify_columns(expression, schema, &qualify_options)
+        expression = qualify_schema_aware_expression(expression, schema, Some(options.dialect))
             .map_err(|e| Error::internal(format!("query analysis qualification failed: {e}")))?;
     }
 
@@ -234,8 +235,8 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
             options.dialect,
             &nullability_context,
         ),
-        relations: relation_facts(&scope, mapping_schema.as_ref()),
-        base_tables: base_table_facts(&scope, mapping_schema.as_ref()),
+        relations: relation_facts(&scope, mapping_schema.as_ref(), options.dialect),
+        base_tables: base_table_facts(&scope, mapping_schema.as_ref(), options.dialect),
         star_projections,
         set_operations: set_operation_facts(&expression, &scope, options.dialect),
     })
@@ -338,7 +339,7 @@ fn top_level_cte_facts(expression: &Expression, dialect: DialectType) -> Result<
                     .map(|column| column.name.clone())
                     .collect(),
                 body_sql: Dialect::get(dialect).generate(&cte.this)?,
-                output_columns: get_output_column_names(&cte.this),
+                output_columns: get_output_column_names_for_dialect(&cte.this, Some(dialect)),
             })
         })
         .collect()
@@ -347,6 +348,7 @@ fn top_level_cte_facts(expression: &Expression, dialect: DialectType) -> Result<
 fn star_projection_facts(
     expression: &Expression,
     mapping_schema: Option<&MappingSchema>,
+    dialect: DialectType,
 ) -> Vec<StarProjectionFact> {
     let scope = build_scope(expression);
     let ordered_sources = ordered_source_names_for_query(expression);
@@ -361,8 +363,13 @@ fn star_projection_facts(
             }
 
             let table = projection_star_table(inner);
-            let expanded_columns =
-                expanded_star_columns(table.as_deref(), &scope, &ordered_sources, mapping_schema);
+            let expanded_columns = expanded_star_columns(
+                table.as_deref(),
+                &scope,
+                &ordered_sources,
+                mapping_schema,
+                dialect,
+            );
 
             Some(StarProjectionFact {
                 index,
@@ -378,6 +385,7 @@ fn expanded_star_columns(
     scope: &Scope,
     ordered_sources: &[String],
     mapping_schema: Option<&MappingSchema>,
+    dialect: DialectType,
 ) -> Vec<String> {
     let mut columns = Vec::new();
     let mut source_names: Vec<String> = if ordered_sources.is_empty() {
@@ -409,7 +417,7 @@ fn expanded_star_columns(
             }
         }
 
-        columns.extend(source_columns(source, mapping_schema));
+        columns.extend(source_columns(source, mapping_schema, dialect));
     }
 
     columns
@@ -627,14 +635,14 @@ fn projection_facts_for_query(
     dialect: DialectType,
     nullability_context: &NullabilityContext<'_>,
 ) -> Vec<ProjectionFact> {
-    let expressions = select_expressions_for_query(expression);
-    let names = get_output_column_names(expression);
+    let expressions = projection_sources_for_query(expression, dialect);
+    let names = get_output_column_names_for_dialect(expression, Some(dialect));
 
     expressions
         .iter()
         .enumerate()
-        .map(|(index, projection)| {
-            projection_fact(
+        .map(|(index, (projection, null_padded))| {
+            let mut fact = projection_fact(
                 index,
                 names
                     .get(index)
@@ -645,9 +653,129 @@ fn projection_facts_for_query(
                 scope,
                 dialect,
                 nullability_context,
-            )
+            );
+            if *null_padded {
+                fact.nullability = ProjectionNullability::Nullable;
+            }
+            fact
         })
         .collect()
+}
+
+/// Return one representative projection for each result ordinal together with
+/// whether any immediate name-aligned branch contributes a synthetic NULL.
+fn projection_sources_for_query(
+    expression: &Expression,
+    dialect: DialectType,
+) -> Vec<(&Expression, bool)> {
+    match crate::set_operation::set_operation_layout(expression, Some(dialect)) {
+        Ok(Some(layout)) => layout
+            .outputs
+            .iter()
+            .filter_map(|output| {
+                let null_padded = output.left_ordinal.is_none() || output.right_ordinal.is_none();
+                output
+                    .left_ordinal
+                    .and_then(|ordinal| {
+                        projection_source_for_ordinal(
+                            set_operation_left(expression)?,
+                            ordinal,
+                            dialect,
+                        )
+                    })
+                    .or_else(|| {
+                        output.right_ordinal.and_then(|ordinal| {
+                            projection_source_for_ordinal(
+                                set_operation_right(expression)?,
+                                ordinal,
+                                dialect,
+                            )
+                        })
+                    })
+                    .map(|(projection, nested_null_padded)| {
+                        (projection, null_padded || nested_null_padded)
+                    })
+            })
+            .collect(),
+        _ => select_expressions_for_query(expression)
+            .into_iter()
+            .map(|projection| (projection, false))
+            .collect(),
+    }
+}
+
+fn projection_source_for_ordinal(
+    expression: &Expression,
+    ordinal: usize,
+    dialect: DialectType,
+) -> Option<(&Expression, bool)> {
+    match crate::set_operation::set_operation_layout(expression, Some(dialect)) {
+        Ok(Some(layout)) => {
+            let output = layout.outputs.get(ordinal)?;
+            let null_padded = output.left_ordinal.is_none() || output.right_ordinal.is_none();
+            output
+                .left_ordinal
+                .and_then(|child_ordinal| {
+                    projection_source_for_ordinal(
+                        set_operation_left(expression)?,
+                        child_ordinal,
+                        dialect,
+                    )
+                })
+                .or_else(|| {
+                    output.right_ordinal.and_then(|child_ordinal| {
+                        projection_source_for_ordinal(
+                            set_operation_right(expression)?,
+                            child_ordinal,
+                            dialect,
+                        )
+                    })
+                })
+                .map(|(projection, nested_null_padded)| {
+                    (projection, null_padded || nested_null_padded)
+                })
+        }
+        _ => match expression {
+            Expression::Select(select) => select
+                .expressions
+                .get(ordinal)
+                .map(|projection| (projection, false)),
+            Expression::Union(union) => {
+                projection_source_for_ordinal(&union.left, ordinal, dialect)
+            }
+            Expression::Intersect(intersect) => {
+                projection_source_for_ordinal(&intersect.left, ordinal, dialect)
+            }
+            Expression::Except(except) => {
+                projection_source_for_ordinal(&except.left, ordinal, dialect)
+            }
+            Expression::Subquery(subquery) => {
+                projection_source_for_ordinal(&subquery.this, ordinal, dialect)
+            }
+            Expression::Paren(paren) => {
+                projection_source_for_ordinal(&paren.this, ordinal, dialect)
+            }
+            _ => None,
+        },
+    }
+}
+
+fn set_operation_left(expression: &Expression) -> Option<&Expression> {
+    match expression {
+        Expression::Union(set_op) => Some(&set_op.left),
+        Expression::Intersect(set_op) => Some(&set_op.left),
+        Expression::Except(set_op) => Some(&set_op.left),
+        _ => None,
+    }
+}
+
+fn set_operation_right(expression: &Expression) -> Option<&Expression> {
+    match expression {
+        Expression::Union(set_op) => Some(&set_op.right),
+        Expression::Intersect(set_op) => Some(&set_op.right),
+        Expression::Except(set_op) => Some(&set_op.right),
+        _ => None,
+    }
 }
 
 fn select_expressions_for_query(expression: &Expression) -> Vec<&Expression> {
@@ -1223,10 +1351,11 @@ fn dedupe_column_refs(refs: Vec<ColumnReferenceFact>) -> Vec<ColumnReferenceFact
 fn relation_facts(
     scope: &Scope,
     mapping_schema: Option<&crate::schema::MappingSchema>,
+    dialect: DialectType,
 ) -> Vec<RelationFact> {
     let mut relations = Vec::new();
     let mut seen = HashSet::new();
-    collect_relation_facts(scope, mapping_schema, &mut seen, &mut relations);
+    collect_relation_facts(scope, mapping_schema, dialect, &mut seen, &mut relations);
 
     relations.sort_by(|left, right| {
         left.name
@@ -1239,6 +1368,7 @@ fn relation_facts(
 fn collect_relation_facts(
     scope: &Scope,
     mapping_schema: Option<&crate::schema::MappingSchema>,
+    dialect: DialectType,
     seen: &mut HashSet<String>,
     relations: &mut Vec<RelationFact>,
 ) {
@@ -1252,7 +1382,7 @@ fn collect_relation_facts(
                 .unwrap_or_else(|| source_name.clone()),
             alias: source.alias.clone().or_else(|| source_alias(source)),
             kind: source.kind,
-            columns: source_columns(source, mapping_schema),
+            columns: source_columns(source, mapping_schema, dialect),
             catalog: identity
                 .as_ref()
                 .and_then(|identity| identity.catalog.clone()),
@@ -1271,18 +1401,19 @@ fn collect_relation_facts(
     }
 
     for branch_scope in &scope.union_scopes {
-        collect_relation_facts(branch_scope, mapping_schema, seen, relations);
+        collect_relation_facts(branch_scope, mapping_schema, dialect, seen, relations);
     }
 }
 
 fn base_table_facts(
     scope: &Scope,
     mapping_schema: Option<&crate::schema::MappingSchema>,
+    dialect: DialectType,
 ) -> Vec<RelationFact> {
     let mut relations = Vec::new();
     let mut seen = HashSet::new();
 
-    collect_base_table_facts(scope, mapping_schema, &mut seen, &mut relations);
+    collect_base_table_facts(scope, mapping_schema, dialect, &mut seen, &mut relations);
 
     relations.sort_by(|left, right| left.name.cmp(&right.name));
     relations
@@ -1291,6 +1422,7 @@ fn base_table_facts(
 fn collect_base_table_facts(
     scope: &Scope,
     mapping_schema: Option<&crate::schema::MappingSchema>,
+    dialect: DialectType,
     seen: &mut HashSet<String>,
     relations: &mut Vec<RelationFact>,
 ) {
@@ -1308,7 +1440,7 @@ fn collect_base_table_facts(
                 name: identity.name,
                 alias: source.alias.clone().or_else(|| source_alias(source)),
                 kind: SourceKind::Table,
-                columns: source_columns(source, mapping_schema),
+                columns: source_columns(source, mapping_schema, dialect),
                 catalog: identity.catalog,
                 schema: identity.schema,
                 table: identity.table,
@@ -1324,13 +1456,14 @@ fn collect_base_table_facts(
         .chain(scope.derived_table_scopes.iter())
         .chain(scope.subquery_scopes.iter())
     {
-        collect_base_table_facts(child_scope, mapping_schema, seen, relations);
+        collect_base_table_facts(child_scope, mapping_schema, dialect, seen, relations);
     }
 }
 
 fn source_columns(
     source: &SourceInfo,
     mapping_schema: Option<&crate::schema::MappingSchema>,
+    dialect: DialectType,
 ) -> Vec<String> {
     match &source.expression {
         Expression::Table(table) => mapping_schema
@@ -1339,14 +1472,18 @@ fn source_columns(
         Expression::Select(_)
         | Expression::Union(_)
         | Expression::Intersect(_)
-        | Expression::Except(_) => get_output_column_names(&source.expression),
-        Expression::Subquery(subquery) => get_output_column_names(&subquery.this),
+        | Expression::Except(_) => {
+            get_output_column_names_for_dialect(&source.expression, Some(dialect))
+        }
+        Expression::Subquery(subquery) => {
+            get_output_column_names_for_dialect(&subquery.this, Some(dialect))
+        }
         Expression::Cte(cte) if !cte.columns.is_empty() => cte
             .columns
             .iter()
             .map(|column| column.name.clone())
             .collect(),
-        Expression::Cte(cte) => get_output_column_names(&cte.this),
+        Expression::Cte(cte) => get_output_column_names_for_dialect(&cte.this, Some(dialect)),
         _ => Vec::new(),
     }
 }
@@ -1421,7 +1558,7 @@ fn collect_set_operation_facts(
                 kind: "union".to_string(),
                 all: union.all,
                 distinct: union.distinct,
-                output_columns: get_output_column_names(expression),
+                output_columns: get_output_column_names_for_dialect(expression, Some(dialect)),
                 branches: set_operation_branches(
                     &union.left,
                     &union.right,
@@ -1438,7 +1575,7 @@ fn collect_set_operation_facts(
                 kind: "intersect".to_string(),
                 all: intersect.all,
                 distinct: intersect.distinct,
-                output_columns: get_output_column_names(expression),
+                output_columns: get_output_column_names_for_dialect(expression, Some(dialect)),
                 branches: set_operation_branches(
                     &intersect.left,
                     &intersect.right,
@@ -1455,7 +1592,7 @@ fn collect_set_operation_facts(
                 kind: "except".to_string(),
                 all: except.all,
                 distinct: except.distinct,
-                output_columns: get_output_column_names(expression),
+                output_columns: get_output_column_names_for_dialect(expression, Some(dialect)),
                 branches: set_operation_branches(
                     &except.left,
                     &except.right,

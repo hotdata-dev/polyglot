@@ -50,6 +50,7 @@ pub mod resolver;
 pub mod schema;
 #[cfg(feature = "semantic")]
 pub mod scope;
+mod set_operation;
 #[cfg(feature = "time")]
 pub mod time;
 pub mod tokens;
@@ -1012,6 +1013,18 @@ mod validation_tests {
         assert!(result.errors.iter().any(|error| error.code == "W001"));
         assert!(result.errors.iter().any(|error| error.code == "W002"));
         assert!(result.errors.iter().any(|error| error.code == "W004"));
+
+        let median_result = validate_with_options(
+            "SELECT category, MEDIAN(price) FROM products",
+            DialectType::DuckDB,
+            &options,
+        );
+
+        assert!(median_result.valid, "Warnings must not invalidate SQL");
+        assert!(median_result
+            .errors
+            .iter()
+            .any(|error| error.code == "W002"));
     }
 
     #[test]

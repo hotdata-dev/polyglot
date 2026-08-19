@@ -62,6 +62,7 @@ fn java_to_strptime_format(fmt: &str) -> String {
 #[derive(Debug)]
 pub(super) enum Action {
     GreatestLeastNull,
+    SnowflakeRoundToClickHouse,
     BigQueryFunctionNormalize,
     BigQueryToHexBare,
     BigQueryToHexLower,
@@ -132,8 +133,26 @@ pub(super) fn rewrite(
                     inferred_type: None,
                 })))
             }
+            Action::SnowflakeRoundToClickHouse => {
+                let args = match e {
+                    Expression::Round(round) => {
+                        let mut args = vec![round.this];
+                        if let Some(decimals) = round.decimals {
+                            args.push(decimals);
+                        }
+                        args
+                    }
+                    Expression::Function(function) => function.args,
+                    _ => unreachable!(
+                        "action only triggered for Snowflake ROUND function expressions"
+                    ),
+                };
+                normalize_round_to_clickhouse(args, source, target, context.strict)
+            }
 
-            Action::BigQueryFunctionNormalize => normalize_bigquery_function(e, source, target),
+            Action::BigQueryFunctionNormalize => {
+                normalize_bigquery_function(e, source, target, context.strict)
+            }
 
             Action::BigQueryToHexBare => {
                 // Not used anymore - handled directly in normalize_bigquery_function
@@ -1427,17 +1446,25 @@ pub(super) fn rewrite(
                                     ))))
                                 }
                                 DialectType::ClickHouse => {
-                                    let func_name = if is_text {
-                                        "JSONExtractString"
+                                    if is_text && matches!(source, DialectType::PostgreSQL) {
+                                        Ok(
+                                            super::json::build_clickhouse_nullable_json_text_extract(
+                                                json_expr, args,
+                                            ),
+                                        )
                                     } else {
-                                        "JSONExtractRaw"
-                                    };
-                                    let mut new_args = vec![json_expr];
-                                    new_args.extend(args);
-                                    Ok(Expression::Function(Box::new(Function::new(
-                                        func_name.to_string(),
-                                        new_args,
-                                    ))))
+                                        let func_name = if is_text {
+                                            "JSONExtractString"
+                                        } else {
+                                            "JSONExtractRaw"
+                                        };
+                                        let mut new_args = vec![json_expr];
+                                        new_args.extend(args);
+                                        Ok(Expression::Function(Box::new(Function::new(
+                                            func_name.to_string(),
+                                            new_args,
+                                        ))))
+                                    }
                                 }
                                 _ => {
                                     let func_name = if is_text {
@@ -3434,6 +3461,18 @@ pub(super) fn rewrite(
                                 None
                             };
                             match target {
+                                DialectType::ClickHouse
+                                    if matches!(source, DialectType::Snowflake) =>
+                                {
+                                    operators::snowflake_regexp_like_to_clickhouse(
+                                        crate::expressions::RegexpFunc {
+                                            this: str_expr,
+                                            pattern,
+                                            flags,
+                                        },
+                                        context,
+                                    )
+                                }
                                 DialectType::DuckDB => {
                                     let mut new_args = vec![str_expr, pattern];
                                     if let Some(fl) = flags {
@@ -12355,10 +12394,305 @@ pub(super) fn rewrite(
     Ok(RewriteOutcome::Rewritten(expression))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumericKind {
+    Float,
+    Decimal,
+    Integer,
+    Unknown,
+}
+
+pub(super) fn data_type_numeric_kind(data_type: &DataType) -> NumericKind {
+    match data_type {
+        DataType::Float { .. } | DataType::Double { .. } => NumericKind::Float,
+        DataType::Decimal { .. } => NumericKind::Decimal,
+        DataType::TinyInt { .. }
+        | DataType::SmallInt { .. }
+        | DataType::Int { .. }
+        | DataType::BigInt { .. } => NumericKind::Integer,
+        DataType::Nullable { inner } => data_type_numeric_kind(inner),
+        DataType::Custom { name } => match name.to_ascii_uppercase().as_str() {
+            "FLOAT" | "FLOAT32" | "FLOAT64" | "DOUBLE" | "DOUBLE PRECISION" | "REAL" => {
+                NumericKind::Float
+            }
+            "NUMERIC" | "BIGNUMERIC" | "DECIMAL" | "BIGDECIMAL" | "NUMBER" => NumericKind::Decimal,
+            "INT" | "INT32" | "INT64" | "INTEGER" | "BIGINT" | "SMALLINT" => NumericKind::Integer,
+            _ => NumericKind::Unknown,
+        },
+        _ => NumericKind::Unknown,
+    }
+}
+
+fn combine_numeric_kinds(left: NumericKind, right: NumericKind) -> NumericKind {
+    use NumericKind::*;
+    match (left, right) {
+        (Float, _) | (_, Float) => Float,
+        (Decimal, Decimal | Integer) | (Integer, Decimal) => Decimal,
+        (Integer, Integer) => Integer,
+        _ => Unknown,
+    }
+}
+
+pub(super) fn expression_numeric_kind(expression: &Expression) -> NumericKind {
+    match expression {
+        Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast) => {
+            data_type_numeric_kind(&cast.to)
+        }
+        Expression::Literal(literal) => match literal.as_ref() {
+            Literal::Number(number) if number.contains(['e', 'E']) => NumericKind::Float,
+            Literal::Number(number) if number.contains('.') => NumericKind::Decimal,
+            Literal::Number(_) | Literal::HexNumber(_) => NumericKind::Integer,
+            _ => NumericKind::Unknown,
+        },
+        Expression::Paren(paren) => expression_numeric_kind(&paren.this),
+        Expression::Alias(alias) => expression_numeric_kind(&alias.this),
+        Expression::Neg(unary) => expression_numeric_kind(&unary.this),
+        Expression::Add(binary)
+        | Expression::Sub(binary)
+        | Expression::Mul(binary)
+        | Expression::Mod(binary) => combine_numeric_kinds(
+            expression_numeric_kind(&binary.left),
+            expression_numeric_kind(&binary.right),
+        ),
+        Expression::Div(binary) => {
+            let combined = combine_numeric_kinds(
+                expression_numeric_kind(&binary.left),
+                expression_numeric_kind(&binary.right),
+            );
+            if combined == NumericKind::Integer {
+                NumericKind::Float
+            } else {
+                combined
+            }
+        }
+        _ => expression
+            .inferred_type()
+            .map(data_type_numeric_kind)
+            .unwrap_or(NumericKind::Unknown),
+    }
+}
+
+fn normalize_round_to_clickhouse(
+    mut args: Vec<Expression>,
+    source: DialectType,
+    target: DialectType,
+    strict: bool,
+) -> Result<Expression> {
+    let input_kind = expression_numeric_kind(&args[0]);
+    if args.len() <= 2 {
+        if strict && input_kind == NumericKind::Float {
+            let feature = if matches!(source, DialectType::BigQuery) {
+                "BigQuery ROUND over FLOAT64 uses half-away-from-zero rounding, which ClickHouse cannot preserve"
+            } else {
+                "Snowflake ROUND over floating-point input uses half-away-from-zero rounding, which ClickHouse cannot preserve"
+            };
+            return Err(crate::error::Error::unsupported(
+                feature,
+                target.to_string(),
+            ));
+        }
+        if strict && input_kind == NumericKind::Unknown {
+            let feature = if matches!(source, DialectType::BigQuery) {
+                "BigQuery ROUND with an unresolved input type cannot be preserved"
+            } else {
+                "Snowflake ROUND with an unresolved input type cannot be preserved"
+            };
+            return Err(crate::error::Error::unsupported(
+                feature,
+                target.to_string(),
+            ));
+        }
+        return Ok(Expression::Function(Box::new(Function::new(
+            "ROUND".to_string(),
+            args,
+        ))));
+    }
+
+    if args.len() == 3 {
+        let x = args.remove(0);
+        let n = args.remove(0);
+        let mode = args.remove(0);
+        let mode_name = match &mode {
+            Expression::Literal(literal) => match literal.as_ref() {
+                Literal::String(value) => Some(value.to_ascii_uppercase()),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        if matches!(
+            mode_name.as_deref(),
+            Some("ROUND_HALF_EVEN" | "HALF_TO_EVEN")
+        ) {
+            return Ok(Expression::Function(Box::new(Function::new(
+                "roundBankers".to_string(),
+                vec![x, n],
+            ))));
+        }
+        if matches!(
+            mode_name.as_deref(),
+            Some("ROUND_HALF_AWAY_FROM_ZERO" | "HALF_AWAY_FROM_ZERO")
+        ) && matches!(input_kind, NumericKind::Decimal | NumericKind::Integer)
+        {
+            return Ok(Expression::Function(Box::new(Function::new(
+                "ROUND".to_string(),
+                vec![x, n],
+            ))));
+        }
+        if strict {
+            let source_name = if matches!(source, DialectType::Snowflake) {
+                "Snowflake"
+            } else {
+                "BigQuery"
+            };
+            return Err(crate::error::Error::unsupported(
+                format!("{source_name} ROUND mode cannot be preserved for ClickHouse"),
+                target.to_string(),
+            ));
+        }
+
+        // ClickHouse has no three-argument ROUND form. In permissive mode,
+        // retain an executable best-effort expression and drop the mode.
+        return Ok(Expression::Function(Box::new(Function::new(
+            "ROUND".to_string(),
+            vec![x, n],
+        ))));
+    }
+
+    Ok(Expression::Function(Box::new(Function::new(
+        "ROUND".to_string(),
+        args,
+    ))))
+}
+
+fn bigquery_safe_divide_numeric_kind(left: &Expression, right: &Expression) -> NumericKind {
+    let combined = combine_numeric_kinds(
+        expression_numeric_kind(left),
+        expression_numeric_kind(right),
+    );
+    if combined == NumericKind::Integer {
+        NumericKind::Float
+    } else {
+        combined
+    }
+}
+
+fn ensure_double_expression(expression: Expression) -> Expression {
+    if matches!(
+        &expression,
+        Expression::Cast(cast) if data_type_numeric_kind(&cast.to) == NumericKind::Float
+    ) {
+        expression
+    } else {
+        Expression::Cast(Box::new(Cast {
+            this: expression,
+            to: DataType::Double {
+                precision: None,
+                scale: None,
+            },
+            trailing_comments: Vec::new(),
+            double_colon_syntax: false,
+            format: None,
+            default: None,
+            inferred_type: None,
+        }))
+    }
+}
+
+fn clickhouse_safe_float_divide(left: Expression, right: Expression) -> Expression {
+    let left = ensure_double_expression(left);
+    let right = ensure_double_expression(right);
+    let quotient = Expression::Div(Box::new(BinaryOp::new(left.clone(), right.clone())));
+    let function = |name: &str, argument: Expression| {
+        Expression::Function(Box::new(Function::new(name.to_string(), vec![argument])))
+    };
+
+    // BigQuery only permits a non-finite result from non-finite inputs. ClickHouse
+    // returns non-finite Float64 values for zero division and finite overflow, so
+    // distinguish those errors from NaN/infinity propagation by inspecting both
+    // the operands and the quotient.
+    let input_is_nan = Expression::Or(Box::new(BinaryOp::new(
+        function("isNaN", left.clone()),
+        function("isNaN", right.clone()),
+    )));
+    let non_nan_inputs = Expression::Not(Box::new(UnaryOp {
+        this: Expression::Paren(Box::new(Paren {
+            this: input_is_nan,
+            trailing_comments: Vec::new(),
+        })),
+        inferred_type: None,
+    }));
+    let denominator_is_zero = Expression::Eq(Box::new(BinaryOp::new(
+        right.clone(),
+        Expression::number(0),
+    )));
+    let finite_inputs = Expression::And(Box::new(BinaryOp::new(
+        function("isFinite", left),
+        function("isFinite", right),
+    )));
+    let quotient_is_not_finite = Expression::Not(Box::new(UnaryOp {
+        this: function("isFinite", quotient.clone()),
+        inferred_type: None,
+    }));
+    let finite_overflow = Expression::And(Box::new(BinaryOp::new(
+        finite_inputs,
+        quotient_is_not_finite,
+    )));
+    let arithmetic_error = Expression::Or(Box::new(BinaryOp::new(
+        denominator_is_zero,
+        finite_overflow,
+    )));
+    let condition = Expression::And(Box::new(BinaryOp::new(
+        non_nan_inputs,
+        Expression::Paren(Box::new(Paren {
+            this: arithmetic_error,
+            trailing_comments: Vec::new(),
+        })),
+    )));
+
+    Expression::IfFunc(Box::new(IfFunc {
+        condition,
+        true_value: Expression::Null(Null),
+        false_value: Some(quotient),
+        original_name: None,
+        inferred_type: None,
+    }))
+}
+
+fn clickhouse_timestamp_literal_out_of_range(expression: &Expression) -> bool {
+    let value = match expression {
+        Expression::Literal(literal) => match literal.as_ref() {
+            Literal::String(value)
+            | Literal::Date(value)
+            | Literal::Timestamp(value)
+            | Literal::Datetime(value) => value,
+            _ => return false,
+        },
+        _ => return false,
+    };
+
+    value
+        .get(..4)
+        .and_then(|year| year.parse::<u32>().ok())
+        .is_some_and(|year| !(1900..=2299).contains(&year))
+}
+
+fn clickhouse_constant_timezone(expression: &Expression) -> bool {
+    matches!(
+        expression,
+        Expression::Literal(literal)
+            if matches!(
+                literal.as_ref(),
+                Literal::String(_) | Literal::RawString(_) | Literal::TripleQuotedString(_, _)
+            )
+    )
+}
+
 pub(super) fn normalize_bigquery_function(
     e: Expression,
     source: DialectType,
     target: DialectType,
+    strict: bool,
 ) -> Result<Expression> {
     use crate::expressions::{BinaryOp, Cast, DataType, Function, Identifier, Literal, Paren};
 
@@ -13679,6 +14013,30 @@ pub(super) fn normalize_bigquery_function(
         "SAFE_DIVIDE" if args.len() == 2 => {
             let x = args.remove(0);
             let y = args.remove(0);
+
+            if matches!(target, DialectType::ClickHouse) {
+                match bigquery_safe_divide_numeric_kind(&x, &y) {
+                    NumericKind::Float => {
+                        return Ok(clickhouse_safe_float_divide(x, y));
+                    }
+                    NumericKind::Decimal | NumericKind::Unknown if strict => {
+                        let detail =
+                            if bigquery_safe_divide_numeric_kind(&x, &y) == NumericKind::Decimal {
+                                "decimal"
+                            } else {
+                                "unresolved"
+                            };
+                        return Err(crate::error::Error::unsupported(
+                            format!(
+                                "BigQuery SAFE_DIVIDE with {detail} operand types cannot be preserved"
+                            ),
+                            target.to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+
             // Wrap x and y in parens if they're complex expressions
             let y_ref = match &y {
                 Expression::Column(_) | Expression::Literal(_) | Expression::Identifier(_) => {
@@ -14757,6 +15115,46 @@ pub(super) fn normalize_bigquery_function(
         // TIMESTAMP(x) -> CAST(x AS TIMESTAMP WITH TIME ZONE) for Presto
         // TIMESTAMP(x, tz) -> CAST(x AS TIMESTAMP) AT TIME ZONE tz for DuckDB
         "TIMESTAMP" => {
+            if matches!(target, DialectType::ClickHouse) && matches!(args.len(), 1 | 2) {
+                let arg = args.remove(0);
+                if strict && clickhouse_timestamp_literal_out_of_range(&arg) {
+                    return Err(crate::error::Error::unsupported(
+                        "BigQuery TIMESTAMP literal is outside ClickHouse DateTime64's 1900-2299 range",
+                        target.to_string(),
+                    ));
+                }
+
+                let zone = args.pop();
+                if strict
+                    && zone
+                        .as_ref()
+                        .is_some_and(|zone| !clickhouse_constant_timezone(zone))
+                {
+                    return Err(crate::error::Error::unsupported(
+                        "BigQuery TIMESTAMP with a non-constant time zone cannot be preserved",
+                        target.to_string(),
+                    ));
+                }
+
+                let timezone = zone.clone().unwrap_or_else(|| Expression::string("UTC"));
+                let timestamp = Expression::Function(Box::new(Function::new(
+                    "toDateTime64".to_string(),
+                    vec![arg, Expression::number(6), timezone],
+                )));
+
+                return if zone.is_some() {
+                    // BigQuery TIMESTAMP values are absolute instants displayed in UTC.
+                    // Interpret the source wall-clock value in its supplied zone, then
+                    // attach UTC metadata so ClickHouse renders the same instant.
+                    Ok(Expression::Function(Box::new(Function::new(
+                        "toTimeZone".to_string(),
+                        vec![timestamp, Expression::string("UTC")],
+                    ))))
+                } else {
+                    Ok(timestamp)
+                };
+            }
+
             if args.len() == 1 {
                 let arg = args.remove(0);
                 Ok(Expression::Cast(Box::new(Cast {
@@ -16458,6 +16856,13 @@ pub(super) fn normalize_bigquery_function(
                     ))))
                 }
             }
+        }
+
+        // ClickHouse's ROUND uses banker's rounding for Float inputs while BigQuery
+        // and Snowflake default to half-away-from-zero. Decimal inputs match;
+        // explicit half-even mode can use ClickHouse's roundBankers implementation.
+        "ROUND" if matches!(target, DialectType::ClickHouse) && !args.is_empty() => {
+            normalize_round_to_clickhouse(args, source, target, strict)
         }
 
         // ROUND(x, n, 'ROUND_HALF_EVEN') -> ROUND_EVEN(x, n) for DuckDB

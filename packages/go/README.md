@@ -86,6 +86,35 @@ func main() {
 }
 ```
 
+## Immutable SQL Builders
+
+The Go SDK provides an idiomatic version of the common SQLGlot builder
+surface. Builder values are immutable plans evaluated by the shared Rust
+engine through the native library.
+
+```go
+query := polyglot.Select("customer_id", "COUNT(*) AS orders").
+	From("orders").
+	Where("status = 'complete'").
+	GroupBy("customer_id").
+	OrderBy("orders DESC").
+	Limit(10)
+
+sql, err := client.BuildSQL(query, "postgres")
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(sql)
+```
+
+`Client.Build` returns the expression AST as `json.RawMessage`, while
+`Client.BuildSQL` generates SQL for a target dialect. Package-level `Build`
+and `BuildSQL` wrappers use the configured default client. Constructors cover
+selects, columns, tables, literals, named functions, `CASE`, all join and set
+operation variants, windows, lateral views, hints, row locks, CTAS, and full
+DML including conditional `MERGE` actions. Repeated clauses append by default;
+the `*WithOptions` methods accept `ClauseOptions{Append: false}` for replacement.
+
 ## API Reference
 
 The primary API is client-scoped. Package-level convenience functions mirror
@@ -116,6 +145,8 @@ These methods are available on `*Client` and as package-level wrappers:
 | `Optimize(sql, dialect string, options ...OptimizeOptions) ([]string, error)` | Apply optimizer rewrites and return SQL. |
 | `Generate(ast json.RawMessage, dialect string, options ...GenerateOptions) ([]string, error)` | Generate SQL from a JSON AST returned by `Parse` or related APIs. |
 | `GenerateDataType(dataType json.RawMessage, dialect string) (string, error)` | Generate SQL from a JSON `DataType` returned by `ParseDataType`. |
+| `Build(expression Expression) (json.RawMessage, error)` | Evaluate an immutable builder plan and return its JSON AST. |
+| `BuildSQL(expression Expression, dialect string) (string, error)` | Evaluate an immutable builder plan and render SQL for a dialect. |
 | `Validate(sql, dialect string, options ...ValidationOptions) (ValidationResult, error)` | Validate SQL with optional strict syntax and semantic warnings; diagnostics are returned as data. |
 | `Dialects() ([]string, error)` | Return supported dialect names. |
 | `DialectCount() (int, error)` | Return the number of supported dialects. |

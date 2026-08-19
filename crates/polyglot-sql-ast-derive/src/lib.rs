@@ -45,6 +45,25 @@ fn expand_ast_node(input: &DeriveInput) -> proc_macro2::TokenStream {
         }
         Data::Union(_) => quote!(),
     };
+    let serialized_variant_names = if name == "Expression" {
+        if let Data::Enum(data) = &input.data {
+            let names = data.variants.iter().map(|variant| {
+                let name = serde_snake_case(&variant.ident.to_string());
+                syn::LitStr::new(&name, variant.ident.span())
+            });
+            quote! {
+                impl #name {
+                    pub(crate) const SERIALIZED_VARIANT_NAMES: &'static [&'static str] = &[
+                        #(#names),*
+                    ];
+                }
+            }
+        } else {
+            quote!()
+        }
+    } else {
+        quote!()
+    };
 
     quote! {
         impl crate::ast_children::AstNode for #name {
@@ -72,7 +91,21 @@ fn expand_ast_node(input: &DeriveInput) -> proc_macro2::TokenStream {
                 #mutable
             }
         }
+
+        #serialized_variant_names
     }
+}
+
+/// Match serde's `rename_all = "snake_case"` behavior for Rust enum variants.
+fn serde_snake_case(name: &str) -> String {
+    let mut snake_case = String::with_capacity(name.len());
+    for (index, character) in name.chars().enumerate() {
+        if index > 0 && character.is_uppercase() {
+            snake_case.push('_');
+        }
+        snake_case.extend(character.to_lowercase());
+    }
+    snake_case
 }
 
 fn visit_fields(fields: &Fields, mutable: bool) -> proc_macro2::TokenStream {
@@ -330,4 +363,22 @@ fn is_skipped(field: &Field) -> bool {
                 .parse_args::<syn::Ident>()
                 .is_ok_and(|ident| ident == "skip")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serde_snake_case;
+
+    #[test]
+    fn serde_snake_case_matches_expression_variant_serialization() {
+        assert_eq!(serde_snake_case("Literal"), "literal");
+        assert_eq!(serde_snake_case("ILike"), "i_like");
+        assert_eq!(serde_snake_case("JSONBExists"), "j_s_o_n_b_exists");
+        assert_eq!(serde_snake_case("SHA2Digest"), "s_h_a2_digest");
+        assert_eq!(
+            serde_snake_case("CurrentTimestampLTZ"),
+            "current_timestamp_l_t_z"
+        );
+        assert_eq!(serde_snake_case("PropertyEQ"), "property_e_q");
+    }
 }

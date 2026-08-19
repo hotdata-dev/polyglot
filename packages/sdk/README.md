@@ -126,6 +126,32 @@ if (!result.success) {
 
 Build SQL queries programmatically with full type safety. All builder operations are backed by the Rust engine via WASM.
 
+### SQLGlot-Compatible Immutable API
+
+An additive `compat` namespace provides immutable cross-language builder plans
+with familiar string coercion conventions. The existing TypeScript builder
+classes are adapters over the same plan and Rust engine.
+
+```typescript
+import { compat } from '@polyglot-sql/sdk';
+// Or: import * as compat from '@polyglot-sql/sdk/compat';
+
+const base = compat
+  .select('customer_id', 'COUNT(*) AS orders')
+  .from_('orders')
+  .where("status = 'complete'")
+  .groupBy('customer_id');
+
+const query = base.orderBy('orders DESC').limit(10);
+console.log(query.sql('postgres'));
+```
+
+These expressions are immutable. The namespace and class facade share named
+function helpers, query clauses, all join and set-operation variants, windows,
+lateral views, hints, row locks, CTAS, `CASE`, and full DML including conditional
+`MERGE`. Repeated clauses append by default; pass `{ append: false }` as the
+first argument to replace one.
+
 ### SELECT
 
 ```typescript

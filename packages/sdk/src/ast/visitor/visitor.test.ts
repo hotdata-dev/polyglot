@@ -11,7 +11,12 @@ import { describe, expect, it } from 'vitest';
 import { col, lit, sqlNull } from '../../builders';
 import type { Expression } from '../../generated/Expression';
 import { Dialect, generate, parse } from '../../index';
-import { getExprData, getExprType, makeExpr } from '../helpers';
+import {
+  getExprData,
+  getExprType,
+  isExpressionValue,
+  makeExpr,
+} from '../helpers';
 import {
   addSelectColumns,
   addWhere,
@@ -22,6 +27,7 @@ import {
   findByType,
   findFirst,
   getAggregateFunctions,
+  getChildren,
   getColumnNames,
   getColumns,
   getDepth,
@@ -64,6 +70,22 @@ function parseFirst(sql: string): Expression {
     throw new Error(`Parse failed: ${result.error}`);
   }
   return result.ast[0];
+}
+
+function parseFirstWithDialect(sql: string, dialect: Dialect): Expression {
+  const result = parse(sql, dialect);
+  if (!result.success || !result.ast) {
+    throw new Error(`Parse failed: ${result.error}`);
+  }
+  return result.ast[0];
+}
+
+function columnReference(node: Expression): string {
+  const data = getExprData(node) as {
+    name: { name: string };
+    table: { name: string } | null;
+  };
+  return data.table ? `${data.table.name}.${data.name.name}` : data.name.name;
 }
 
 // Helper to regenerate SQL from AST
@@ -140,6 +162,100 @@ describe('Walker Functions', () => {
       });
 
       expect(columnParent).not.toBeNull();
+    });
+
+    it('should traverse expression fields inside arrays of serialized structs', () => {
+      const cases = [
+        {
+          sql: 'SELECT LIST(value ORDER BY ordering_key) FROM source_table',
+          columns: ['value', 'ordering_key'],
+        },
+        {
+          sql: 'SELECT projected FROM source_table ORDER BY ordering_key',
+          columns: ['projected', 'ordering_key'],
+        },
+        {
+          sql: 'SELECT l.projected FROM left_table AS l JOIN right_table AS r ON l.join_key = r.join_key',
+          columns: ['l.projected', 'l.join_key', 'r.join_key'],
+        },
+        {
+          sql: 'WITH cte AS (SELECT inner_value FROM source_table) SELECT outer_value FROM cte',
+          columns: ['outer_value', 'inner_value'],
+        },
+        {
+          sql: 'SELECT SUM(value) OVER (PARTITION BY group_key ORDER BY ordering_key) FROM source_table',
+          columns: ['value', 'group_key', 'ordering_key'],
+        },
+      ];
+
+      for (const { sql, columns } of cases) {
+        const ast = parseFirstWithDialect(sql, Dialect.DuckDB);
+        expect(getColumns(ast).map(columnReference)).toEqual(columns);
+      }
+    });
+
+    it('should preserve visitor location metadata through serialized structs', () => {
+      const aggregate = parseFirstWithDialect(
+        'SELECT LIST(value ORDER BY ordering_key) FROM source_table',
+        Dialect.DuckDB,
+      );
+      const locations: Array<{
+        parent: string | null;
+        key: string | null;
+        index: number | null;
+      }> = [];
+
+      walk(aggregate, {
+        column: (node, parent, key, index) => {
+          if (columnReference(node) === 'ordering_key') {
+            locations.push({
+              parent: parent ? getExprType(parent) : null,
+              key,
+              index,
+            });
+          }
+        },
+      });
+
+      expect(locations).toEqual([
+        { parent: 'aggregate_function', key: 'order_by', index: 0 },
+      ]);
+    });
+
+    it('should not expose single-field payload structs as expression nodes', () => {
+      const column = col('value').toJSON() as Expression;
+
+      expect(isExpressionValue(column)).toBe(true);
+      expect(isExpressionValue(sqlNull().toJSON())).toBe(true);
+      expect(isExpressionValue({ this: column })).toBe(false);
+      expect(isExpressionValue({ expressions: [column] })).toBe(false);
+
+      const visited: string[] = [];
+      walk(parseFirst('SELECT value FROM source_table WHERE value = 1'), {
+        enter: (node) => visited.push(getExprType(node)),
+      });
+      expect(visited).not.toContain('this');
+      expect(visited).not.toContain('expressions');
+    });
+  });
+
+  describe('getChildren()', () => {
+    it('should collect expression children nested in struct arrays', () => {
+      const ast = parseFirst(
+        'SELECT l.projected FROM left_table AS l JOIN right_table AS r ON l.join_key = r.join_key',
+      );
+      const childTypes = getChildren(ast).flatMap(({ value }) =>
+        Array.isArray(value)
+          ? value.map((child) => getExprType(child))
+          : [getExprType(value)],
+      );
+
+      expect(
+        getChildren(ast).some(
+          ({ key, value }) => key === 'expressions' && Array.isArray(value),
+        ),
+      ).toBe(true);
+      expect(childTypes).toContain('eq');
     });
   });
 
@@ -341,6 +457,96 @@ describe('Convenience Finder Functions', () => {
 
       expect(aggregates.length).toBe(0);
     });
+
+    it('should find DuckDB COUNT_IF, MEDIAN, and FIRST aggregates', () => {
+      const result = parse(
+        'SELECT COUNT_IF(numeric_value > 0), MEDIAN(numeric_value), FIRST(numeric_value) FROM source_table',
+        Dialect.DuckDB,
+      );
+      if (!result.success || !result.ast) {
+        throw new Error(`Parse failed: ${result.error}`);
+      }
+
+      const aggregateTypes = getAggregateFunctions(result.ast[0]).map(
+        getExprType,
+      );
+
+      expect(aggregateTypes).toEqual(['count_if', 'median', 'first']);
+    });
+
+    it('should preserve and find DuckDB null-preserving arg extrema', () => {
+      const result = parse(
+        'SELECT ARG_MAX_NULL(label, score), ARG_MIN_NULL(label, score) FROM source_table',
+        Dialect.DuckDB,
+      );
+      if (!result.success || !result.ast) {
+        throw new Error(`Parse failed: ${result.error}`);
+      }
+
+      const aggregates = getAggregateFunctions(result.ast[0]);
+
+      expect(aggregates.map(getExprType)).toEqual([
+        'aggregate_function',
+        'aggregate_function',
+      ]);
+      expect(aggregates.map((node) => getExprData(node).name)).toEqual([
+        'ARG_MAX_NULL',
+        'ARG_MIN_NULL',
+      ]);
+      expect(
+        aggregates.map((node) => (getExprData(node).args as unknown[]).length),
+      ).toEqual([2, 2]);
+    });
+
+    it('should find DuckDB product, histogram, and quantile aggregates', () => {
+      const result = parse(
+        'SELECT PRODUCT(x), APPROX_QUANTILE(x, 0.5), HISTOGRAM_EXACT(x, [1, 2]), MAD(x), QUANTILE(x, 0.5), QUANTILE_CONT(x, 0.5), QUANTILE_DISC(x, 0.5), RESERVOIR_QUANTILE(x, 0.5) FROM source_table',
+        Dialect.DuckDB,
+      );
+      if (!result.success || !result.ast) {
+        throw new Error(`Parse failed: ${result.error}`);
+      }
+
+      const aggregates = getAggregateFunctions(result.ast[0]);
+
+      expect(aggregates.map(getExprType)).toEqual(
+        Array.from({ length: 8 }, () => 'aggregate_function'),
+      );
+      expect(aggregates.map((node) => getExprData(node).name)).toEqual([
+        'PRODUCT',
+        'APPROX_QUANTILE',
+        'HISTOGRAM_EXACT',
+        'MAD',
+        'QUANTILE',
+        'QUANTILE_CONT',
+        'QUANTILE_DISC',
+        'RESERVOIR_QUANTILE',
+      ]);
+    });
+
+    it('should retain DuckDB aggregate-local modifiers', () => {
+      const result = parse(
+        'SELECT PRODUCT(DISTINCT x ORDER BY x DESC) FILTER (WHERE keep) AS aggregate_value FROM source_table',
+        Dialect.DuckDB,
+      );
+      if (!result.success || !result.ast) {
+        throw new Error(`Parse failed: ${result.error}`);
+      }
+
+      const aggregates = getAggregateFunctions(result.ast[0]);
+      expect(aggregates).toHaveLength(1);
+
+      const data = getExprData(aggregates[0]);
+      expect(data.distinct).toBe(true);
+      expect(data.filter).not.toBeNull();
+      expect(data.order_by).toHaveLength(1);
+
+      const generated = generate(result.ast, Dialect.DuckDB);
+      expect(generated.success).toBe(true);
+      expect(generated.sql).toEqual([
+        'SELECT PRODUCT(DISTINCT x ORDER BY x DESC) FILTER(WHERE keep) AS aggregate_value FROM source_table',
+      ]);
+    });
   });
 
   describe('getWindowFunctions()', () => {
@@ -498,6 +704,64 @@ describe('Transformer Functions', () => {
       });
 
       expect(columnVisited).toBe(true);
+    });
+
+    it('should transform expressions nested inside struct arrays', () => {
+      const ast = parseFirstWithDialect(
+        'SELECT LIST(value ORDER BY ordering_key) FROM source_table',
+        Dialect.DuckDB,
+      );
+      const transformed = transform(ast, {
+        column: (node) => {
+          if (columnReference(node) !== 'ordering_key') return undefined;
+          const data = getExprData(node) as {
+            name: { name: string };
+          };
+          return makeExpr('column', {
+            ...data,
+            name: { ...data.name, name: 'replacement_key' },
+          });
+        },
+      });
+
+      const result = generate([transformed], Dialect.DuckDB);
+      expect(result.success).toBe(true);
+      expect(result.sql).toEqual([
+        'SELECT LIST(value ORDER BY replacement_key) FROM source_table',
+      ]);
+    });
+
+    it('should visit the same nodes and locations as walk()', () => {
+      const ast = parseFirstWithDialect(
+        'WITH cte AS (SELECT inner_value FROM source_table) SELECT SUM(value) OVER (PARTITION BY group_key ORDER BY ordering_key) FROM cte ORDER BY outer_key',
+        Dialect.DuckDB,
+      );
+      const walked: string[] = [];
+      const transformed: string[] = [];
+      const record = (
+        target: string[],
+        node: Expression,
+        parent: Expression | null,
+        key: string | null,
+        index: number | null,
+      ) => {
+        target.push(
+          `${getExprType(node)}:${parent ? getExprType(parent) : 'null'}:${key}:${index}`,
+        );
+      };
+
+      walk(ast, {
+        enter: (node, parent, key, index) =>
+          record(walked, node, parent, key, index),
+      });
+      transform(ast, {
+        enter: (node, parent, key, index) => {
+          record(transformed, node, parent, key, index);
+          return undefined;
+        },
+      });
+
+      expect(transformed).toEqual(walked);
     });
   });
 
@@ -899,6 +1163,24 @@ describe('Clone', () => {
       expect(toSql(ast)).toContain('a');
       expect(toSql(modified)).toContain('b');
     });
+
+    it('should clone containers nested inside serialized structs', () => {
+      const ast = parseFirstWithDialect(
+        'SELECT LIST(value ORDER BY ordering_key) FROM source_table',
+        Dialect.DuckDB,
+      );
+      const cloned = clone(ast);
+      const originalAggregate = findByType(ast, 'aggregate_function')[0];
+      const clonedAggregate = findByType(cloned, 'aggregate_function')[0];
+      const originalData = getExprData(originalAggregate);
+      const clonedData = getExprData(clonedAggregate);
+
+      expect(clonedData.order_by).not.toBe(originalData.order_by);
+      expect((clonedData.order_by as unknown[])[0]).not.toBe(
+        (originalData.order_by as unknown[])[0],
+      );
+      expect(toSql(cloned)).toBe(toSql(ast));
+    });
   });
 });
 
@@ -919,6 +1201,19 @@ describe('Remove', () => {
 
       expect(sql).toContain('a');
       expect(sql).toContain('c');
+    });
+
+    it('should remove array nodes reached through serialized structs', () => {
+      const ast = parseFirst(
+        'WITH cte AS (SELECT a, b FROM source_table) SELECT * FROM cte',
+      );
+      const newAst = remove(ast, (node) => {
+        return getExprType(node) === 'column' && columnReference(node) === 'b';
+      });
+
+      expect(toSql(newAst)).toBe(
+        'WITH cte AS (SELECT a FROM source_table) SELECT * FROM cte',
+      );
     });
   });
 });

@@ -226,5 +226,24 @@ pub fn transpilation_known_failures(source: &str, target: &str) -> HashSet<Strin
         failures.insert("tsql->tsql:80".to_string());
     }
 
+    if source == "tsql" && target == "spark" {
+        // SQLGlot treats bare T-SQL FLOAT as single precision, but SQL Server defaults it to
+        // FLOAT(53), which is double precision.
+        failures.insert("tsql->spark:51".to_string());
+    }
+
+    if source == "postgres" && target == "clickhouse" {
+        // SQLGlot maps JSON_EXTRACT_PATH_TEXT to JSONExtractString, which
+        // collapses a missing path or JSON null into an empty string. Polyglot
+        // intentionally preserves PostgreSQL's NULL semantics.
+        failures.insert("postgres->clickhouse:14".to_string());
+    }
+
+    if source == "tsql" && target == "hive" {
+        // SQLGlot treats T-SQL FLOAT(32) as single precision, but T-SQL normalizes every
+        // precision from 25 through 53 to double precision.
+        failures.insert("tsql->hive:52".to_string());
+    }
+
     failures
 }

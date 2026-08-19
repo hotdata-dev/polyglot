@@ -1642,8 +1642,10 @@ pub(super) fn normalize(
         let action = {
             let source_propagates_nulls =
                 matches!(source, DialectType::Snowflake | DialectType::BigQuery);
-            let target_ignores_nulls =
-                matches!(target, DialectType::DuckDB | DialectType::PostgreSQL);
+            let target_ignores_nulls = matches!(
+                target,
+                DialectType::DuckDB | DialectType::PostgreSQL | DialectType::ClickHouse
+            );
 
             match &e {
                 Expression::Subquery(subquery)
@@ -1672,6 +1674,19 @@ pub(super) fn normalize(
                         && temporal::is_postgres_date_part_function(&e)
                     {
                         Action::Temporal(temporal::Action::PostgresDatePartForTsql)
+                    } else if matches!(source, DialectType::Snowflake)
+                        && matches!(target, DialectType::ClickHouse)
+                        && f.args.len() <= 1
+                        && matches!(
+                            name.as_str(),
+                            "CURRENT_TIME"
+                                | "LOCALTIME"
+                                | "CURRENT_TIMESTAMP"
+                                | "CURRENT_TIMESTAMP_LTZ"
+                                | "LOCALTIMESTAMP"
+                        )
+                    {
+                        Action::Temporal(temporal::Action::SnowflakeCurrentToClickHouse)
                     } else if name == "JSON"
                         && f.args.len() == 1
                         && matches!(source, DialectType::DuckDB)
@@ -1709,6 +1724,12 @@ pub(super) fn normalize(
                         && f.args.len() >= 2
                     {
                         Action::Scalar(scalar::Action::GreatestLeastNull)
+                    } else if matches!(source, DialectType::Snowflake)
+                        && matches!(target, DialectType::ClickHouse)
+                        && name == "ROUND"
+                        && !f.args.is_empty()
+                    {
+                        Action::Scalar(scalar::Action::SnowflakeRoundToClickHouse)
                     } else if matches!(source, DialectType::Snowflake)
                         && name == "ARRAY_GENERATE_RANGE"
                         && f.args.len() >= 2
@@ -2276,6 +2297,11 @@ pub(super) fn normalize(
                         {
                             Action::Aggregates(aggregates::Action::BigQueryPercentileContToDuckDB)
                         }
+                        "QUANTILE" | "QUANTILE_CONT" | "QUANTILE_DISC" | "APPROX_QUANTILE"
+                            if matches!(source, DialectType::DuckDB) =>
+                        {
+                            Action::Aggregates(aggregates::Action::DuckDBQuantileConvert)
+                        }
                         _ => Action::None,
                     }
                 }
@@ -2292,7 +2318,11 @@ pub(super) fn normalize(
                 },
                 Expression::ToNumber(tn) => {
                     // TO_NUMBER(x) with 1 arg -> CAST(x AS DOUBLE) for most targets
-                    if tn.format.is_none() && tn.precision.is_none() && tn.scale.is_none() {
+                    if tn.safe.is_none()
+                        && tn.format.is_none()
+                        && tn.precision.is_none()
+                        && tn.scale.is_none()
+                    {
                         match target {
                             DialectType::Oracle
                             | DialectType::Snowflake
@@ -2706,10 +2736,11 @@ pub(super) fn normalize(
                             }
                             _ => Action::None,
                         }
-                    } else if matches!(source, DialectType::TSQL) {
-                        // For TSQL source -> any target (including TSQL itself for REAL)
+                    } else if matches!(source, DialectType::TSQL | DialectType::Fabric) {
+                        // For TSQL/Fabric source -> any target (including the source family itself
+                        // for REAL)
                         match dt {
-                            // REAL -> FLOAT even for TSQL->TSQL
+                            // REAL -> FLOAT even for TSQL/Fabric identity transpilation
                             DataType::Custom { ref name }
                                 if name.eq_ignore_ascii_case("REAL") =>
                             {
@@ -2719,9 +2750,10 @@ pub(super) fn normalize(
                                 real_spelling: true,
                                 ..
                             } => Action::Types(types::Action::TSQLTypeNormalize),
-                            // Other TSQL type normalizations only for non-TSQL targets
+                            // Keep the existing non-float TSQL normalizations source-scoped.
                             DataType::Custom { ref name }
-                                if !matches!(target, DialectType::TSQL)
+                                if matches!(source, DialectType::TSQL)
+                                    && !matches!(target, DialectType::TSQL)
                                     && (name.eq_ignore_ascii_case("MONEY")
                                         || name.eq_ignore_ascii_case("SMALLMONEY")
                                         || name.eq_ignore_ascii_case("DATETIME2")
@@ -2736,13 +2768,14 @@ pub(super) fn normalize(
                             {
                                 Action::Types(types::Action::TSQLTypeNormalize)
                             }
-                            DataType::Float {
-                                precision: Some(_), ..
-                            } if !matches!(target, DialectType::TSQL) => {
+                            DataType::Float { .. }
+                                if !matches!(target, DialectType::TSQL | DialectType::Fabric) =>
+                            {
                                 Action::Types(types::Action::TSQLTypeNormalize)
                             }
                             DataType::TinyInt { .. }
-                                if !matches!(target, DialectType::TSQL) =>
+                                if matches!(source, DialectType::TSQL)
+                                    && !matches!(target, DialectType::TSQL) =>
                             {
                                 Action::Types(types::Action::TSQLTypeNormalize)
                             }
@@ -2750,10 +2783,11 @@ pub(super) fn normalize(
                             DataType::Int {
                                 integer_spelling: true,
                                 ..
-                            } if matches!(
-                                target,
-                                DialectType::Databricks | DialectType::Spark
-                            ) =>
+                            } if matches!(source, DialectType::TSQL)
+                                && matches!(
+                                    target,
+                                    DialectType::Databricks | DialectType::Spark
+                                ) =>
                             {
                                 Action::Types(types::Action::TSQLTypeNormalize)
                             }
@@ -2861,6 +2895,16 @@ pub(super) fn normalize(
                         Action::None
                     }
                 }
+                Expression::CurrentTime(_)
+                | Expression::CurrentTimestamp(_)
+                | Expression::CurrentTimestampLTZ(_)
+                | Expression::Localtime(_)
+                | Expression::Localtimestamp(_)
+                    if matches!(source, DialectType::Snowflake)
+                        && matches!(target, DialectType::ClickHouse) =>
+                {
+                    Action::Temporal(temporal::Action::SnowflakeCurrentToClickHouse)
+                }
                 Expression::Any(ref q) => {
                     if matches!(source, DialectType::PostgreSQL)
                         && matches!(
@@ -2878,8 +2922,26 @@ pub(super) fn normalize(
                         Action::None
                     }
                 }
+                Expression::Round(_)
+                    if matches!(source, DialectType::Snowflake)
+                        && matches!(target, DialectType::ClickHouse) =>
+                {
+                    Action::Scalar(scalar::Action::SnowflakeRoundToClickHouse)
+                }
+                Expression::Median(_)
+                    if matches!(source, DialectType::Snowflake)
+                        && matches!(target, DialectType::ClickHouse) =>
+                {
+                    Action::Aggregates(aggregates::Action::SnowflakeMedianToClickHouse)
+                }
                 // BigQuery APPROX_QUANTILES(x, n) -> APPROX_QUANTILE(x, [quantiles]) for DuckDB
                 // Snowflake RLIKE does full-string match; DuckDB REGEXP_FULL_MATCH also does full-string match
+                Expression::RegexpLike(_)
+                    if matches!(source, DialectType::Snowflake)
+                        && matches!(target, DialectType::ClickHouse) =>
+                {
+                    Action::Operators(operators::Action::SnowflakeRegexpLikeToClickHouse)
+                }
                 Expression::RegexpLike(_)
                     if matches!(source, DialectType::Snowflake)
                         && matches!(target, DialectType::DuckDB) =>
@@ -2901,6 +2963,14 @@ pub(super) fn normalize(
                         && operators::similar_to_can_lower_to_tsql_like(s) =>
                 {
                     Action::Operators(operators::Action::SimilarToToTsqlLike)
+                }
+                Expression::Div(_)
+                    if matches!(
+                        source,
+                        DialectType::PostgreSQL | DialectType::Redshift | DialectType::TSQL
+                    ) && matches!(target, DialectType::ClickHouse) =>
+                {
+                    Action::Operators(operators::Action::SourceDivisionToClickHouse)
                 }
                 // RegexpLike from non-DuckDB/non-Snowflake sources -> REGEXP_MATCHES for DuckDB target
                 Expression::RegexpLike(_)
@@ -3121,6 +3191,16 @@ pub(super) fn normalize(
                     if matches!(target, DialectType::TSQL | DialectType::Fabric) =>
                 {
                     Action::Json(json::Action::JsonExtractToTsql)
+                }
+                // PostgreSQL `->>`/`#>>` -> nullable text extraction for ClickHouse.
+                // This must precede the generic ClickHouse rule because
+                // JSONExtractString returns an empty string for missing paths.
+                Expression::JsonExtractScalar(ref f)
+                    if matches!(source, DialectType::PostgreSQL)
+                        && matches!(target, DialectType::ClickHouse)
+                        && (f.arrow_syntax || f.hash_arrow_syntax) =>
+                {
+                    Action::Json(json::Action::PostgresJsonExtractTextToClickHouse)
                 }
                 // JSON_EXTRACT -> JSONExtractString for ClickHouse
                 Expression::JsonExtract(_) if matches!(target, DialectType::ClickHouse) => {

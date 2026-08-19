@@ -221,13 +221,30 @@
     {
       "id": "builders",
       "description": "Fluent SQL builders",
+      "commonFeatureSet": [
+        "expressions",
+        "named_functions",
+        "select_clauses",
+        "joins",
+        "set_operations",
+        "named_windows",
+        "lateral_views",
+        "hints",
+        "row_locks",
+        "ctas",
+        "case",
+        "insert",
+        "update",
+        "delete",
+        "merge"
+      ],
       "layers": {
         "rust": { "status": "supported", "symbols": ["builder.col"] },
-        "python": { "status": "unavailable", "symbols": ["select"], "notes": "Python currently exposes parsed Expression objects rather than fluent builders." },
-        "ffi": { "status": "unavailable", "symbols": ["polyglot_select_builder"], "notes": "The C ABI does not expose stateful builders." },
-        "go": { "status": "unavailable", "symbols": ["Client.Select"], "notes": "The Go SDK does not expose fluent builders." },
-        "wasm": { "status": "supported", "symbols": ["WasmSelectBuilder"] },
-        "typescript": { "status": "supported", "symbols": ["select", "SelectBuilder"] }
+        "python": { "status": "supported", "symbols": ["select", "column", "merge_into"], "notes": "Python exposes the shared builder feature set with Python-style names." },
+        "ffi": { "status": "partial", "symbols": ["polyglot_build"], "notes": "The C ABI evaluates versioned stateless builder plans rather than exposing stateful C builder objects." },
+        "go": { "status": "supported", "symbols": ["Client.Build", "Client.BuildSQL", "MergeInto"], "notes": "Go exposes the shared immutable builder feature set with idiomatic Go names." },
+        "wasm": { "status": "supported", "symbols": ["wasm_compat_build"], "notes": "WASM evaluates typed, stateless builder plans; TypeScript supplies both immutable and class facades." },
+        "typescript": { "status": "supported", "symbols": ["select", "SelectBuilder", "compat.select", "compat.mergeInto"] }
       }
     },
     {

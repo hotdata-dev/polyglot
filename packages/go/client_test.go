@@ -40,6 +40,9 @@ func TestPublicAPIMatchesCapabilityContract(t *testing.T) {
 	}
 
 	clientType := reflect.TypeOf(&Client{})
+	packageSymbols := map[string]any{
+		"MergeInto": MergeInto,
+	}
 	seen := make(map[string]bool, len(contract.Capabilities))
 	for _, capability := range contract.Capabilities {
 		if seen[capability.ID] {
@@ -59,10 +62,12 @@ func TestPublicAPIMatchesCapabilityContract(t *testing.T) {
 		}
 
 		for _, symbol := range entry.Symbols {
-			if !strings.HasPrefix(symbol, "Client.") {
-				t.Fatalf("capability %q has invalid Go symbol %q", capability.ID, symbol)
+			var exists bool
+			if strings.HasPrefix(symbol, "Client.") {
+				_, exists = clientType.MethodByName(strings.TrimPrefix(symbol, "Client."))
+			} else {
+				_, exists = packageSymbols[symbol]
 			}
-			_, exists := clientType.MethodByName(strings.TrimPrefix(symbol, "Client."))
 			if entry.Status == "unavailable" && exists {
 				t.Fatalf("capability %q: %s unexpectedly exists", capability.ID, symbol)
 			}
@@ -79,6 +84,85 @@ func TestVersion(t *testing.T) {
 	}
 	if expected := os.Getenv("POLYGLOT_GO_EXPECTED_VERSION"); expected != "" && Version() != expected {
 		t.Fatalf("Version() = %q, want %q", Version(), expected)
+	}
+}
+
+func TestBuilderRequestUsesSharedProtocol(t *testing.T) {
+	query := Select("customer_id", "COUNT(*) AS orders").
+		From("orders").
+		Where("status = 'complete'").
+		GroupBy("customer_id")
+
+	request, err := query.request(map[string]any{"kind": "sql", "dialect": "postgres"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(request), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["version"] != float64(1) {
+		t.Fatalf("version = %#v", decoded["version"])
+	}
+	if decoded["read_dialect"] != "generic" {
+		t.Fatalf("read_dialect = %#v", decoded["read_dialect"])
+	}
+	if _, ok := decoded["expression"]; ok {
+		t.Fatal("request unexpectedly contains the retired expression field")
+	}
+	plan, ok := decoded["plan"].(map[string]any)
+	if !ok {
+		t.Fatalf("plan missing or wrong type: %#v", decoded["plan"])
+	}
+	if _, ok := plan["base"].(map[string]any); !ok {
+		t.Fatalf("plan base missing or wrong type: %#v", plan["base"])
+	}
+	operations, ok := plan["operations"].([]any)
+	if !ok || len(operations) != 3 {
+		t.Fatalf("plan operations = %#v, want three flat operations", plan["operations"])
+	}
+	if strings.Contains(request, `"kind":"apply"`) {
+		t.Fatalf("request contains retired nested apply nodes: %s", request)
+	}
+}
+
+func TestBuilderScalarStringsAreLiterals(t *testing.T) {
+	request, err := Column("status").Eq("active").request(map[string]any{"kind": "ast"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(request, `"kind":"string","value":"active"`) {
+		t.Fatalf("request does not contain a string literal: %s", request)
+	}
+}
+
+func TestBuilderFullFeatureSetUsesTypedPlanOperations(t *testing.T) {
+	query := Select("department", Count(Star()).As("employees")).
+		From("employees").
+		FullJoin("departments", Column("employees.department_id").Eq(Column("departments.id"))).
+		Window("w", []any{"department"}, []any{Column("salary").Desc()}).
+		LateralViewWithOptions(LateralViewOptions{Outer: true}, Func("EXPLODE", Column("teams")), "team", "name").
+		ForShare().
+		Hint("FULL(employees)").
+		CTASWithOptions(CTASOptions{Replace: true, Temporary: true}, "department_summary")
+
+	request, err := query.request(map[string]any{"kind": "sql", "dialect": "generic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"full", "window", "outer", "share", "hint", "ctas", "count", "temporary", "replace"} {
+		if !strings.Contains(request, kind) {
+			t.Fatalf("request does not contain %q: %s", kind, request)
+		}
+	}
+
+	merge := MergeInto("target").
+		MergeUsing("source", Column("target.id").Eq(Column("source.id"))).
+		WhenMatchedUpdate(map[string]any{"name": Column("source.name")}, "source.active").
+		WhenMatchedDelete("source.deleted").
+		WhenNotMatchedInsert([]string{"id"}, []any{Column("source.id")}, "source.active")
+	if _, err := merge.request(map[string]any{"kind": "ast"}); err != nil {
+		t.Fatal(err)
 	}
 }
 

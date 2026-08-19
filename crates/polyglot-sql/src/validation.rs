@@ -22,6 +22,7 @@ use crate::function_catalog::{
 };
 use crate::function_registry::canonical_typed_function_name_upper;
 use crate::optimizer::annotate_types::annotate_types;
+use crate::optimizer::qualify_columns::normalize_dotted_columns;
 use crate::resolver::Resolver;
 use crate::schema::{MappingSchema, Schema as SqlSchema, SchemaError, SchemaResult, TABLE_PARTS};
 use crate::scope::{build_scope, walk_in_scope};
@@ -3328,7 +3329,9 @@ fn validate_select_columns_with_schema(
     strict: bool,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let select_expr = Expression::Select(Box::new(select.clone()));
+    let mut normalized_select = select.clone();
+    let _ = normalize_dotted_columns(&mut normalized_select, resolver_schema, true);
+    let select_expr = Expression::Select(Box::new(normalized_select));
     let scope = build_scope(&select_expr);
     let mut resolver = Resolver::new(&scope, resolver_schema, true);
     let source_names: Vec<String> = scope.sources.keys().cloned().collect();

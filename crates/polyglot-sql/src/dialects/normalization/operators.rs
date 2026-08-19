@@ -6,6 +6,7 @@ use crate::expressions::*;
 #[derive(Debug)]
 pub(super) enum Action {
     Div0TypedDivision,
+    SourceDivisionToClickHouse,
     RegexpReplaceSnowflakeToDuckDB,
     BigQuerySafeDivide,
     RegexpLikeToDuckDB,
@@ -31,6 +32,7 @@ pub(super) enum Action {
     RlikeSnowflakeToDuckDB,
     RegexpExtractAllToSnowflake,
     RegexpLikeExasolAnchor,
+    SnowflakeRegexpLikeToClickHouse,
     SnowflakeWindowFrameStrip,
     SnowflakeWindowFrameAdd,
 }
@@ -45,6 +47,20 @@ pub(super) fn rewrite(
     let e = expression;
     let expression = (|| -> Result<Expression> {
         match action {
+            Action::SourceDivisionToClickHouse => {
+                if let Expression::Div(div) = e {
+                    normalize_source_division_to_clickhouse(*div, context)
+                } else {
+                    unreachable!("action only triggered for Div expressions")
+                }
+            }
+            Action::SnowflakeRegexpLikeToClickHouse => {
+                if let Expression::RegexpLike(f) = e {
+                    snowflake_regexp_like_to_clickhouse(*f, context)
+                } else {
+                    unreachable!("action only triggered for RegexpLike expressions")
+                }
+            }
             Action::Div0TypedDivision => {
                 let if_func = if let Expression::IfFunc(f) = e {
                     *f
@@ -1402,25 +1418,22 @@ pub(super) fn rewrite(
                         ],
                     )));
 
-                    // Position offset: pos - 1 when pos > 1, else 0
-                    let pos_offset: Expression = if !is_pos_1 {
-                        let pos = position.clone().unwrap_or(Expression::number(1));
-                        Expression::Sub(Box::new(BinaryOp::new(pos, Expression::number(1))))
-                    } else {
-                        Expression::number(0)
-                    };
-
-                    // ELSE: 1 + split_sum + extract_sum + pos_offset
-                    let else_expr = Expression::Add(Box::new(BinaryOp::new(
-                        Expression::Add(Box::new(BinaryOp::new(
-                            Expression::Add(Box::new(BinaryOp::new(
-                                Expression::number(1),
-                                split_sum,
-                            ))),
-                            extract_sum,
-                        ))),
-                        pos_offset,
+                    // ELSE base: 1 + split_sum + extract_sum
+                    let else_base = Expression::Add(Box::new(BinaryOp::new(
+                        Expression::Add(Box::new(BinaryOp::new(Expression::number(1), split_sum))),
+                        extract_sum,
                     )));
+
+                    // Append the position offset as a left-associated `+ pos - 1` chain.
+                    let else_expr = if !is_pos_1 {
+                        let pos = position.clone().unwrap_or(Expression::number(1));
+                        Expression::Sub(Box::new(BinaryOp::new(
+                            Expression::Add(Box::new(BinaryOp::new(else_base, pos))),
+                            Expression::number(1),
+                        )))
+                    } else {
+                        Expression::Add(Box::new(BinaryOp::new(else_base, Expression::number(0))))
+                    };
 
                     Ok(Expression::Case(Box::new(Case {
                         operand: None,
@@ -1685,6 +1698,96 @@ pub(super) fn rewrite(
     Ok(RewriteOutcome::Rewritten(expression))
 }
 
+pub(super) fn snowflake_regexp_like_to_clickhouse(
+    mut regexp: RegexpFunc,
+    context: &NormalizationContext,
+) -> Result<Expression> {
+    let flags = match snowflake_regex_inline_flags(regexp.flags.as_ref()) {
+        Ok(flags) => flags,
+        Err(reason) if context.strict => {
+            return Err(crate::error::Error::unsupported(
+                format!("Snowflake REGEXP_LIKE {reason} cannot be preserved"),
+                context.target.to_string(),
+            ));
+        }
+        Err(_) => return Ok(Expression::RegexpLike(Box::new(regexp))),
+    };
+
+    let prefix = format!("{flags}^(");
+    regexp.pattern = match regexp.pattern {
+        Expression::Literal(literal) => match *literal {
+            Literal::String(pattern) => Expression::string(format!("{prefix}{pattern})$")),
+            other => Expression::Function(Box::new(Function::new(
+                "concat".to_string(),
+                vec![
+                    Expression::string(prefix),
+                    Expression::Literal(Box::new(other)),
+                    Expression::string(")$"),
+                ],
+            ))),
+        },
+        pattern => Expression::Function(Box::new(Function::new(
+            "concat".to_string(),
+            vec![
+                Expression::string(prefix),
+                pattern,
+                Expression::string(")$"),
+            ],
+        ))),
+    };
+    regexp.flags = None;
+    Ok(Expression::RegexpLike(Box::new(regexp)))
+}
+
+fn snowflake_regex_inline_flags(flags: Option<&Expression>) -> std::result::Result<String, String> {
+    let Some(flags) = flags else {
+        // ClickHouse enables dot-all matching by default, unlike Snowflake.
+        return Ok("(?-s)".to_string());
+    };
+    let Expression::Literal(literal) = flags else {
+        return Err("with dynamic parameters".to_string());
+    };
+    let Literal::String(flags) = literal.as_ref() else {
+        return Err("with non-string parameters".to_string());
+    };
+
+    let mut case_insensitive = false;
+    let mut multiline = false;
+    let mut dot_matches_newline = false;
+    for flag in flags.chars() {
+        match flag.to_ascii_lowercase() {
+            'c' => case_insensitive = false,
+            'i' => case_insensitive = true,
+            'm' => multiline = true,
+            's' => dot_matches_newline = true,
+            // `e` controls submatch extraction and does not change the boolean result.
+            'e' => {}
+            unsupported => {
+                return Err(format!("parameter `{unsupported}`"));
+            }
+        }
+    }
+
+    let mut enabled = String::new();
+    if case_insensitive {
+        enabled.push('i');
+    }
+    if multiline {
+        enabled.push('m');
+    }
+    if dot_matches_newline {
+        enabled.push('s');
+    }
+
+    if dot_matches_newline {
+        Ok(format!("(?{enabled})"))
+    } else if enabled.is_empty() {
+        Ok("(?-s)".to_string())
+    } else {
+        Ok(format!("(?{enabled}-s)"))
+    }
+}
+
 pub(super) fn cast_expr(this: Expression, to: DataType) -> Expression {
     Expression::Cast(Box::new(Cast {
         this,
@@ -1695,6 +1798,337 @@ pub(super) fn cast_expr(this: Expression, to: DataType) -> Expression {
         default: None,
         inferred_type: None,
     }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StaticNumericValue {
+    Zero,
+    Finite(f64),
+    NonFinite,
+    Unknown,
+}
+
+fn static_numeric_value(expression: &Expression) -> StaticNumericValue {
+    match expression {
+        Expression::Literal(literal) => match literal.as_ref() {
+            Literal::Number(number) => {
+                let mantissa = number
+                    .trim_start_matches(['+', '-'])
+                    .split(['e', 'E'])
+                    .next()
+                    .unwrap_or(number);
+                let is_exact_zero = mantissa.chars().filter(|ch| *ch != '.').all(|ch| ch == '0');
+
+                number
+                    .parse::<f64>()
+                    .map(|value| {
+                        if is_exact_zero {
+                            StaticNumericValue::Zero
+                        } else if value == 0.0 || !value.is_finite() {
+                            StaticNumericValue::NonFinite
+                        } else {
+                            StaticNumericValue::Finite(value)
+                        }
+                    })
+                    .unwrap_or(StaticNumericValue::Unknown)
+            }
+            Literal::HexNumber(number) => {
+                let number = number
+                    .strip_prefix("0x")
+                    .or_else(|| number.strip_prefix("0X"))
+                    .unwrap_or(number);
+                u128::from_str_radix(number, 16)
+                    .map(|value| {
+                        if value == 0 {
+                            StaticNumericValue::Zero
+                        } else {
+                            StaticNumericValue::Finite(value as f64)
+                        }
+                    })
+                    .unwrap_or(StaticNumericValue::Unknown)
+            }
+            _ => StaticNumericValue::Unknown,
+        },
+        Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast) => {
+            static_numeric_value(&cast.this)
+        }
+        Expression::Paren(paren) => static_numeric_value(&paren.this),
+        Expression::Alias(alias) => static_numeric_value(&alias.this),
+        Expression::Neg(unary) => match static_numeric_value(&unary.this) {
+            StaticNumericValue::Finite(value) => StaticNumericValue::Finite(-value),
+            other => other,
+        },
+        _ => StaticNumericValue::Unknown,
+    }
+}
+
+fn canonical_integer_type(data_type: &DataType) -> Option<(u8, DataType)> {
+    match data_type {
+        DataType::TinyInt { .. } => Some((0, DataType::TinyInt { length: None })),
+        DataType::SmallInt { .. } => Some((1, DataType::SmallInt { length: None })),
+        DataType::Int { .. } => Some((
+            2,
+            DataType::Int {
+                length: None,
+                integer_spelling: true,
+            },
+        )),
+        DataType::BigInt { .. } => Some((3, DataType::BigInt { length: None })),
+        DataType::Nullable { inner } => canonical_integer_type(inner),
+        DataType::Custom { name } => match name.to_ascii_uppercase().as_str() {
+            "TINYINT" | "INT8" => Some((0, DataType::TinyInt { length: None })),
+            "SMALLINT" | "INT16" => Some((1, DataType::SmallInt { length: None })),
+            "INT" | "INTEGER" | "INT32" => Some((
+                2,
+                DataType::Int {
+                    length: None,
+                    integer_spelling: true,
+                },
+            )),
+            "BIGINT" | "INT64" => Some((3, DataType::BigInt { length: None })),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn expression_integer_type(expression: &Expression, source: DialectType) -> Option<(u8, DataType)> {
+    match expression {
+        Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast) => {
+            canonical_integer_type(&cast.to)
+        }
+        Expression::Literal(literal) => match literal.as_ref() {
+            Literal::Number(number) if !number.contains(['.', 'e', 'E']) => {
+                if number.parse::<i32>().is_ok() {
+                    canonical_integer_type(&DataType::Int {
+                        length: None,
+                        integer_spelling: true,
+                    })
+                } else if !matches!(source, DialectType::TSQL) && number.parse::<i64>().is_ok() {
+                    canonical_integer_type(&DataType::BigInt { length: None })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        Expression::Paren(paren) => expression_integer_type(&paren.this, source),
+        Expression::Alias(alias) => expression_integer_type(&alias.this, source),
+        Expression::Neg(unary) => expression_integer_type(&unary.this, source),
+        Expression::Add(binary)
+        | Expression::Sub(binary)
+        | Expression::Mul(binary)
+        | Expression::Mod(binary) => {
+            let left = expression_integer_type(&binary.left, source)?;
+            let right = expression_integer_type(&binary.right, source)?;
+            Some(if left.0 >= right.0 { left } else { right })
+        }
+        _ => expression.inferred_type().and_then(canonical_integer_type),
+    }
+}
+
+fn cast_integer_operand(expression: Expression, data_type: &DataType) -> Expression {
+    if matches!(
+        &expression,
+        Expression::Cast(cast) if canonical_integer_type(&cast.to).is_some_and(|(_, current)| current == *data_type)
+    ) {
+        expression
+    } else {
+        cast_expr(expression, data_type.clone())
+    }
+}
+
+fn clickhouse_float_type(data_type: &DataType, source: DialectType) -> Option<DataType> {
+    match data_type {
+        DataType::Double { .. } => Some(DataType::Double {
+            precision: None,
+            scale: None,
+        }),
+        DataType::Float {
+            real_spelling: true,
+            ..
+        } => Some(DataType::Float {
+            precision: None,
+            scale: None,
+            real_spelling: true,
+        }),
+        DataType::Float { .. } if matches!(source, DialectType::TSQL | DialectType::Redshift) => {
+            Some(DataType::Double {
+                precision: None,
+                scale: None,
+            })
+        }
+        DataType::Float { .. } => Some(DataType::Float {
+            precision: None,
+            scale: None,
+            real_spelling: false,
+        }),
+        DataType::Nullable { inner } => clickhouse_float_type(inner, source),
+        DataType::Custom { name } => match name.to_ascii_uppercase().as_str() {
+            "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" | "FLOAT64" => Some(DataType::Double {
+                precision: None,
+                scale: None,
+            }),
+            "REAL" | "FLOAT4" | "FLOAT32" => Some(DataType::Float {
+                precision: None,
+                scale: None,
+                real_spelling: true,
+            }),
+            "FLOAT"
+                if matches!(
+                    source,
+                    DialectType::PostgreSQL | DialectType::Redshift | DialectType::TSQL
+                ) =>
+            {
+                Some(DataType::Double {
+                    precision: None,
+                    scale: None,
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn normalize_clickhouse_float_operand(expression: Expression, source: DialectType) -> Expression {
+    match expression {
+        Expression::Cast(mut cast) => {
+            if let Some(data_type) = clickhouse_float_type(&cast.to, source) {
+                cast.to = data_type;
+            }
+            Expression::Cast(cast)
+        }
+        Expression::TryCast(mut cast) => {
+            if let Some(data_type) = clickhouse_float_type(&cast.to, source) {
+                cast.to = data_type;
+            }
+            Expression::TryCast(cast)
+        }
+        Expression::SafeCast(mut cast) => {
+            if let Some(data_type) = clickhouse_float_type(&cast.to, source) {
+                cast.to = data_type;
+            }
+            Expression::SafeCast(cast)
+        }
+        Expression::Paren(mut paren) => {
+            paren.this = normalize_clickhouse_float_operand(paren.this, source);
+            Expression::Paren(paren)
+        }
+        Expression::Alias(mut alias) => {
+            alias.this = normalize_clickhouse_float_operand(alias.this, source);
+            Expression::Alias(alias)
+        }
+        Expression::Neg(mut unary) => {
+            unary.this = normalize_clickhouse_float_operand(unary.this, source);
+            Expression::Neg(unary)
+        }
+        other => other,
+    }
+}
+
+fn normalize_source_division_to_clickhouse(
+    mut division: BinaryOp,
+    context: &NormalizationContext,
+) -> Result<Expression> {
+    let left_kind = super::scalar::expression_numeric_kind(&division.left);
+    let right_kind = super::scalar::expression_numeric_kind(&division.right);
+
+    if left_kind == super::scalar::NumericKind::Integer
+        && right_kind == super::scalar::NumericKind::Integer
+    {
+        if let (Some(left_type), Some(right_type)) = (
+            expression_integer_type(&division.left, context.source),
+            expression_integer_type(&division.right, context.source),
+        ) {
+            let result_type = if left_type.0 >= right_type.0 {
+                left_type.1
+            } else {
+                right_type.1
+            };
+            return Ok(Expression::IntDiv(Box::new(BinaryFunc {
+                this: cast_integer_operand(division.left, &result_type),
+                expression: cast_integer_operand(division.right, &result_type),
+                original_name: None,
+                inferred_type: Some(result_type),
+            })));
+        }
+    }
+
+    if !context.strict {
+        return Ok(Expression::Div(Box::new(division)));
+    }
+
+    if left_kind == super::scalar::NumericKind::Integer
+        && right_kind == super::scalar::NumericKind::Integer
+    {
+        return Err(crate::error::Error::unsupported(
+            format!(
+                "{} integer division with unresolved operand widths cannot be preserved for ClickHouse",
+                context.source
+            ),
+            context.target.to_string(),
+        ));
+    }
+
+    if left_kind == super::scalar::NumericKind::Unknown
+        || right_kind == super::scalar::NumericKind::Unknown
+    {
+        return Err(crate::error::Error::unsupported(
+            format!(
+                "{} division with unresolved operand types cannot be preserved for ClickHouse",
+                context.source
+            ),
+            context.target.to_string(),
+        ));
+    }
+
+    if matches!(
+        (left_kind, right_kind),
+        (
+            super::scalar::NumericKind::Decimal,
+            super::scalar::NumericKind::Decimal | super::scalar::NumericKind::Integer
+        ) | (
+            super::scalar::NumericKind::Integer,
+            super::scalar::NumericKind::Decimal
+        )
+    ) {
+        return Err(crate::error::Error::unsupported(
+            format!(
+                "{} decimal division precision, scale, rounding, and overflow semantics cannot be preserved for ClickHouse",
+                context.source
+            ),
+            context.target.to_string(),
+        ));
+    }
+
+    let left_value = static_numeric_value(&division.left);
+    let right_value = static_numeric_value(&division.right);
+    let statically_safe_float_division = matches!(
+        (left_value, right_value),
+        (StaticNumericValue::Zero, StaticNumericValue::Finite(_))
+            | (StaticNumericValue::Finite(_), StaticNumericValue::Finite(_))
+    ) && match (left_value, right_value) {
+        (StaticNumericValue::Zero, StaticNumericValue::Finite(divisor)) => divisor != 0.0,
+        (StaticNumericValue::Finite(dividend), StaticNumericValue::Finite(divisor)) => {
+            divisor != 0.0 && (dividend / divisor).is_finite()
+        }
+        _ => false,
+    };
+
+    if statically_safe_float_division {
+        division.left = normalize_clickhouse_float_operand(division.left, context.source);
+        division.right = normalize_clickhouse_float_operand(division.right, context.source);
+        Ok(Expression::Div(Box::new(division)))
+    } else {
+        Err(crate::error::Error::unsupported(
+            format!(
+                "{} floating-point division may error on zero or overflow, while ClickHouse returns a non-finite Float64 value",
+                context.source
+            ),
+            context.target.to_string(),
+        ))
+    }
 }
 
 pub(super) fn lower_expr(this: Expression) -> Expression {

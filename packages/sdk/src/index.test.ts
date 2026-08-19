@@ -114,6 +114,11 @@ describe('Polyglot SDK', () => {
     assertLayerContract(contract, 'wasm', wasmModule);
   });
 
+  it('exports the compatibility builders from the named and default APIs', () => {
+    expect(sdk.compat.select('x').sql()).toBe('SELECT x');
+    expect(sdk.default.compat.select('y').sql()).toBe('SELECT y');
+  });
+
   describe('init', () => {
     it('should be initialized (synchronous init on import)', () => {
       expect(isInitialized()).toBe(true);
@@ -467,6 +472,28 @@ describe('Polyglot SDK', () => {
         ordinalComplete: false,
       });
     });
+
+    it('should expose Snowflake UNION BY NAME outputs and lineage', () => {
+      const sql =
+        'SELECT 1 AS left_value UNION ALL BY NAME SELECT 2 AS right_value';
+      const output = outputColumns(sql, Dialect.Snowflake);
+
+      expect(output.success).toBe(true);
+      expect(output.output).toEqual({
+        columns: [
+          { kind: 'named', name: 'left_value', ordinal: 0 },
+          { kind: 'named', name: 'right_value', ordinal: 1 },
+        ],
+        ordinalComplete: true,
+      });
+
+      const result = lineageAt(1, sql, Dialect.Snowflake);
+      expect(result.success).toBe(true);
+      expect(collectNames(result.lineage!)).toContain('right_value');
+      expect(result.lineage?.downstream.map((node) => node.set_branch)).toEqual(
+        [{ operator: 'union', ordinal: 1, all: true }],
+      );
+    });
   });
 
   describe('analyzeQuery', () => {
@@ -480,6 +507,42 @@ describe('Polyglot SDK', () => {
         transformKind: 'direct',
       });
       expect(result.analysis?.projections[0].upstream[0].column).toBe('a');
+    });
+
+    it('should classify DuckDB COUNT_IF, MEDIAN, and FIRST as aggregations', () => {
+      const result = analyzeQuery(
+        'SELECT COUNT_IF(numeric_value > 0), MEDIAN(numeric_value), FIRST(numeric_value) FROM source_table',
+        { dialect: Dialect.DuckDB },
+      );
+
+      expect(result.success).toBe(true);
+      expect(
+        result.analysis?.projections.map(({ transformKind }) => transformKind),
+      ).toEqual(['aggregation', 'aggregation', 'aggregation']);
+    });
+
+    it('should classify DuckDB null-preserving arg extrema as aggregations', () => {
+      const result = analyzeQuery(
+        'SELECT ARG_MAX_NULL(label, score), ARG_MIN_NULL(label, score) FROM source_table',
+        { dialect: Dialect.DuckDB },
+      );
+
+      expect(result.success).toBe(true);
+      expect(
+        result.analysis?.projections.map(({ transformKind }) => transformKind),
+      ).toEqual(['aggregation', 'aggregation']);
+    });
+
+    it('should classify DuckDB product, histogram, and quantile aggregates', () => {
+      const result = analyzeQuery(
+        'SELECT PRODUCT(x), APPROX_QUANTILE(x, 0.5), HISTOGRAM_EXACT(x, [1, 2]), MAD(x), QUANTILE(x, 0.5), QUANTILE_CONT(x, 0.5), QUANTILE_DISC(x, 0.5), RESERVOIR_QUANTILE(x, 0.5) FROM source_table',
+        { dialect: Dialect.DuckDB },
+      );
+
+      expect(result.success).toBe(true);
+      expect(
+        result.analysis?.projections.map(({ transformKind }) => transformKind),
+      ).toEqual(Array.from({ length: 8 }, () => 'aggregation'));
     });
 
     it('should expose set-operation branch roles', () => {

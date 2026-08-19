@@ -41,6 +41,38 @@ polyglot_sql.parse_one("VARCHAR(255)", dialect="duckdb", into=polyglot_sql.DataT
 polyglot_sql.format_sql("SELECT a,b FROM t WHERE x=1", dialect="postgres")
 ```
 
+### SQLGlot-Compatible Builders
+
+The common SQLGlot builder surface is available directly from
+`polyglot_sql`. Builders return normal Polyglot expression objects and are
+immutable: each chained call returns a new expression.
+
+```python
+query = (
+    polyglot_sql.select("customer_id", "COUNT(*) AS orders")
+    .from_("orders")
+    .where("status = 'complete'")
+    .group_by("customer_id")
+    .order_by("orders DESC")
+    .limit(10)
+)
+
+query.sql("postgres")
+# "SELECT customer_id, COUNT(*) AS orders FROM orders WHERE status = 'complete' GROUP BY customer_id ORDER BY orders DESC LIMIT 10"
+
+active = polyglot_sql.column("status").eq("active")
+active.sql()
+# "status = 'active'"
+```
+
+The shared builder feature set also includes named aggregate/string/math/date
+helpers, all join and set-operation variants, named windows, lateral views,
+hints, row locks, CTAS, `CASE`, `INSERT`, `UPDATE`, `DELETE`, and conditional
+`MERGE` actions. Repeated clauses append by default; pass `append=False` to
+replace one. Advanced parser options, mutable `copy=False` behavior, and the
+complete SQLGlot expression catalog are not included. Polyglot expressions
+remain the native AST type; SQLGlot is not a runtime dependency.
+
 ```python
 ast = polyglot_sql.parse_one("SELECT id FROM a UNION ALL SELECT id FROM b")
 order_expr = polyglot_sql.parse_one("SELECT id").args["expressions"][0]

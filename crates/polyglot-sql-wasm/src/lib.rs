@@ -3,8 +3,7 @@
 //! This crate provides WASM bindings for the polyglot-sql library,
 //! allowing SQL dialect translation in the browser.
 
-pub mod builders;
-
+use polyglot_sql::builder::plan::{execute as execute_builder, BuildRequest, BuildResult};
 use polyglot_sql::{
     analyze_query as core_analyze_query, ast_json as ast_json_compat, ast_transforms,
     dialects::{Dialect, DialectType, TranspileOptions},
@@ -30,6 +29,23 @@ use polyglot_sql::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
+
+/// Evaluate a stateless SQLGlot-compatible builder plan.
+#[wasm_bindgen]
+pub fn wasm_compat_build(request: JsValue) -> Result<JsValue, JsValue> {
+    set_panic_hook();
+    let request: BuildRequest = serde_wasm_bindgen::from_value(request)
+        .map_err(|error| JsValue::from_str(&format!("Invalid builder request: {error}")))?;
+    match execute_builder(&request).map_err(|error| JsValue::from_str(&error.to_string()))? {
+        BuildResult::Ast(expression) => {
+            let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+            expression.serialize(&serializer).map_err(|error| {
+                JsValue::from_str(&format!("Builder serialization error: {error}"))
+            })
+        }
+        BuildResult::Sql(sql) => Ok(JsValue::from_str(&sql)),
+    }
+}
 
 /// Initialize panic hook for better error messages in WASM
 pub fn set_panic_hook() {

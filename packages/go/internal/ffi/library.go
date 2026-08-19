@@ -15,6 +15,7 @@ type Library struct {
 	Format                   func(string, string) Result
 	FormatWithOptions        func(string, string, string) Result
 	Optimize                 func(string, string) Result
+	Build                    func(string) Result
 	Generate                 func(string, string) Result
 	GenerateDataType         func(string, string) Result
 	Validate                 func(string, string) ValidationResult
@@ -86,6 +87,7 @@ func (l *Library) registerAll() error {
 		{"polyglot_format", &l.Format},
 		{"polyglot_format_with_options", &l.FormatWithOptions},
 		{"polyglot_optimize", &l.Optimize},
+		{"polyglot_build", &l.Build},
 		{"polyglot_generate", &l.Generate},
 		{"polyglot_generate_data_type", &l.GenerateDataType},
 		{"polyglot_validate", &l.Validate},

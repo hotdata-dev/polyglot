@@ -6120,14 +6120,12 @@ impl DuckDBDialect {
                     trailing_comments: Vec::new(),
                     inferred_type: None,
                 }));
-                let two_pi_u2 = Expression::Mul(Box::new(BinaryOp {
-                    left: two_pi,
-                    right: u2,
-                    left_comments: Vec::new(),
-                    operator_comments: Vec::new(),
-                    trailing_comments: Vec::new(),
-                    inferred_type: None,
-                }));
+                let two_pi_u2 = if let Expression::Div(div) = u2 {
+                    let numerator = Expression::Mul(Box::new(BinaryOp::new(two_pi, div.left)));
+                    Expression::Div(Box::new(BinaryOp::new(numerator, div.right)))
+                } else {
+                    Expression::Mul(Box::new(BinaryOp::new(two_pi, u2)))
+                };
                 let cos_part = Expression::Function(Box::new(Function::new(
                     "COS".to_string(),
                     vec![two_pi_u2],
@@ -6328,6 +6326,7 @@ impl DuckDBDialect {
                 let x_value = Expression::Dot(Box::new(crate::expressions::DotAccess {
                     this: x_ref,
                     field: Identifier::new("value"),
+                    inferred_type: None,
                 }));
                 let x_value_is_null = Expression::IsNull(Box::new(crate::expressions::IsNull {
                     this: x_value,
@@ -7212,6 +7211,24 @@ impl DuckDBDialect {
     ) -> Result<Expression> {
         let name_upper = f.name.to_uppercase();
         match name_upper.as_str() {
+            // Keep the established canonical transpilation for a plain DuckDB
+            // LIST aggregate now that the parser represents it as an aggregate
+            // node. Modifier-bearing LIST calls retain their aggregate shape so
+            // DISTINCT, ORDER BY, FILTER, and LIMIT are not discarded.
+            "LIST"
+                if f.args.len() == 1
+                    && !f.distinct
+                    && f.filter.is_none()
+                    && f.order_by.is_empty()
+                    && f.limit.is_none()
+                    && f.ignore_nulls.is_none() =>
+            {
+                Ok(Expression::Function(Box::new(Function::new(
+                    "ARRAY_AGG".to_string(),
+                    f.args,
+                ))))
+            }
+
             // GROUP_CONCAT -> LISTAGG
             "GROUP_CONCAT" if !f.args.is_empty() => Ok(Expression::Function(Box::new(
                 Function::new("LISTAGG".to_string(), f.args),

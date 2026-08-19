@@ -15,10 +15,13 @@ export default defineConfig({
   ],
   build: {
     lib: {
-      entry: resolve(__dirname, 'src/index.ts'),
+      entry: {
+        index: resolve(__dirname, 'src/index.ts'),
+        compat: resolve(__dirname, 'src/compat.ts'),
+      },
       name: 'PolyglotSQL',
       formats: ['es'],
-      fileName: () => 'index.node.js',
+      fileName: (_format, entryName) => `${entryName}.node.js`,
     },
     rollupOptions: {
       external: ['node:fs', 'node:url'],

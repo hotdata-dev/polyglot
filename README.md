@@ -286,7 +286,7 @@ If you want to disable `stacker` for a native Rust build, turn off default featu
 
 ```toml
 [dependencies]
-polyglot-sql = { version = "0.8.1", default-features = false, features = ["all-dialects", "transpile"] }
+polyglot-sql = { version = "0.9.2", default-features = false, features = ["all-dialects", "transpile"] }
 ```
 
 That can reduce overhead slightly on trusted inputs, but you lose the default stack-growth protection for deeply nested SQL.
@@ -405,16 +405,19 @@ Polyglot currently runs **11,333 SQLGlot fixture cases** plus additional project
 | SQLGlot transpile (generic) | 154 | 100% |
 | SQLGlot parser | 32 | 100% |
 | SQLGlot pretty-print | 23 | 100% |
-| Lib unit tests (non-ignored) | 1,142 | 100% |
+| Lib unit tests (non-ignored) | 1,150 | 100% |
 | Custom dialect identity | 276 | 100% |
 | Custom dialect transpilation | 347 | 100% |
 | ClickHouse parser corpus (non-skipped) | 9,417 | 100% |
 | ClickHouse normalized round trips (in-scope) | 121,020 | 100% |
-| FFI integration tests | 66 | 100% |
-| Python bindings tests (non-skipped) | 169 | 100% |
-| **Total (strict Rust/FFI pass/fail case count)** | **143,601** | **100%** |
+| FFI tests (unit + integration) | 67 | 100% |
+| Python bindings tests (non-skipped) | 178 | 100% |
+| **Total (strict Rust/FFI pass/fail case count)** | **143,610** | **100%** |
 
-One Rust unit test is ignored, one Python compatibility test is skipped, and 172 out-of-scope KQL/non-SQL ClickHouse fixtures are excluded from the strict counts.
+One Rust unit test is ignored, one Python capability-contract test is skipped
+unless `POLYGLOT_API_CONTRACT` is configured (179/179 pass when it is), and 172
+out-of-scope KQL/non-SQL ClickHouse fixtures are excluded from the strict
+counts.
 
 ```bash
 # Setup fixtures (required once)
@@ -422,10 +425,10 @@ make setup-fixtures
 
 # Run all tests
 make test-rust-all          # All 11,333 SQLGlot fixture cases
-make test-rust-lib          # 1,142 active lib unit tests (1 ignored)
-make test-rust-verify       # All 143,601 strict Rust/FFI cases
-make test-ffi               # 66 FFI integration tests
-make test-python            # 169 active Python tests (1 skipped)
+make test-rust-lib          # 1,150 active lib unit tests (1 ignored)
+make test-rust-verify       # All 143,610 strict Rust/FFI cases
+make test-ffi               # 67 FFI unit/integration tests
+make test-python            # 178 active Python tests (1 contract test skipped by default)
 
 # Individual test suites
 make test-rust-identity     # 977 generic identity cases
@@ -487,7 +490,7 @@ cargo +nightly fuzz run fuzz_transpile
 | `make test-ffi` | Run FFI integration tests |
 | `make test-rust` | Run SQLGlot-named Rust tests in `polyglot-sql` |
 | `make test-rust-all` | Run all 11,333 SQLGlot fixture cases |
-| `make test-rust-lib` | Run 1,141 active lib unit tests (1 ignored) |
+| `make test-rust-lib` | Run 1,150 active lib unit tests (1 ignored) |
 | `make test-rust-verify` | Full verification suite |
 | `make test-rust-clickhouse-parser` | Run strict ClickHouse parser suite |
 | `make test-rust-clickhouse-coverage` | Run the strict ClickHouse normalized round-trip suite |

@@ -1,12 +1,17 @@
+use crate::builders::{
+    apply_and_wrap, binary_operator, join_type as parse_join_type, node_from_any, nodes_from_tuple,
+    unary_operator,
+};
 use crate::errors::{map_generate_error, GenerateError};
 use crate::expr_types::{wrap_expression, wrap_expression_with_parent};
 use crate::helpers::{resolve_dialect, to_python_object};
 use polyglot_sql::ast_json;
+use polyglot_sql::builder::plan::{BuildNode, BuildOperation, BuilderAssignment, BuilderPlan};
 use polyglot_sql::traversal::ExpressionWalk;
 use polyglot_sql::Expression;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyString, PyTuple};
+use pyo3::types::{PyAny, PyDict, PyString, PyTuple};
 use serde_json::Value;
 
 #[pyclass(subclass, from_py_object, module = "polyglot_sql", name = "Expression")]
@@ -46,6 +51,89 @@ impl PyExpression {
             parent: Some(parent),
             arg_key: Some(arg_key.to_string()),
         }
+    }
+
+    fn builder_binary(
+        &self,
+        py: Python<'_>,
+        op: &str,
+        other: &Bound<'_, PyAny>,
+        parse_string: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let node = BuildNode::Binary {
+            op: binary_operator(op)?,
+            left: Box::new(BuildNode::Ast {
+                expression: Box::new(self.inner.clone()),
+            }),
+            right: Box::new(node_from_any(other, parse_string)?),
+        };
+        let expression = polyglot_sql::builder::plan::evaluate(&BuilderPlan::new(node), "generic")
+            .map_err(crate::errors::map_parse_error)?;
+        wrap_expression(py, expression)
+    }
+
+    fn builder_unary(&self, py: Python<'_>, op: &str) -> PyResult<Py<PyAny>> {
+        let node = BuildNode::Unary {
+            op: unary_operator(op)?,
+            expression: Box::new(BuildNode::Ast {
+                expression: Box::new(self.inner.clone()),
+            }),
+        };
+        let expression = polyglot_sql::builder::plan::evaluate(&BuilderPlan::new(node), "generic")
+            .map_err(crate::errors::map_parse_error)?;
+        wrap_expression(py, expression)
+    }
+
+    fn builder_ordered(&self, py: Python<'_>, desc: bool) -> PyResult<Py<PyAny>> {
+        let node = BuildNode::Ordered {
+            expression: Box::new(BuildNode::Ast {
+                expression: Box::new(self.inner.clone()),
+            }),
+            desc,
+        };
+        let expression = polyglot_sql::builder::plan::evaluate(&BuilderPlan::new(node), "generic")
+            .map_err(crate::errors::map_parse_error)?;
+        wrap_expression(py, expression)
+    }
+
+    fn builder_list_operation(
+        &self,
+        py: Python<'_>,
+        kind: &str,
+        expressions: &Bound<'_, PyTuple>,
+        append: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let expressions = nodes_from_tuple(expressions, true)?;
+        let operation = match kind {
+            "where" => BuildOperation::Where {
+                expressions,
+                append,
+            },
+            "group_by" => BuildOperation::GroupBy {
+                expressions,
+                append,
+            },
+            "having" => BuildOperation::Having {
+                expressions,
+                append,
+            },
+            "order_by" => BuildOperation::OrderBy {
+                expressions,
+                append,
+            },
+            "sort_by" => BuildOperation::SortBy {
+                expressions,
+                append,
+            },
+            "qualify" => BuildOperation::Qualify {
+                expressions,
+                append,
+            },
+            _ => unreachable!("known builder list operation"),
+        };
+        apply_and_wrap(py, self, operation, dialect, copy)
     }
 }
 
@@ -708,6 +796,758 @@ impl PyExpression {
         }
         let _ = py;
         Ok(String::new())
+    }
+
+    // === SQLGlot-compatible builder methods ===
+
+    fn eq(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "eq", other, false)
+    }
+
+    fn neq(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "neq", other, false)
+    }
+
+    fn lt(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "lt", other, false)
+    }
+
+    fn lte(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "lte", other, false)
+    }
+
+    fn gt(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "gt", other, false)
+    }
+
+    fn gte(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "gte", other, false)
+    }
+
+    fn and_(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "and", other, true)
+    }
+
+    fn or_(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "or", other, true)
+    }
+
+    fn xor(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "xor", other, true)
+    }
+
+    fn not_(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.builder_unary(py, "not")
+    }
+
+    fn is_(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "is", other, false)
+    }
+
+    fn is_null(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.builder_unary(py, "is_null")
+    }
+
+    fn is_not_null(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.builder_unary(py, "is_not_null")
+    }
+
+    fn like(&self, py: Python<'_>, pattern: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "like", pattern, false)
+    }
+
+    fn ilike(&self, py: Python<'_>, pattern: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "ilike", pattern, false)
+    }
+
+    fn rlike(&self, py: Python<'_>, pattern: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "rlike", pattern, false)
+    }
+
+    fn between(
+        &self,
+        py: Python<'_>,
+        low: &Bound<'_, PyAny>,
+        high: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let node = BuildNode::Between {
+            expression: Box::new(BuildNode::Ast {
+                expression: Box::new(self.inner.clone()),
+            }),
+            low: Box::new(node_from_any(low, false)?),
+            high: Box::new(node_from_any(high, false)?),
+        };
+        let expression = polyglot_sql::builder::plan::evaluate(&BuilderPlan::new(node), "generic")
+            .map_err(crate::errors::map_parse_error)?;
+        wrap_expression(py, expression)
+    }
+
+    #[pyo3(signature = (*expressions))]
+    fn isin(&self, py: Python<'_>, expressions: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
+        let node = BuildNode::InList {
+            expression: Box::new(BuildNode::Ast {
+                expression: Box::new(self.inner.clone()),
+            }),
+            values: nodes_from_tuple(expressions, false)?,
+            negated: false,
+        };
+        let expression = polyglot_sql::builder::plan::evaluate(&BuilderPlan::new(node), "generic")
+            .map_err(crate::errors::map_parse_error)?;
+        wrap_expression(py, expression)
+    }
+
+    #[pyo3(signature = (*expressions))]
+    fn not_in(&self, py: Python<'_>, expressions: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
+        let node = BuildNode::InList {
+            expression: Box::new(BuildNode::Ast {
+                expression: Box::new(self.inner.clone()),
+            }),
+            values: nodes_from_tuple(expressions, false)?,
+            negated: true,
+        };
+        let expression = polyglot_sql::builder::plan::evaluate(&BuilderPlan::new(node), "generic")
+            .map_err(crate::errors::map_parse_error)?;
+        wrap_expression(py, expression)
+    }
+
+    fn as_(&self, py: Python<'_>, alias: &str) -> PyResult<Py<PyAny>> {
+        let node = BuildNode::Alias {
+            expression: Box::new(BuildNode::Ast {
+                expression: Box::new(self.inner.clone()),
+            }),
+            alias: alias.to_string(),
+        };
+        let expression = polyglot_sql::builder::plan::evaluate(&BuilderPlan::new(node), "generic")
+            .map_err(crate::errors::map_parse_error)?;
+        wrap_expression(py, expression)
+    }
+
+    fn cast(&self, py: Python<'_>, to: &str) -> PyResult<Py<PyAny>> {
+        let node = BuildNode::Cast {
+            expression: Box::new(BuildNode::Ast {
+                expression: Box::new(self.inner.clone()),
+            }),
+            to: to.to_string(),
+        };
+        let expression = polyglot_sql::builder::plan::evaluate(&BuilderPlan::new(node), "generic")
+            .map_err(crate::errors::map_parse_error)?;
+        wrap_expression(py, expression)
+    }
+
+    fn asc(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.builder_ordered(py, false)
+    }
+
+    fn desc(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.builder_ordered(py, true)
+    }
+
+    #[pyo3(signature = (*expressions, append = true, dialect = None, copy = true))]
+    fn select(
+        &self,
+        py: Python<'_>,
+        expressions: &Bound<'_, PyTuple>,
+        append: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Select {
+                expressions: nodes_from_tuple(expressions, true)?,
+                append,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (expression, dialect = None, copy = true))]
+    fn from_(
+        &self,
+        py: Python<'_>,
+        expression: &Bound<'_, PyAny>,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::From {
+                source: node_from_any(expression, true)?,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (expression, on = None, join_type = "", dialect = None, copy = true))]
+    fn join(
+        &self,
+        py: Python<'_>,
+        expression: &Bound<'_, PyAny>,
+        on: Option<&Bound<'_, PyAny>>,
+        join_type: &str,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Join {
+                source: node_from_any(expression, true)?,
+                on: on.map(|value| node_from_any(value, true)).transpose()?,
+                join_type: parse_join_type(join_type)?,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(name = "where", signature = (*expressions, append = true, dialect = None, copy = true))]
+    fn where_builder(
+        &self,
+        py: Python<'_>,
+        expressions: &Bound<'_, PyTuple>,
+        append: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.builder_list_operation(py, "where", expressions, append, dialect, copy)
+    }
+
+    #[pyo3(signature = (*expressions, append = true, dialect = None, copy = true))]
+    fn group_by(
+        &self,
+        py: Python<'_>,
+        expressions: &Bound<'_, PyTuple>,
+        append: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.builder_list_operation(py, "group_by", expressions, append, dialect, copy)
+    }
+
+    #[pyo3(signature = (*expressions, append = true, dialect = None, copy = true))]
+    fn having(
+        &self,
+        py: Python<'_>,
+        expressions: &Bound<'_, PyTuple>,
+        append: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.builder_list_operation(py, "having", expressions, append, dialect, copy)
+    }
+
+    #[pyo3(signature = (*expressions, append = true, dialect = None, copy = true))]
+    fn order_by(
+        &self,
+        py: Python<'_>,
+        expressions: &Bound<'_, PyTuple>,
+        append: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.builder_list_operation(py, "order_by", expressions, append, dialect, copy)
+    }
+
+    #[pyo3(signature = (*expressions, append = true, dialect = None, copy = true))]
+    fn sort_by(
+        &self,
+        py: Python<'_>,
+        expressions: &Bound<'_, PyTuple>,
+        append: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.builder_list_operation(py, "sort_by", expressions, append, dialect, copy)
+    }
+
+    #[pyo3(signature = (expression, dialect = None, copy = true))]
+    fn limit(
+        &self,
+        py: Python<'_>,
+        expression: &Bound<'_, PyAny>,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Limit {
+                expression: node_from_any(expression, false)?,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (expression, dialect = None, copy = true))]
+    fn offset(
+        &self,
+        py: Python<'_>,
+        expression: &Bound<'_, PyAny>,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Offset {
+                expression: node_from_any(expression, false)?,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (distinct = true, copy = true))]
+    fn distinct(&self, py: Python<'_>, distinct: bool, copy: bool) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Distinct { enabled: distinct },
+            None,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (*expressions, append = true, dialect = None, copy = true))]
+    fn qualify(
+        &self,
+        py: Python<'_>,
+        expressions: &Bound<'_, PyTuple>,
+        append: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.builder_list_operation(py, "qualify", expressions, append, dialect, copy)
+    }
+
+    #[pyo3(signature = (expression, table_alias = None, column_aliases = None, outer = false, dialect = None, copy = true))]
+    #[allow(clippy::too_many_arguments)]
+    fn lateral_view(
+        &self,
+        py: Python<'_>,
+        expression: &Bound<'_, PyAny>,
+        table_alias: Option<&str>,
+        column_aliases: Option<Vec<String>>,
+        outer: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::LateralView {
+                expression: node_from_any(expression, true)?,
+                table_alias: table_alias.map(str::to_string),
+                column_aliases: column_aliases.unwrap_or_default(),
+                outer,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (name, partition_by = None, order_by = None, dialect = None, copy = true))]
+    fn window(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        partition_by: Option<&Bound<'_, PyTuple>>,
+        order_by: Option<&Bound<'_, PyTuple>>,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Window {
+                name: name.to_string(),
+                partition_by: partition_by
+                    .map(|values| nodes_from_tuple(values, true))
+                    .transpose()?
+                    .unwrap_or_default(),
+                order_by: order_by
+                    .map(|values| nodes_from_tuple(values, true))
+                    .transpose()?
+                    .unwrap_or_default(),
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (copy = true))]
+    fn for_update(&self, py: Python<'_>, copy: bool) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Lock {
+                lock_type: polyglot_sql::builder::plan::LockType::Update,
+            },
+            None,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (copy = true))]
+    fn for_share(&self, py: Python<'_>, copy: bool) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Lock {
+                lock_type: polyglot_sql::builder::plan::LockType::Share,
+            },
+            None,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (text, copy = true))]
+    fn hint(&self, py: Python<'_>, text: &str, copy: bool) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Hint {
+                text: text.to_string(),
+            },
+            None,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (table, replace = false, temporary = false, copy = true))]
+    fn ctas(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        replace: bool,
+        temporary: bool,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Ctas {
+                table: table.to_string(),
+                replace,
+                temporary,
+            },
+            None,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (alias = None, copy = true))]
+    fn subquery(&self, py: Python<'_>, alias: Option<&str>, copy: bool) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Subquery {
+                alias: alias.map(str::to_string),
+            },
+            None,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (expression, distinct = true, dialect = None, copy = true))]
+    fn union(
+        &self,
+        py: Python<'_>,
+        expression: &Bound<'_, PyAny>,
+        distinct: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Union {
+                other: node_from_any(expression, true)?,
+                distinct,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (expression, distinct = true, dialect = None, copy = true))]
+    fn intersect(
+        &self,
+        py: Python<'_>,
+        expression: &Bound<'_, PyAny>,
+        distinct: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Intersect {
+                other: node_from_any(expression, true)?,
+                distinct,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (expression, distinct = true, dialect = None, copy = true))]
+    fn except_(
+        &self,
+        py: Python<'_>,
+        expression: &Bound<'_, PyAny>,
+        distinct: bool,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Except {
+                other: node_from_any(expression, true)?,
+                distinct,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (condition, result, dialect = None, copy = true))]
+    fn when(
+        &self,
+        py: Python<'_>,
+        condition: &Bound<'_, PyAny>,
+        result: &Bound<'_, PyAny>,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::When {
+                condition: node_from_any(condition, true)?,
+                result: node_from_any(result, true)?,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (result, dialect = None, copy = true))]
+    fn else_(
+        &self,
+        py: Python<'_>,
+        result: &Bound<'_, PyAny>,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Else {
+                result: node_from_any(result, true)?,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (assignments, copy = true))]
+    fn set_(
+        &self,
+        py: Python<'_>,
+        assignments: &Bound<'_, PyDict>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let assignments = assignments
+            .iter()
+            .map(|(key, value)| {
+                Ok(BuilderAssignment {
+                    column: key.extract::<String>()?,
+                    value: node_from_any(&value, false)?,
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        apply_and_wrap(py, self, BuildOperation::Set { assignments }, None, copy)
+    }
+
+    #[pyo3(signature = (columns, copy = true))]
+    fn columns(&self, py: Python<'_>, columns: Vec<String>, copy: bool) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::InsertColumns { columns },
+            None,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (*values, copy = true))]
+    fn values(
+        &self,
+        py: Python<'_>,
+        values: &Bound<'_, PyTuple>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Values {
+                rows: vec![nodes_from_tuple(values, false)?],
+                append: true,
+            },
+            None,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (query, copy = true))]
+    fn query(&self, py: Python<'_>, query: &Bound<'_, PyAny>, copy: bool) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::Query {
+                query: node_from_any(query, true)?,
+            },
+            None,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (source, on, dialect = None, copy = true))]
+    fn merge_using(
+        &self,
+        py: Python<'_>,
+        source: &Bound<'_, PyAny>,
+        on: &Bound<'_, PyAny>,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::MergeUsing {
+                source: node_from_any(source, true)?,
+                on: node_from_any(on, true)?,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (assignments, condition = None, dialect = None, copy = true))]
+    fn when_matched_update(
+        &self,
+        py: Python<'_>,
+        assignments: &Bound<'_, PyDict>,
+        condition: Option<&Bound<'_, PyAny>>,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let assignments = assignments
+            .iter()
+            .map(|(key, value)| {
+                Ok(BuilderAssignment {
+                    column: key.extract::<String>()?,
+                    value: node_from_any(&value, false)?,
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::WhenMatchedUpdate {
+                assignments,
+                condition: condition
+                    .map(|value| node_from_any(value, true))
+                    .transpose()?,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (condition = None, dialect = None, copy = true))]
+    fn when_matched_delete(
+        &self,
+        py: Python<'_>,
+        condition: Option<&Bound<'_, PyAny>>,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::WhenMatchedDelete {
+                condition: condition
+                    .map(|value| node_from_any(value, true))
+                    .transpose()?,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    #[pyo3(signature = (columns, values, condition = None, dialect = None, copy = true))]
+    fn when_not_matched_insert(
+        &self,
+        py: Python<'_>,
+        columns: Vec<String>,
+        values: &Bound<'_, PyTuple>,
+        condition: Option<&Bound<'_, PyAny>>,
+        dialect: Option<&str>,
+        copy: bool,
+    ) -> PyResult<Py<PyAny>> {
+        apply_and_wrap(
+            py,
+            self,
+            BuildOperation::WhenNotMatchedInsert {
+                columns,
+                values: nodes_from_tuple(values, false)?,
+                condition: condition
+                    .map(|value| node_from_any(value, true))
+                    .transpose()?,
+            },
+            dialect,
+            copy,
+        )
+    }
+
+    fn __add__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "add", other, false)
+    }
+    fn __sub__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "sub", other, false)
+    }
+    fn __mul__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "mul", other, false)
+    }
+    fn __truediv__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "div", other, false)
+    }
+    fn __mod__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "mod", other, false)
+    }
+    fn __and__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "and", other, false)
+    }
+    fn __or__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "or", other, false)
+    }
+    fn __xor__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.builder_binary(py, "xor", other, false)
+    }
+    fn __invert__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.builder_unary(py, "not")
+    }
+    fn __neg__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.builder_unary(py, "neg")
     }
 
     // === Standard Python methods ===

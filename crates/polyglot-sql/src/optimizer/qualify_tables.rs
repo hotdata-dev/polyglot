@@ -11,6 +11,7 @@ use crate::helper::name_sequence;
 use crate::optimizer::normalize_identifiers::{
     get_normalization_strategy, normalize_identifier, NormalizationStrategy,
 };
+use crate::scope::traverse_scope;
 use std::collections::{HashMap, HashSet};
 
 /// Options for table qualification
@@ -133,7 +134,20 @@ pub fn qualify_tables(expression: Expression, options: &QualifyTablesOptions) ->
     } else {
         &options.alias_prefix
     };
-    let mut next_alias = name_sequence(alias_prefix);
+    let mut reserved_aliases: HashSet<String> = traverse_scope(&expression)
+        .into_iter()
+        .flat_map(|scope| scope.sources.into_keys())
+        .filter(|name| !name.is_empty())
+        .map(|name| normalize_identifier(Identifier::new(name), strategy).name)
+        .collect();
+    let mut alias_sequence = name_sequence(alias_prefix);
+    let mut next_alias = || loop {
+        let candidate = alias_sequence();
+        let normalized = normalize_identifier(Identifier::new(candidate.clone()), strategy).name;
+        if reserved_aliases.insert(normalized) {
+            return candidate;
+        }
+    };
 
     qualify_tables_inner(expression, options, strategy, &mut next_alias)
 }
@@ -771,6 +785,20 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT * FROM (SELECT * FROM tab_1 AS tab_1) AS _0 UNION ALL SELECT * FROM (SELECT * FROM tab_1 AS tab_1) AS _1"
+        );
+    }
+
+    #[test]
+    fn test_generated_subquery_alias_avoids_existing_source_alias() {
+        let options = QualifyTablesOptions::new().with_alias_unaliased_tables(false);
+        let expr =
+            parse("SELECT _0.a, b FROM first_table AS _0 CROSS JOIN (SELECT b FROM second_table)");
+        let qualified = qualify_tables(expr, &options);
+        let sql = gen(&qualified);
+
+        assert_eq!(
+            sql,
+            "SELECT _0.a, b FROM first_table AS _0 CROSS JOIN (SELECT b FROM second_table) AS _1"
         );
     }
 

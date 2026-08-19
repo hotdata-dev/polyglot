@@ -888,6 +888,10 @@ fn postgres_to_date_literals_respect_fabric_date_domain() {
     for sql in [
         "SELECT to_date('-44-02-01', 'YYYY-MM-DD')",
         "SELECT to_date('0000-02-01', 'YYYY-MM-DD')",
+        "SELECT to_date('-44-02-01'::text, 'YYYY-MM-DD'::text)",
+        "SELECT to_date('0000-02-01'::text, 'YYYY-MM-DD'::text)",
+        "SELECT to_date('0001-01-01'::char(1), 'YYYY-MM-DD'::text)",
+        "SELECT to_date('0001-01-01'::varchar(1), 'YYYY-MM-DD'::text)",
         "SELECT to_date('10000-02-01', 'YYYY-MM-DD')",
         "SELECT to_date('02/01/0000', 'MM/DD/YYYY')",
         "SELECT to_date('00000201', 'YYYYMMDD')",
@@ -914,6 +918,31 @@ fn postgres_to_date_literals_respect_fabric_date_domain() {
         (
             "SELECT to_date(date_text, 'YYYY-MM-DD') FROM t",
             "SELECT CONVERT(DATE, date_text, 23) FROM t",
+        ),
+        (
+            "SELECT to_date('1'::char(-1), 'YYYY-MM-DD')",
+            "SELECT CONVERT(DATE, CAST('1' AS CHAR(4294967295)), 23)",
+        ),
+        (
+            "SELECT to_date('1'::char(4294967295), 'YYYY-MM-DD')",
+            "SELECT CONVERT(DATE, CAST('1' AS CHAR(4294967295)), 23)",
+        ),
+    ] {
+        assert_eq!(pg_to_fabric_strict(sql), expected, "failed for {sql}");
+    }
+
+    for (sql, expected) in [
+        (
+            "SELECT to_date('0001-01-01'::text, 'YYYY-MM-DD'::text)",
+            "SELECT CONVERT(DATE, CAST('0001-01-01' AS VARCHAR(MAX)), 23)",
+        ),
+        (
+            "SELECT to_date('9999-12-31'::text, 'YYYY-MM-DD'::text)",
+            "SELECT CONVERT(DATE, CAST('9999-12-31' AS VARCHAR(MAX)), 23)",
+        ),
+        (
+            "SELECT to_date(date_text::text, 'YYYY-MM-DD'::text) FROM t",
+            "SELECT CONVERT(DATE, CAST(date_text AS VARCHAR(MAX)), 23) FROM t",
         ),
     ] {
         assert_eq!(pg_to_fabric_strict(sql), expected, "failed for {sql}");
@@ -2316,6 +2345,33 @@ fn strict_postgres_distinct_string_agg_is_rejected_for_fabric() {
             TranspileOptions::strict(),
         )
         .is_ok());
+}
+
+#[test]
+fn strict_postgres_aggregate_arguments_containing_subqueries_are_rejected_for_fabric() {
+    let pg = Dialect::get(DialectType::PostgreSQL);
+    for sql in [
+        "SELECT (SELECT max((SELECT i.unique2 FROM tenk1 i WHERE i.unique1 = o.unique1))) FROM tenk1 o",
+        "SELECT (SELECT max((SELECT i.unique2 FROM tenk1 i WHERE i.unique1 = o.unique1)) FILTER (WHERE o.unique1 < 10)) FROM tenk1 o",
+        "SELECT sum(unique1) FILTER (WHERE unique1 IN (SELECT unique1 FROM onek WHERE unique1 < 100)) FROM tenk1",
+    ] {
+        let err = pg
+            .transpile_with(sql, DialectType::Fabric, TranspileOptions::strict())
+            .expect_err("strict Fabric transpilation should reject a subquery in an aggregate argument");
+        assert!(
+            err.to_string()
+                .contains("aggregate arguments containing subqueries"),
+            "unexpected error for {sql}: {err}"
+        );
+    }
+
+    for sql in [
+        "SELECT (SELECT i.unique2 FROM tenk1 i WHERE i.unique1 = o.unique1) FROM tenk1 o",
+        "SELECT (SELECT max(i.unique2) FROM tenk1 i WHERE i.unique1 = o.unique1) FROM tenk1 o",
+    ] {
+        pg.transpile_with(sql, DialectType::Fabric, TranspileOptions::strict())
+            .unwrap_or_else(|err| panic!("strict mode should accept {sql}: {err}"));
+    }
 }
 
 #[test]

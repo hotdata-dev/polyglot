@@ -9,7 +9,7 @@ use crate::expressions::*;
 use crate::lineage::{self, LineageNode, SetOperator};
 use crate::schema::Schema;
 use crate::scope::SourceKind;
-use crate::traversal::ExpressionWalk;
+use crate::traversal::{contains_aggregate, ExpressionWalk};
 use crate::{mapping_schema_from_validation_schema_with_dialect, Error, Result, ValidationSchema};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
@@ -720,62 +720,7 @@ fn has_virtual_terminal(node: &LineageNode) -> bool {
 }
 
 fn expression_contains_aggregate(expr: &Expression) -> bool {
-    expr.contains(|node| {
-        matches!(
-            node,
-            Expression::AggregateFunction(_)
-                | Expression::Sum(_)
-                | Expression::Count(_)
-                | Expression::Avg(_)
-                | Expression::Min(_)
-                | Expression::Max(_)
-                | Expression::GroupConcat(_)
-                | Expression::StringAgg(_)
-                | Expression::ListAgg(_)
-                | Expression::ArrayAgg(_)
-                | Expression::CountIf(_)
-                | Expression::SumIf(_)
-                | Expression::Stddev(_)
-                | Expression::StddevPop(_)
-                | Expression::StddevSamp(_)
-                | Expression::Variance(_)
-                | Expression::VarPop(_)
-                | Expression::VarSamp(_)
-                | Expression::Median(_)
-                | Expression::Mode(_)
-                | Expression::First(_)
-                | Expression::Last(_)
-                | Expression::AnyValue(_)
-                | Expression::ApproxDistinct(_)
-                | Expression::ApproxCountDistinct(_)
-                | Expression::ApproxPercentile(_)
-                | Expression::Percentile(_)
-                | Expression::LogicalAnd(_)
-                | Expression::LogicalOr(_)
-                | Expression::Skewness(_)
-                | Expression::BitwiseCount(_)
-                | Expression::ArrayConcatAgg(_)
-                | Expression::ArrayUniqueAgg(_)
-                | Expression::BoolXorAgg(_)
-                | Expression::ParameterizedAgg(_)
-                | Expression::ArgMax(_)
-                | Expression::ArgMin(_)
-                | Expression::ApproxTopK(_)
-                | Expression::ApproxTopKAccumulate(_)
-                | Expression::ApproxTopKCombine(_)
-                | Expression::ApproxTopKEstimate(_)
-                | Expression::ApproxTopSum(_)
-                | Expression::ApproxQuantiles(_)
-                | Expression::Grouping(_)
-                | Expression::GroupingId(_)
-                | Expression::AnonymousAggFunc(_)
-                | Expression::CombinedAggFunc(_)
-                | Expression::CombinedParameterizedAgg(_)
-                | Expression::HashAgg(_)
-                | Expression::ObjectAgg(_)
-                | Expression::AIAgg(_)
-        )
-    })
+    contains_aggregate(expr)
 }
 
 fn collect_input_datasets(

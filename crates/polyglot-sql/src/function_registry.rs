@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
+use crate::dialects::DialectType;
+
 /// Metadata describing parser-specific function behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FunctionSpec {
@@ -129,6 +131,35 @@ pub(crate) const AGGREGATE_FUNCTION_NAME_LIST: &[&str] = &[
     "ARBITRARY",
 ];
 
+/// DuckDB aggregate names that are not already covered by the shared registry.
+///
+/// This list follows DuckDB's 1.4 LTS aggregate-function catalog. Macro aliases
+/// such as `GEOMEAN` and `WAVG` are included because calls to those macros have
+/// aggregate cardinality in DuckDB. `HISTOGRAM_VALUES` is intentionally absent:
+/// DuckDB exposes it as a table macro used in `FROM`, not as an aggregate
+/// expression.
+pub(crate) const DUCKDB_AGGREGATE_FUNCTION_NAME_LIST: &[&str] = &[
+    "ARG_MAX_NULL",
+    "ARG_MIN_NULL",
+    "BITSTRING_AGG",
+    "SUMKAHAN",
+    "KAHAN_SUM",
+    "GEOMETRIC_MEAN",
+    "GEOMEAN",
+    "HISTOGRAM_EXACT",
+    "PRODUCT",
+    "WEIGHTED_AVG",
+    "WAVG",
+    "APPROX_QUANTILE",
+    "RESERVOIR_QUANTILE",
+    "KURTOSIS_POP",
+    "MAD",
+    "QUANTILE_CONT",
+    "QUANTILE_DISC",
+    "QUANTILE",
+    "SEM",
+];
+
 /// Consolidated metadata map keyed by uppercased function name.
 pub(crate) static FUNCTION_SPECS: LazyLock<HashMap<&'static str, FunctionSpec>> =
     LazyLock::new(|| {
@@ -174,6 +205,15 @@ pub(crate) static AGGREGATE_FUNCTION_NAME_SET: LazyLock<HashSet<&'static str>> =
         FUNCTION_SPECS
             .iter()
             .filter_map(|(name, spec)| spec.aggregate.then_some(*name))
+            .collect()
+    });
+
+/// DuckDB-specific names that should use aggregate parsing behavior.
+pub(crate) static DUCKDB_AGGREGATE_FUNCTION_NAME_SET: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| {
+        DUCKDB_AGGREGATE_FUNCTION_NAME_LIST
+            .iter()
+            .copied()
             .collect()
     });
 
@@ -2195,6 +2235,18 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
     is_aggregate_function_name_upper(upper.as_str())
 }
 
+/// Returns true if the given name should use aggregate parsing behavior for the
+/// selected source dialect.
+pub(crate) fn is_aggregate_function_name_for_dialect(
+    name: &str,
+    dialect: Option<DialectType>,
+) -> bool {
+    let upper = name.to_uppercase();
+    is_aggregate_function_name(name)
+        || (matches!(dialect, Some(DialectType::DuckDB))
+            && DUCKDB_AGGREGATE_FUNCTION_NAME_SET.contains(upper.as_str()))
+}
+
 /// Returns typed function spec by canonical or alias uppercased name.
 pub(crate) fn typed_function_spec_by_name_upper(
     upper_name: &str,
@@ -2234,11 +2286,12 @@ pub(crate) fn typed_dispatch_group_by_name_upper(
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_typed_function_name_upper, is_aggregate_function_name_upper,
-        is_no_paren_function_name_upper, parser_dispatch_behavior_by_name_upper,
-        typed_dispatch_group_by_name_upper, typed_function_spec_by_canonical_upper,
-        typed_function_spec_by_name_upper, ParserDispatchBehavior, TypedDispatchGroup,
-        TypedParseKind, AGGREGATE_FUNCTION_NAME_LIST, FUNCTION_SPECS, NO_PAREN_FUNCTION_NAME_LIST,
+        canonical_typed_function_name_upper, is_aggregate_function_name_for_dialect,
+        is_aggregate_function_name_upper, is_no_paren_function_name_upper,
+        parser_dispatch_behavior_by_name_upper, typed_dispatch_group_by_name_upper,
+        typed_function_spec_by_canonical_upper, typed_function_spec_by_name_upper,
+        ParserDispatchBehavior, TypedDispatchGroup, TypedParseKind, AGGREGATE_FUNCTION_NAME_LIST,
+        DUCKDB_AGGREGATE_FUNCTION_NAME_LIST, FUNCTION_SPECS, NO_PAREN_FUNCTION_NAME_LIST,
         PARSER_DISPATCH_SPECS, TYPED_DISPATCH_GROUP_SPECS, TYPED_FUNCTION_ALIAS_TO_CANONICAL,
         TYPED_FUNCTION_SPECS,
     };
@@ -2271,6 +2324,14 @@ mod tests {
         assert!(is_aggregate_function_name_upper("COUNT"));
         assert!(is_aggregate_function_name_upper("APPROX_PERCENTILE"));
         assert!(!is_aggregate_function_name_upper("COALESCE"));
+        assert!(is_aggregate_function_name_for_dialect(
+            "arg_max_null",
+            Some(DialectType::DuckDB)
+        ));
+        assert!(!is_aggregate_function_name_for_dialect(
+            "arg_max_null",
+            Some(DialectType::Generic)
+        ));
     }
 
     #[test]
@@ -2288,6 +2349,20 @@ mod tests {
             aggregate_unique.len(),
             AGGREGATE_FUNCTION_NAME_LIST.len(),
             "aggregate source list has duplicates"
+        );
+
+        let duckdb_aggregate_unique: HashSet<&str> = DUCKDB_AGGREGATE_FUNCTION_NAME_LIST
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            duckdb_aggregate_unique.len(),
+            DUCKDB_AGGREGATE_FUNCTION_NAME_LIST.len(),
+            "DuckDB aggregate source list has duplicates"
+        );
+        assert!(
+            duckdb_aggregate_unique.is_disjoint(&aggregate_unique),
+            "DuckDB-specific aggregate names should not duplicate shared names"
         );
 
         let parser_dispatch_unique: HashSet<&str> =
@@ -2314,6 +2389,113 @@ mod tests {
         )
         .expect("ARBITRARY should parse with aggregate ORDER BY/LIMIT clauses");
         assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn duckdb_lts_aggregate_catalog_is_discoverable() {
+        // Snapshot of the expression-level functions and aliases documented at
+        // https://duckdb.org/docs/lts/sql/functions/aggregates. The
+        // HISTOGRAM_VALUES table macro is intentionally not part of this list.
+        const EXPRESSIONS: &[&str] = &[
+            "ANY_VALUE(a)",
+            "ARG_MAX(a, b)",
+            "ARG_MAX(a, b, 2)",
+            "ARGMAX(a, b)",
+            "ARGMAX(a, b, 2)",
+            "MAX_BY(a, b)",
+            "MAX_BY(a, b, 2)",
+            "ARG_MAX_NULL(a, b)",
+            "ARG_MIN(a, b)",
+            "ARG_MIN(a, b, 2)",
+            "ARGMIN(a, b)",
+            "ARGMIN(a, b, 2)",
+            "MIN_BY(a, b)",
+            "MIN_BY(a, b, 2)",
+            "ARG_MIN_NULL(a, b)",
+            "AVG(a)",
+            "BIT_AND(a)",
+            "BIT_OR(a)",
+            "BIT_XOR(a)",
+            "BITSTRING_AGG(a)",
+            "BOOL_AND(a)",
+            "BOOL_OR(a)",
+            "COUNT()",
+            "COUNT(a)",
+            "COUNTIF(a)",
+            "FAVG(a)",
+            "FIRST(a)",
+            "ARBITRARY(a)",
+            "FSUM(a)",
+            "SUMKAHAN(a)",
+            "KAHAN_SUM(a)",
+            "GEOMETRIC_MEAN(a)",
+            "GEOMEAN(a)",
+            "HISTOGRAM(a)",
+            "HISTOGRAM(a, [0, 1, 10])",
+            "HISTOGRAM_EXACT(a, ['a', 'b'])",
+            "LAST(a)",
+            "LIST(a)",
+            "LIST(a ORDER BY b)",
+            "ARRAY_AGG(a)",
+            "MAX(a)",
+            "MAX(a, 2)",
+            "MIN(a)",
+            "MIN(a, 2)",
+            "PRODUCT(a)",
+            "STRING_AGG(a)",
+            "STRING_AGG(a, ',')",
+            "GROUP_CONCAT(a)",
+            "LISTAGG(a)",
+            "SUM(a)",
+            "WEIGHTED_AVG(a, b)",
+            "WAVG(a, b)",
+            "APPROX_COUNT_DISTINCT(a)",
+            "APPROX_QUANTILE(a, 0.5)",
+            "APPROX_TOP_K(a, 3)",
+            "RESERVOIR_QUANTILE(a, 0.5)",
+            "RESERVOIR_QUANTILE(a, 0.5, 1024)",
+            "CORR(a, b)",
+            "COVAR_POP(a, b)",
+            "COVAR_SAMP(a, b)",
+            "ENTROPY(a)",
+            "KURTOSIS_POP(a)",
+            "KURTOSIS(a)",
+            "MAD(a)",
+            "MEDIAN(a)",
+            "MODE(a)",
+            "QUANTILE_CONT(a, 0.5)",
+            "QUANTILE_DISC(a, 0.5)",
+            "QUANTILE(a, 0.5)",
+            "REGR_AVGX(a, b)",
+            "REGR_AVGY(a, b)",
+            "REGR_COUNT(a, b)",
+            "REGR_INTERCEPT(a, b)",
+            "REGR_R2(a, b)",
+            "REGR_SLOPE(a, b)",
+            "REGR_SXX(a, b)",
+            "REGR_SXY(a, b)",
+            "REGR_SYY(a, b)",
+            "SKEWNESS(a)",
+            "SEM(a)",
+            "STDDEV_POP(a)",
+            "STDDEV_SAMP(a)",
+            "STDDEV(a)",
+            "VAR_POP(a)",
+            "VAR_SAMP(a)",
+            "VARIANCE(a)",
+        ];
+
+        for expression in EXPRESSIONS {
+            let sql = format!("SELECT {expression} FROM t");
+            let parsed = crate::parse_one(&sql, DialectType::DuckDB)
+                .unwrap_or_else(|error| panic!("failed to parse {expression}: {error}"));
+            let aggregates = crate::ast_transforms::get_aggregate_functions(&parsed);
+            assert_eq!(
+                aggregates.len(),
+                1,
+                "expected exactly one aggregate for {expression}, got {aggregates:?}"
+            );
+        }
     }
 
     #[test]

@@ -99,6 +99,30 @@ func integrationLibraryPath(t *testing.T) string {
 	return path
 }
 
+func TestBuilderIntegration(t *testing.T) {
+	client := integrationClient(t)
+	base := Select("x").From("tbl").Where("x > 0")
+	extended := base.Where("x < 9")
+
+	baseSQL, err := client.BuildSQL(base, "generic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extendedSQL, err := client.BuildSQL(extended, "generic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseSQL != "SELECT x FROM tbl WHERE x > 0" {
+		t.Fatalf("base SQL = %q", baseSQL)
+	}
+	if extendedSQL != "SELECT x FROM tbl WHERE x > 0 AND x < 9" {
+		t.Fatalf("extended SQL = %q", extendedSQL)
+	}
+	if _, err := client.Build(extended); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func integrationSchema() ValidationSchema {
 	nullable := true
 	nonNull := false
@@ -802,6 +826,40 @@ func TestIntegrationLineageAndOpenLineage(t *testing.T) {
 
 	if _, err := client.OpenLineageColumnLineage("SELECT total FROM orders", OpenLineageOptions{}); err == nil {
 		t.Fatal("OpenLineageColumnLineage accepted missing producer/output dataset")
+	}
+}
+
+func TestIntegrationBigQueryNameAlignedSetOperation(t *testing.T) {
+	client := integrationClient(t)
+	const sql = "SELECT 1 AS a, 2 AS b FULL OUTER UNION ALL BY NAME SELECT 3 AS b, 4 AS c"
+
+	output, err := client.OutputColumns(sql, "bigquery")
+	if err != nil {
+		t.Fatalf("BigQuery name-aligned OutputColumns: %v", err)
+	}
+	if !output.OrdinalComplete || len(output.Columns) != 3 ||
+		output.Columns[0].Name == nil || *output.Columns[0].Name != "a" ||
+		output.Columns[1].Name == nil || *output.Columns[1].Name != "b" ||
+		output.Columns[2].Name == nil || *output.Columns[2].Name != "c" {
+		t.Fatalf("unexpected BigQuery name-aligned output: %#v", output)
+	}
+
+	analysis, err := client.AnalyzeQuery(sql, AnalyzeQueryOptions{Dialect: "bigquery"})
+	if err != nil {
+		t.Fatalf("BigQuery name-aligned AnalyzeQuery: %v", err)
+	}
+	if len(analysis.SetOperations) != 1 ||
+		len(analysis.SetOperations[0].OutputColumns) != 3 ||
+		analysis.SetOperations[0].OutputColumns[0] != "a" ||
+		analysis.SetOperations[0].OutputColumns[1] != "b" ||
+		analysis.SetOperations[0].OutputColumns[2] != "c" {
+		t.Fatalf("unexpected BigQuery name-aligned analysis: %#v", analysis.SetOperations)
+	}
+	if len(analysis.Projections) != 3 ||
+		analysis.Projections[0].Nullability != "nullable" ||
+		analysis.Projections[1].Nullability != "non_null" ||
+		analysis.Projections[2].Nullability != "nullable" {
+		t.Fatalf("unexpected BigQuery name-aligned nullability: %#v", analysis.Projections)
 	}
 }
 
