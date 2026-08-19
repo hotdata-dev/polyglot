@@ -162,9 +162,9 @@ pub use tsql::TSQLDialect;
 use crate::error::Result;
 #[cfg(feature = "transpile")]
 use crate::expressions::{
-    BinaryOp, Case, Cast, ColumnConstraint, DateBin, Fetch, Function, Identifier, Interval,
-    IntervalUnit, IntervalUnitSpec, Literal, Offset, Over, Select, Subquery, Top, Var, WindowFrame,
-    WindowFrameBound, WindowFrameKind,
+    BinaryOp, Case, Cast, ColumnConstraint, DateBin, DateTimeField, Fetch, Function, Identifier,
+    Interval, IntervalUnit, IntervalUnitSpec, JoinKind, Literal, Offset, Over, Select, Subquery,
+    Top, Var, WindowFrame, WindowFrameBound, WindowFrameKind,
 };
 use crate::expressions::{DataType, Expression};
 #[cfg(any(
@@ -188,7 +188,7 @@ use crate::parser::Parser;
 use crate::tokens::TokenType;
 use crate::tokens::{Token, Tokenizer, TokenizerConfig};
 #[cfg(feature = "transpile")]
-use crate::traversal::ExpressionWalk;
+use crate::traversal::{is_aggregate, ExpressionWalk};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(feature = "transpile")]
@@ -3540,6 +3540,7 @@ impl Dialect {
                     expr
                 };
 
+                Self::reject_clickhouse_session_semantics(&expr, self.dialect_type, target, opts)?;
                 Self::reject_postgres_tsql_strict_regex_predicates(
                     &expr,
                     self.dialect_type,
@@ -3601,21 +3602,34 @@ impl Dialect {
                         normalized
                     };
 
-                // Snowflake source to non-Snowflake target: CURRENT_TIME -> LOCALTIME
-                // Snowflake's CURRENT_TIME is equivalent to LOCALTIME in other dialects.
-                // Python sqlglot parses Snowflake's CURRENT_TIME as Localtime expression.
+                // Snowflake source to non-Snowflake target: CURRENT_TIME -> LOCALTIME.
+                // Preserve precision for ClickHouse's Time64 lowering; retain the existing
+                // precision-less LOCALTIME compatibility output for other targets.
                 let normalized = if matches!(self.dialect_type, DialectType::Snowflake)
                     && !matches!(target, DialectType::Snowflake)
                 {
-                    transform_recursive(normalized, &|e| {
-                        if let Expression::Function(ref f) = e {
-                            if f.name.eq_ignore_ascii_case("CURRENT_TIME") {
-                                return Ok(Expression::Localtime(Box::new(
-                                    crate::expressions::Localtime { this: None },
-                                )));
-                            }
+                    transform_recursive(normalized, &|e| match e {
+                        Expression::Function(ref f)
+                            if f.name.eq_ignore_ascii_case("CURRENT_TIME") =>
+                        {
+                            let precision = if matches!(target, DialectType::ClickHouse) {
+                                f.args.first().cloned().map(Box::new)
+                            } else {
+                                None
+                            };
+                            Ok(Expression::Localtime(Box::new(
+                                crate::expressions::Localtime { this: precision },
+                            )))
                         }
-                        Ok(e)
+                        Expression::Localtime(ref localtime)
+                            if !matches!(target, DialectType::ClickHouse)
+                                && localtime.this.is_some() =>
+                        {
+                            Ok(Expression::Localtime(Box::new(
+                                crate::expressions::Localtime { this: None },
+                            )))
+                        }
+                        _ => Ok(e),
                     })?
                 } else {
                     normalized
@@ -4326,6 +4340,226 @@ impl Dialect {
             && select.for_json.is_empty()
     }
 
+    fn reject_clickhouse_session_semantics(
+        expr: &Expression,
+        source: DialectType,
+        target: DialectType,
+        opts: &TranspileOptions,
+    ) -> Result<()> {
+        if !matches!(
+            opts.unsupported_level,
+            UnsupportedLevel::Raise | UnsupportedLevel::Immediate
+        ) || target != DialectType::ClickHouse
+            || source == DialectType::ClickHouse
+        {
+            return Ok(());
+        }
+
+        const JOIN_USE_NULLS_DIAGNOSTIC: &str = "ClickHouse outer joins require the target setting join_use_nulls = 1 to preserve unmatched-row NULL semantics";
+        const AGGREGATE_NULL_FOR_EMPTY_DIAGNOSTIC: &str = "ClickHouse non-count aggregates require the target setting aggregate_functions_null_for_empty = 1 to preserve empty-input NULL semantics";
+
+        fn is_current_session_time(node: &Expression) -> bool {
+            match node {
+                Expression::CurrentDate(_)
+                | Expression::CurrentTime(_)
+                | Expression::CurrentTimestamp(_)
+                | Expression::CurrentTimestampLTZ(_)
+                | Expression::Localtime(_)
+                | Expression::Localtimestamp(_)
+                | Expression::Systimestamp(_) => true,
+                Expression::Function(function) if !function.quoted => matches!(
+                    function.name.to_ascii_uppercase().as_str(),
+                    "CURRENT_DATE"
+                        | "CURRENT_TIME"
+                        | "LOCALTIME"
+                        | "CURRENT_TIMESTAMP"
+                        | "CURRENT_TIMESTAMP_LTZ"
+                        | "LOCALTIMESTAMP"
+                        | "NOW"
+                        | "GETDATE"
+                        | "SYSTIMESTAMP"
+                ),
+                _ => false,
+            }
+        }
+
+        fn is_session_week_part(expression: &Expression) -> bool {
+            let part = match expression {
+                Expression::Literal(literal) => match literal.as_ref() {
+                    Literal::String(value) => Some(value.as_str()),
+                    _ => None,
+                },
+                Expression::Identifier(identifier) => Some(identifier.name.as_str()),
+                Expression::Var(var) => Some(var.this.as_str()),
+                Expression::Column(column) if column.table.is_none() => {
+                    Some(column.name.name.as_str())
+                }
+                _ => None,
+            };
+            part.is_some_and(|part| {
+                matches!(
+                    part.to_ascii_uppercase().as_str(),
+                    "WEEK" | "W" | "WK" | "WEEKOFYEAR" | "WOY" | "WY"
+                )
+            })
+        }
+
+        fn is_session_week_trunc(node: &Expression) -> bool {
+            match node {
+                Expression::DateTrunc(date_trunc) => {
+                    matches!(date_trunc.unit, DateTimeField::Week)
+                }
+                Expression::Function(function)
+                    if !function.quoted && function.name.eq_ignore_ascii_case("DATE_TRUNC") =>
+                {
+                    function.args.first().is_some_and(is_session_week_part)
+                }
+                _ => false,
+            }
+        }
+
+        fn is_null_extending_clickhouse_join(node: &Expression) -> bool {
+            fn join_is_null_extending(join: &Join) -> bool {
+                matches!(
+                    join.kind,
+                    JoinKind::Left
+                        | JoinKind::Right
+                        | JoinKind::Full
+                        | JoinKind::NaturalLeft
+                        | JoinKind::NaturalRight
+                        | JoinKind::NaturalFull
+                        | JoinKind::AsOfLeft
+                        | JoinKind::AsOfRight
+                )
+            }
+
+            fn joins_are_null_extending(joins: &[Join]) -> bool {
+                joins.iter().any(join_is_null_extending)
+            }
+
+            match node {
+                Expression::Join(join) => join_is_null_extending(join),
+                Expression::Select(select) => joins_are_null_extending(&select.joins),
+                Expression::JoinedTable(joined) => joins_are_null_extending(&joined.joins),
+                Expression::Update(update) => {
+                    joins_are_null_extending(&update.table_joins)
+                        || joins_are_null_extending(&update.from_joins)
+                }
+                Expression::Delete(delete) => joins_are_null_extending(&delete.joins),
+                _ => false,
+            }
+        }
+
+        fn is_count_like_aggregate(node: &Expression) -> bool {
+            match node {
+                Expression::Count(_)
+                | Expression::CountIf(_)
+                | Expression::ApproxDistinct(_)
+                | Expression::ApproxCountDistinct(_) => true,
+                Expression::AggregateFunction(function) => matches!(
+                    function.name.to_ascii_uppercase().as_str(),
+                    "COUNT" | "COUNT_IF" | "COUNTIF" | "APPROX_DISTINCT" | "APPROX_COUNT_DISTINCT"
+                ),
+                _ => false,
+            }
+        }
+
+        fn is_empty_input_sensitive_aggregate(node: &Expression, source: DialectType) -> bool {
+            Dialect::node_is_aggregate_function(node)
+                && !is_count_like_aggregate(node)
+                && !matches!(node, Expression::BitwiseCount(_))
+                && !matches!(node, Expression::Median(_) if source == DialectType::Snowflake)
+                && !matches!(
+                    node,
+                    Expression::AggregateFunction(function)
+                        if function.name.to_ascii_lowercase().ends_with("ornull")
+                )
+        }
+
+        fn setting_is_enabled(setting: &Expression, name: &str) -> bool {
+            let Expression::Eq(equality) = setting else {
+                return false;
+            };
+            let setting_name = match &equality.left {
+                Expression::Identifier(identifier) => identifier.name.as_str(),
+                Expression::Column(column) if column.table.is_none() => column.name.name.as_str(),
+                Expression::Var(var) => var.this.as_str(),
+                _ => return false,
+            };
+            let enabled = match &equality.right {
+                Expression::Literal(literal) => {
+                    matches!(literal.as_ref(), Literal::Number(value) if value.parse::<i128>().is_ok_and(|value| value == 1))
+                }
+                Expression::Boolean(boolean) => boolean.value,
+                _ => false,
+            };
+            setting_name.eq_ignore_ascii_case(name) && enabled
+        }
+
+        fn query_has_enabled_setting(expr: &Expression, name: &str) -> bool {
+            expr.dfs().any(|node| {
+                matches!(
+                    node,
+                    Expression::Select(select)
+                        if select.settings.as_ref().is_some_and(|settings| {
+                            settings.iter().any(|setting| setting_is_enabled(setting, name))
+                        })
+                )
+            })
+        }
+
+        let mut diagnostics = Vec::new();
+        let join_use_nulls_enabled = query_has_enabled_setting(expr, "join_use_nulls");
+        let aggregate_null_for_empty_enabled =
+            query_has_enabled_setting(expr, "aggregate_functions_null_for_empty");
+        for node in expr.dfs() {
+            if source == DialectType::Snowflake && is_current_session_time(node) {
+                Self::push_unsupported_diagnostic(
+                    &mut diagnostics,
+                    "Snowflake current date/time expressions depend on the session TIMEZONE, which cannot be preserved for ClickHouse",
+                );
+            }
+            if source == DialectType::Snowflake && is_session_week_trunc(node) {
+                Self::push_unsupported_diagnostic(
+                    &mut diagnostics,
+                    "Snowflake DATE_TRUNC with a week unit depends on the session WEEK_START, which cannot be preserved for ClickHouse",
+                );
+            }
+            if !join_use_nulls_enabled && is_null_extending_clickhouse_join(node) {
+                Self::push_unsupported_diagnostic(&mut diagnostics, JOIN_USE_NULLS_DIAGNOSTIC);
+            }
+            if !aggregate_null_for_empty_enabled && is_empty_input_sensitive_aggregate(node, source)
+            {
+                Self::push_unsupported_diagnostic(
+                    &mut diagnostics,
+                    AGGREGATE_NULL_FOR_EMPTY_DIAGNOSTIC,
+                );
+            }
+            if opts.unsupported_level == UnsupportedLevel::Immediate && !diagnostics.is_empty() {
+                break;
+            }
+        }
+
+        if diagnostics.is_empty() {
+            return Ok(());
+        }
+
+        let limit = if opts.unsupported_level == UnsupportedLevel::Immediate {
+            1
+        } else {
+            opts.max_unsupported.max(1)
+        };
+        let mut messages = diagnostics.iter().take(limit).cloned().collect::<Vec<_>>();
+        if diagnostics.len() > limit {
+            messages.push(format!("... and {} more", diagnostics.len() - limit));
+        }
+
+        Err(crate::error::Error::unsupported(
+            messages.join("; "),
+            target.to_string(),
+        ))
+    }
+
     fn reject_strict_unsupported(
         expr: &Expression,
         source: DialectType,
@@ -4359,6 +4593,39 @@ impl Dialect {
             };
 
         for node in expr.dfs() {
+            if source == DialectType::Snowflake && target == DialectType::ClickHouse {
+                if Self::node_is_function_named(node, "TO_CHAR") {
+                    Self::push_unsupported_diagnostic(
+                        &mut diagnostics,
+                        "Snowflake TO_CHAR overload or dynamic format",
+                    );
+                }
+                if Self::node_is_function_named(node, "TRY_TO_DOUBLE")
+                    || matches!(node, Expression::ToDouble(to_double) if to_double.safe.is_some() && to_double.format.is_some())
+                {
+                    Self::push_unsupported_diagnostic(
+                        &mut diagnostics,
+                        "Snowflake TRY_TO_DOUBLE with a format model",
+                    );
+                }
+                if Self::node_is_function_named(node, "TRY_TO_NUMBER")
+                    || Self::node_is_function_named(node, "TRY_TO_NUMERIC")
+                    || Self::node_is_function_named(node, "TRY_TO_DECIMAL")
+                    || matches!(node, Expression::ToNumber(to_number) if to_number.safe.is_some())
+                {
+                    Self::push_unsupported_diagnostic(
+                        &mut diagnostics,
+                        "Snowflake TRY_TO_NUMBER decimal conversion semantics",
+                    );
+                }
+                if Self::node_is_function_named(node, "FLATTEN") {
+                    Self::push_unsupported_diagnostic(
+                        &mut diagnostics,
+                        "Snowflake FLATTEN table-function semantics",
+                    );
+                }
+            }
+
             if matches!(target, DialectType::Fabric | DialectType::Hive)
                 && Self::node_has_recursive_with(node)
             {
@@ -4388,6 +4655,12 @@ impl Dialect {
                     Self::push_unsupported_diagnostic(
                         &mut diagnostics,
                         "qualified whole-row aggregate arguments",
+                    );
+                }
+                if Self::node_has_subquery_in_aggregate_argument(node) {
+                    Self::push_unsupported_diagnostic(
+                        &mut diagnostics,
+                        "aggregate arguments containing subqueries",
                     );
                 }
             }
@@ -5197,63 +5470,7 @@ impl Dialect {
     }
 
     fn node_is_aggregate_function(expr: &Expression) -> bool {
-        matches!(
-            expr,
-            Expression::AggregateFunction(_)
-                | Expression::Count(_)
-                | Expression::Sum(_)
-                | Expression::Avg(_)
-                | Expression::Min(_)
-                | Expression::Max(_)
-                | Expression::GroupConcat(_)
-                | Expression::StringAgg(_)
-                | Expression::ListAgg(_)
-                | Expression::ArrayAgg(_)
-                | Expression::CountIf(_)
-                | Expression::SumIf(_)
-                | Expression::Stddev(_)
-                | Expression::StddevPop(_)
-                | Expression::StddevSamp(_)
-                | Expression::Variance(_)
-                | Expression::VarPop(_)
-                | Expression::VarSamp(_)
-                | Expression::Median(_)
-                | Expression::Mode(_)
-                | Expression::First(_)
-                | Expression::Last(_)
-                | Expression::AnyValue(_)
-                | Expression::ApproxDistinct(_)
-                | Expression::ApproxCountDistinct(_)
-                | Expression::ApproxPercentile(_)
-                | Expression::Percentile(_)
-                | Expression::LogicalAnd(_)
-                | Expression::LogicalOr(_)
-                | Expression::Skewness(_)
-                | Expression::BitwiseCount(_)
-                | Expression::BitwiseAndAgg(_)
-                | Expression::BitwiseOrAgg(_)
-                | Expression::BitwiseXorAgg(_)
-                | Expression::ArrayConcatAgg(_)
-                | Expression::ArrayUniqueAgg(_)
-                | Expression::BoolXorAgg(_)
-                | Expression::JsonArrayAgg(_)
-                | Expression::JsonObjectAgg(_)
-                | Expression::ParameterizedAgg(_)
-                | Expression::ArgMax(_)
-                | Expression::ArgMin(_)
-                | Expression::ApproxTopK(_)
-                | Expression::ApproxTopKAccumulate(_)
-                | Expression::ApproxTopKCombine(_)
-                | Expression::ApproxTopKEstimate(_)
-                | Expression::ApproxTopSum(_)
-                | Expression::ApproxQuantiles(_)
-                | Expression::AnonymousAggFunc(_)
-                | Expression::CombinedAggFunc(_)
-                | Expression::CombinedParameterizedAgg(_)
-                | Expression::HashAgg(_)
-                | Expression::ObjectAgg(_)
-                | Expression::AIAgg(_)
-        )
+        is_aggregate(expr)
     }
 
     fn node_has_qualified_whole_row_aggregate_argument(expr: &Expression) -> bool {
@@ -5273,6 +5490,21 @@ impl Dialect {
 
         Self::node_is_aggregate_function(expr)
             && expr.children().into_iter().any(contains_qualified_star)
+    }
+
+    fn node_has_subquery_in_aggregate_argument(expr: &Expression) -> bool {
+        fn contains_query(expr: &Expression) -> bool {
+            matches!(
+                expr,
+                Expression::Select(_)
+                    | Expression::Subquery(_)
+                    | Expression::Union(_)
+                    | Expression::Intersect(_)
+                    | Expression::Except(_)
+            ) || expr.children().into_iter().any(contains_query)
+        }
+
+        Self::node_is_aggregate_function(expr) && expr.children().into_iter().any(contains_query)
     }
 
     fn tsql_apply_has_invalid_outer_aggregate(expr: &Expression) -> bool {

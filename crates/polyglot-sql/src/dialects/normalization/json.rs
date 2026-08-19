@@ -25,6 +25,7 @@ pub(super) enum Action {
     JsonExtractToArrow,
     JsonExtractToTsql,
     JsonExtractToClickHouse,
+    PostgresJsonExtractTextToClickHouse,
     JsonExtractScalarConvert,
     JsonPathNormalize,
     JsonKeysConvert,
@@ -677,6 +678,17 @@ pub(super) fn rewrite(
                 ))))
             }
 
+            Action::PostgresJsonExtractTextToClickHouse => match e {
+                Expression::JsonExtractScalar(f) => {
+                    let path_args =
+                        clickhouse_postgres_json_text_path_args(f.path, f.hash_arrow_syntax);
+                    Ok(build_clickhouse_nullable_json_text_extract(
+                        f.this, path_args,
+                    ))
+                }
+                _ => Ok(e),
+            },
+
             Action::JsonExtractScalarConvert => {
                 // JSON_EXTRACT_SCALAR -> target-specific
                 if let Expression::JsonExtractScalar(f) = e {
@@ -1024,6 +1036,57 @@ pub(super) fn decompose_json_path(path: &str) -> Vec<String> {
         parts.push(current);
     }
     parts
+}
+
+pub(super) fn build_clickhouse_nullable_json_text_extract(
+    json: Expression,
+    mut path_args: Vec<Expression>,
+) -> Expression {
+    let mut args = vec![json];
+    args.append(&mut path_args);
+    args.push(Expression::string("Nullable(String)"));
+    Expression::Function(Box::new(Function::new("JSONExtract".to_string(), args)))
+}
+
+fn clickhouse_postgres_json_text_path_args(
+    path: Expression,
+    postgres_path_array_literal: bool,
+) -> Vec<Expression> {
+    match path {
+        Expression::Literal(lit) => match lit.as_ref() {
+            Literal::String(path) if postgres_path_array_literal => {
+                let segments = parse_postgres_json_path_array_literal(path)
+                    .unwrap_or_else(|| vec![path.clone()]);
+                segments
+                    .into_iter()
+                    .map(clickhouse_postgres_path_segment)
+                    .collect()
+            }
+            // The text operand of `->>` is an object key even if it is numeric.
+            Literal::String(key) => vec![Expression::string(key)],
+            // PostgreSQL array indexes are zero-based, whereas ClickHouse's
+            // positive indexes are one-based. Both dialects use negative
+            // indexes relative to the end of the array.
+            Literal::Number(index) => vec![clickhouse_postgres_array_index(index)],
+            _ => vec![Expression::Literal(lit)],
+        },
+        other => vec![other],
+    }
+}
+
+fn clickhouse_postgres_path_segment(segment: String) -> Expression {
+    if let Ok(index) = segment.parse::<i64>() {
+        clickhouse_postgres_array_index(&index.to_string())
+    } else {
+        Expression::string(&segment)
+    }
+}
+
+fn clickhouse_postgres_array_index(index: &str) -> Expression {
+    let Ok(index) = index.parse::<i64>() else {
+        return Expression::Literal(Box::new(Literal::Number(index.to_string())));
+    };
+    Expression::number(if index >= 0 { index + 1 } else { index })
 }
 
 pub(super) fn normalize_tsql_json_path_expr(

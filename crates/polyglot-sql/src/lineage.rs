@@ -11,7 +11,7 @@ use crate::expressions::{DataType, Expression, Identifier, JoinKind, NamedWindow
 #[cfg(feature = "generate")]
 use crate::generator::Generator;
 use crate::optimizer::annotate_types::annotate_types;
-use crate::optimizer::qualify_columns::{qualify_columns, QualifyColumnsOptions};
+use crate::optimizer::qualify_schema_aware_expression;
 use crate::schema::{normalize_name, Schema};
 use crate::scope::{
     build_scope, find_all_in_scope, Scope, ScopeType, SourceInfo as ScopeSourceInfo, SourceKind,
@@ -310,7 +310,7 @@ pub fn lineage_at_with_schema(
 /// Return the ordered output description of a query.
 pub fn output_columns(sql: &Expression, dialect: Option<DialectType>) -> Result<QueryOutput> {
     let prepared = prepare_lineage_expression(sql, None, dialect, false)?;
-    query_output_from_expression(&prepared)
+    query_output_from_expression(&prepared, dialect)
 }
 
 /// Return the ordered output description of a query after schema-aware expansion.
@@ -320,7 +320,7 @@ pub fn output_columns_with_schema(
     dialect: Option<DialectType>,
 ) -> Result<QueryOutput> {
     let prepared = prepare_lineage_expression(sql, schema, dialect, true)?;
-    query_output_from_expression(&prepared)
+    query_output_from_expression(&prepared, dialect)
 }
 
 fn prepare_lineage_expression(
@@ -332,17 +332,11 @@ fn prepare_lineage_expression(
     let normalized = lineage_normalized_expression(sql);
     let mut prepared = if schema_aware {
         if let Some(schema) = schema {
-            let options = if let Some(dialect_type) = dialect.or_else(|| schema.dialect()) {
-                QualifyColumnsOptions::new()
-                    .with_dialect(dialect_type)
-                    .with_allow_partial(true)
-            } else {
-                QualifyColumnsOptions::new().with_allow_partial(true)
-            };
-
-            qualify_columns(normalized.clone(), schema, &options).map_err(|error| {
-                Error::internal(format!("Lineage qualification failed with schema: {error}"))
-            })?
+            qualify_schema_aware_expression(normalized.clone(), schema, dialect).map_err(
+                |error| {
+                    Error::internal(format!("Lineage qualification failed with schema: {error}"))
+                },
+            )?
         } else {
             normalized
         }
@@ -1378,6 +1372,12 @@ fn handle_set_operation(
     let trace_wildcard_by_name =
         matches!(column, ColumnRef::Name(name) if normalize_column_name(name, dialect) == "*");
 
+    let aligned_layout = match crate::set_operation::set_operation_layout(scope_expr, dialect) {
+        Ok(layout) => layout,
+        Err(error) if error.is_indeterminate() => None,
+        Err(error) => return Err(Error::invalid_input(error.to_string())),
+    };
+
     // Determine column index
     let col_index = match column {
         ColumnRef::Name(_) if trace_wildcard_by_name => 0,
@@ -1385,9 +1385,23 @@ fn handle_set_operation(
         ColumnRef::Index(i) => *i,
     };
 
+    if aligned_layout
+        .as_ref()
+        .is_some_and(|layout| col_index >= layout.outputs.len())
+    {
+        return Err(ordinal_resolution_error(
+            col_index,
+            ColumnResolutionReason::NotFound,
+        ));
+    }
+
     let col_name = match column {
         ColumnRef::Name(name) => name.to_string(),
-        ColumnRef::Index(_) => format!("_{col_index}"),
+        ColumnRef::Index(_) => aligned_layout
+            .as_ref()
+            .and_then(|layout| layout.outputs.get(col_index))
+            .map(|output| output.identifier.name.clone())
+            .unwrap_or_else(|| format!("_{col_index}")),
     };
 
     let mut node = LineageNode::new(&col_name, scope_expr.clone(), scope_expr.clone());
@@ -1415,6 +1429,19 @@ fn handle_set_operation(
                 ColumnRef::Name(name) => ColumnRef::Name(name),
                 ColumnRef::Index(_) => unreachable!("wildcard tracing is name-based"),
             }
+        } else if let Some(layout) = &aligned_layout {
+            let output = &layout.outputs[col_index];
+            let branch_index = if branch_ordinal == 0 {
+                output.left_ordinal
+            } else {
+                output.right_ordinal
+            };
+            let Some(branch_index) = branch_index else {
+                // This branch contributes a dialect-inserted NULL for the
+                // result slot, so it has no source expression to trace.
+                continue;
+            };
+            ColumnRef::Index(branch_index)
         } else {
             ColumnRef::Index(col_index)
         };
@@ -2590,7 +2617,30 @@ struct OutputLayoutEntry {
     projection_index: usize,
 }
 
-fn query_output_from_expression(expression: &Expression) -> Result<QueryOutput> {
+fn query_output_from_expression(
+    expression: &Expression,
+    dialect: Option<DialectType>,
+) -> Result<QueryOutput> {
+    match crate::set_operation::set_operation_layout(expression, dialect) {
+        Ok(Some(layout)) => {
+            return Ok(QueryOutput {
+                columns: layout
+                    .outputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ordinal, output)| OutputColumn::Named {
+                        name: output.identifier.name,
+                        ordinal: Some(ordinal),
+                    })
+                    .collect(),
+                ordinal_complete: true,
+            })
+        }
+        Ok(None) => {}
+        Err(error) if error.is_indeterminate() => {}
+        Err(error) => return Err(Error::invalid_input(error.to_string())),
+    }
+
     let select = leftmost_output_select(expression).ok_or_else(|| {
         Error::invalid_input("output_columns requires a SELECT or set-operation query")
     })?;
@@ -2799,6 +2849,39 @@ fn output_name_to_ordinal(
     name: &str,
     dialect: Option<DialectType>,
 ) -> Result<usize> {
+    match crate::set_operation::set_operation_layout(expression, dialect) {
+        Ok(Some(layout)) => {
+            let lookup = Identifier::new(name);
+            let lookup_key = crate::set_operation::identifier_key(&lookup, dialect);
+            let matches: Vec<_> = layout
+                .outputs
+                .iter()
+                .enumerate()
+                .filter(|(_, output)| {
+                    (output.identifier.quoted && output.identifier.name == name)
+                        || crate::set_operation::identifier_key(&output.identifier, dialect)
+                            == lookup_key
+                })
+                .map(|(ordinal, _)| ordinal)
+                .collect();
+
+            return match matches.as_slice() {
+                [ordinal] => Ok(*ordinal),
+                [_, ..] => Err(name_resolution_error(
+                    name,
+                    ColumnResolutionReason::Ambiguous,
+                )),
+                [] => Err(name_resolution_error(
+                    name,
+                    ColumnResolutionReason::NotFound,
+                )),
+            };
+        }
+        Ok(None) => {}
+        Err(error) if error.is_indeterminate() => {}
+        Err(error) => return Err(Error::invalid_input(error.to_string())),
+    }
+
     let select = leftmost_output_select(expression).ok_or_else(|| {
         Error::invalid_input("column resolution requires a SELECT or set-operation query")
     })?;
@@ -4536,6 +4619,132 @@ select col_a from unioned";
     }
 
     #[test]
+    fn test_lineage_with_schema_natural_join_merged_column() {
+        let query = "SELECT shared_key AS output_key FROM source_table \
+                     NATURAL JOIN (SELECT shared_key FROM source_table) derived";
+        let dialect = Dialect::get(DialectType::DuckDB);
+        let expr = dialect
+            .parse(query)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("expected one expression");
+
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table(
+                "source_table",
+                &[(
+                    "shared_key".into(),
+                    DataType::VarChar {
+                        length: None,
+                        parenthesized_length: false,
+                    },
+                )],
+                None,
+            )
+            .expect("schema setup");
+
+        let node = lineage_with_schema(
+            "output_key",
+            &expr,
+            Some(&schema),
+            Some(DialectType::DuckDB),
+            false,
+        )
+        .expect("lineage_with_schema should resolve a NATURAL JOIN merged column");
+
+        let terminal_nodes: Vec<_> = node
+            .walk()
+            .filter(|candidate| candidate.downstream.is_empty())
+            .collect();
+        assert_eq!(
+            terminal_nodes.len(),
+            2,
+            "both NATURAL JOIN inputs should remain visible: {node:#?}"
+        );
+        assert!(terminal_nodes.iter().all(|candidate| {
+            candidate.source_kind == SourceKind::Table
+                && candidate.source_name == "source_table"
+                && candidate.name.ends_with(".shared_key")
+        }));
+    }
+
+    #[test]
+    fn test_lineage_with_schema_propagates_type_through_anonymous_derived_table() {
+        let expr = parse_dialect(
+            "SELECT source_value FROM (SELECT source_value FROM source_table)",
+            DialectType::DuckDB,
+        );
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        let expected = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+        schema
+            .add_table(
+                "source_table",
+                &[("source_value".into(), expected.clone())],
+                None,
+            )
+            .expect("schema setup");
+
+        let node = lineage_with_schema(
+            "source_value",
+            &expr,
+            Some(&schema),
+            Some(DialectType::DuckDB),
+            false,
+        )
+        .expect("lineage_with_schema should resolve an anonymous derived table");
+
+        assert_eq!(node.expression.inferred_type(), Some(&expected));
+        let terminal_nodes: Vec<_> = node
+            .walk()
+            .filter(|candidate| candidate.downstream.is_empty())
+            .collect();
+        assert_eq!(terminal_nodes.len(), 1, "{node:#?}");
+        assert_eq!(terminal_nodes[0].source_kind, SourceKind::Table);
+        assert_eq!(terminal_nodes[0].source_name, "source_table");
+        assert_eq!(terminal_nodes[0].name, "source_table.source_value");
+    }
+
+    #[test]
+    fn test_issue_412_duckdb_date_trunc_preserves_timestamp_lineage_type() {
+        let expr = parse_dialect(
+            "SELECT DATE_TRUNC('month', event_timestamp) AS truncated_timestamp \
+             FROM source_table",
+            DialectType::DuckDB,
+        );
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        let timestamp = DataType::Timestamp {
+            precision: None,
+            timezone: false,
+        };
+        schema
+            .add_table(
+                "source_table",
+                &[("event_timestamp".into(), timestamp.clone())],
+                None,
+            )
+            .expect("schema setup");
+
+        let node =
+            lineage_at_with_schema(0, &expr, Some(&schema), Some(DialectType::DuckDB), false)
+                .expect("schema-aware lineage");
+
+        assert_eq!(node.expression.inferred_type(), Some(&timestamp));
+        let Expression::Alias(alias) = &node.expression else {
+            panic!("expected aliased DATE_TRUNC projection");
+        };
+        assert_eq!(alias.this.inferred_type(), Some(&timestamp));
+        let Expression::Function(function) = &alias.this else {
+            panic!("expected generic DATE_TRUNC function");
+        };
+        assert_eq!(function.args[1].inferred_type(), Some(&timestamp));
+    }
+
+    #[test]
     fn test_lineage_with_schema_qualified_table_name() {
         let query = "SELECT a FROM raw.t1";
         let dialect = Dialect::get(DialectType::BigQuery);
@@ -4855,6 +5064,79 @@ FROM t JOIN UNNEST(t.items) AS item ON TRUE
             .find(|child| child.source_kind == SourceKind::Virtual)
             .expect("virtual UNNEST output");
         assert_eq!(virtual_child.expression.inferred_type(), Some(&expected));
+    }
+
+    #[test]
+    fn test_lineage_with_schema_resolves_struct_fields_issue_408() {
+        let struct_type = DataType::Struct {
+            fields: vec![crate::expressions::StructField::new(
+                "field_value".into(),
+                DataType::Text,
+            )],
+            nested: true,
+        };
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table(
+                "source_table",
+                &[
+                    ("composite_value".into(), struct_type.clone()),
+                    (
+                        "nested_items".into(),
+                        DataType::Array {
+                            element_type: Box::new(struct_type),
+                            dimension: None,
+                        },
+                    ),
+                ],
+                None,
+            )
+            .expect("schema setup");
+
+        let direct = parse_dialect(
+            "SELECT composite_value.field_value AS output_value FROM source_table",
+            DialectType::DuckDB,
+        );
+        let direct_node = lineage_with_schema(
+            "output_value",
+            &direct,
+            Some(&schema),
+            Some(DialectType::DuckDB),
+            false,
+        )
+        .expect("direct struct lineage");
+        assert_eq!(
+            direct_node.expression.inferred_type(),
+            Some(&DataType::Text)
+        );
+        assert_lineage_contains(&direct_node, "source_table.composite_value");
+
+        let unnested = parse_dialect(
+            "SELECT item.field_value AS output_value FROM source_table s \
+             CROSS JOIN UNNEST(s.nested_items) AS expanded(item)",
+            DialectType::DuckDB,
+        );
+        let unnest_node = lineage_with_schema(
+            "output_value",
+            &unnested,
+            Some(&schema),
+            Some(DialectType::DuckDB),
+            false,
+        )
+        .expect("UNNEST struct lineage");
+        assert_eq!(
+            unnest_node.expression.inferred_type(),
+            Some(&DataType::Text)
+        );
+        assert!(
+            unnest_node.walk().any(|node| {
+                node.source_kind == SourceKind::Table
+                    && node.source_name == "source_table"
+                    && node.name.ends_with(".nested_items")
+            }),
+            "expected physical nested_items lineage, got {:?}",
+            lineage_names(&unnest_node)
+        );
     }
 
     #[test]
@@ -5527,6 +5809,170 @@ FROM t JOIN UNNEST(t.items) AS item ON TRUE
                     ordinal: Some(1),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_issue_411_duckdb_and_snowflake_union_by_name_layout_and_lineage() {
+        let sql = "SELECT 1 AS left_value UNION ALL BY NAME SELECT 2 AS right_value";
+
+        for dialect in [DialectType::DuckDB, DialectType::Snowflake] {
+            let expr = parse_dialect(sql, dialect);
+            let output = output_columns(&expr, Some(dialect)).expect("output columns");
+            assert_eq!(
+                output.columns,
+                vec![
+                    OutputColumn::Named {
+                        name: "left_value".to_string(),
+                        ordinal: Some(0),
+                    },
+                    OutputColumn::Named {
+                        name: "right_value".to_string(),
+                        ordinal: Some(1),
+                    },
+                ],
+                "unexpected output layout for {dialect:?}"
+            );
+
+            let left = lineage_at(0, &expr, Some(dialect), false).expect("left lineage");
+            assert_eq!(
+                left.downstream
+                    .iter()
+                    .map(|node| node.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["left_value"]
+            );
+            assert_eq!(
+                left.downstream[0].set_branch,
+                Some(SetBranch {
+                    operator: SetOperator::Union,
+                    ordinal: 0,
+                    all: true,
+                })
+            );
+
+            let right = lineage_at(1, &expr, Some(dialect), false).expect("right lineage");
+            assert_eq!(
+                right
+                    .downstream
+                    .iter()
+                    .map(|node| node.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["right_value"]
+            );
+            assert_eq!(
+                right.downstream[0].set_branch,
+                Some(SetBranch {
+                    operator: SetOperator::Union,
+                    ordinal: 1,
+                    all: true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn test_issue_411_bigquery_strict_by_name_reorders_lineage() {
+        let dialect = DialectType::BigQuery;
+        let expr = parse_dialect(
+            "SELECT 1 AS a, 2 AS b UNION ALL BY NAME SELECT 3 AS b, 4 AS a",
+            dialect,
+        );
+        let output = output_columns(&expr, Some(dialect)).expect("output columns");
+        assert_eq!(
+            output.columns,
+            vec![
+                OutputColumn::Named {
+                    name: "a".to_string(),
+                    ordinal: Some(0),
+                },
+                OutputColumn::Named {
+                    name: "b".to_string(),
+                    ordinal: Some(1),
+                },
+            ]
+        );
+
+        for (ordinal, expected_name) in [(0, "a"), (1, "b")] {
+            let node = lineage_at(ordinal, &expr, Some(dialect), false).expect("lineage");
+            assert_eq!(
+                node.downstream
+                    .iter()
+                    .map(|child| child.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![expected_name, expected_name]
+            );
+        }
+    }
+
+    #[test]
+    fn test_issue_411_bigquery_by_name_modes_and_explicit_order() {
+        let dialect = DialectType::BigQuery;
+        for (sql, expected) in [
+            (
+                "SELECT 1 AS a, 2 AS b INNER UNION ALL BY NAME SELECT 3 AS b, 4 AS c",
+                vec!["b"],
+            ),
+            (
+                "SELECT 1 AS a, 2 AS b LEFT OUTER UNION ALL BY NAME SELECT 3 AS b, 4 AS c",
+                vec!["a", "b"],
+            ),
+            (
+                "SELECT 1 AS a, 2 AS b FULL OUTER UNION ALL BY NAME SELECT 3 AS b, 4 AS c",
+                vec!["a", "b", "c"],
+            ),
+            (
+                "SELECT 1 AS a, 2 AS b FULL OUTER UNION ALL BY NAME ON (c, a) SELECT 3 AS b, 4 AS c",
+                vec!["c", "a"],
+            ),
+            (
+                "SELECT 1 AS a, 2 AS b INTERSECT DISTINCT BY NAME SELECT 3 AS b, 4 AS a",
+                vec!["a", "b"],
+            ),
+            (
+                "SELECT 1 AS a, 2 AS b EXCEPT DISTINCT BY NAME SELECT 3 AS b, 4 AS a",
+                vec!["a", "b"],
+            ),
+        ] {
+            let expr = parse_dialect(sql, dialect);
+            let output = output_columns(&expr, Some(dialect)).expect("output columns");
+            assert_eq!(
+                output
+                    .columns
+                    .iter()
+                    .filter_map(|column| match column {
+                        OutputColumn::Named { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                expected,
+                "unexpected output layout for {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_issue_411_name_matching_uses_dialect_identifier_rules() {
+        let sql = "SELECT 1 AS \"lower\" UNION ALL BY NAME SELECT 2 AS lower";
+
+        let duckdb = parse_dialect(sql, DialectType::DuckDB);
+        assert_eq!(
+            output_columns(&duckdb, Some(DialectType::DuckDB))
+                .expect("DuckDB output")
+                .columns
+                .len(),
+            1,
+            "DuckDB quoted identifiers are case-insensitive"
+        );
+
+        let snowflake = parse_dialect(sql, DialectType::Snowflake);
+        assert_eq!(
+            output_columns(&snowflake, Some(DialectType::Snowflake))
+                .expect("Snowflake output")
+                .columns
+                .len(),
+            2,
+            "Snowflake quoted lowercase and unquoted uppercase identifiers differ"
         );
     }
 

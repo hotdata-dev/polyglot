@@ -1850,6 +1850,29 @@ mod new_dialect_tests {
 #[cfg(test)]
 mod connect_by_tests {
     use super::*;
+    use polyglot_sql::ExpressionWalk;
+
+    #[test]
+    fn test_oracle_prior_remains_an_operator_outside_connect_by() {
+        let sql =
+            "SELECT PRIOR employee_id FROM employees CONNECT BY PRIOR employee_id = manager_id";
+        let expression = polyglot_sql::parse_one(sql, DialectType::Oracle)
+            .expect("Oracle PRIOR expressions should parse");
+
+        assert_eq!(
+            expression
+                .dfs()
+                .filter(|node| matches!(node, Expression::Prior(_)))
+                .count(),
+            2,
+            "Oracle should parse PRIOR as an operator in the projection and CONNECT BY"
+        );
+        assert_eq!(
+            polyglot_sql::generate(&expression, DialectType::Oracle)
+                .expect("Oracle PRIOR expressions should generate"),
+            sql
+        );
+    }
 
     #[test]
     fn test_connect_by_basic() {

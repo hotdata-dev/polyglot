@@ -9,6 +9,7 @@
 
 import type { DataType } from '../generated/DataType';
 import type { Expression } from '../generated/Expression';
+import { EXPRESSION_VARIANT_NAMES } from '../generated/ExpressionVariantNames';
 
 /**
  * Distributive conditional type to extract all variant key names from Expression union.
@@ -23,6 +24,22 @@ export type ExpressionType = Expression extends infer E
       : never
     : never
   : never;
+
+type GeneratedExpressionType = (typeof EXPRESSION_VARIANT_NAMES)[number];
+type MissingExpressionType = Exclude<ExpressionType, GeneratedExpressionType>;
+type UnexpectedExpressionType = Exclude<
+  GeneratedExpressionType,
+  ExpressionType
+>;
+type ExactExpressionVariantRegistry = [
+  MissingExpressionType | UnexpectedExpressionType,
+] extends [never]
+  ? readonly ExpressionType[]
+  : never;
+
+const expressionVariantNames: ExactExpressionVariantRegistry =
+  EXPRESSION_VARIANT_NAMES;
+const expressionVariantNameSet = new Set<string>(expressionVariantNames);
 
 /**
  * Extract a specific Expression variant by its key name.
@@ -81,13 +98,10 @@ export function getExprData(expr: Expression): Record<string, unknown> {
 /**
  * Check if a runtime value looks like an Expression.
  *
- * Expressions in the externally tagged format are single-key objects
- * where the key is the variant name and the value is the inner data object.
- *
- * Important: The inner value must be a non-null, non-array plain object.
- * Structs like From { expressions: Vec<Expression> } serialize as
- * { "expressions": [...] } — a single-key object with an array value.
- * These must NOT be treated as Expressions, or the transformer will corrupt them.
+ * Expressions in the externally tagged format are single-key objects whose
+ * key is one of the variants generated from Rust's `Expression` enum.
+ * Checking the exact variant registry prevents one-field payload structs such
+ * as `{ this: expression }` from being exposed as phantom expression nodes.
  */
 export function isExpressionValue(value: unknown): value is Expression {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -95,9 +109,7 @@ export function isExpressionValue(value: unknown): value is Expression {
   }
   const keys = Object.keys(value);
   if (keys.length !== 1) return false;
-  const inner = (value as Record<string, unknown>)[keys[0]];
-  // Expression inner data is a non-array object (struct data) OR null (unit struct variants like Null, CurrentDate, RowNumber)
-  return inner === null || (typeof inner === 'object' && !Array.isArray(inner));
+  return expressionVariantNameSet.has(keys[0]);
 }
 
 /**

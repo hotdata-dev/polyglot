@@ -351,52 +351,16 @@ impl Step {
 
 /// Check if an expression contains an aggregate function
 fn contains_aggregate(expr: &Expression) -> bool {
-    match expr {
-        // Specific aggregate function variants
-        Expression::Sum(_)
-        | Expression::Count(_)
-        | Expression::Avg(_)
-        | Expression::Min(_)
-        | Expression::Max(_)
-        | Expression::ArrayAgg(_)
-        | Expression::StringAgg(_)
-        | Expression::ListAgg(_)
-        | Expression::Stddev(_)
-        | Expression::StddevPop(_)
-        | Expression::StddevSamp(_)
-        | Expression::Variance(_)
-        | Expression::VarPop(_)
-        | Expression::VarSamp(_)
-        | Expression::Median(_)
-        | Expression::Mode(_)
-        | Expression::First(_)
-        | Expression::Last(_)
-        | Expression::AnyValue(_)
-        | Expression::ApproxDistinct(_)
-        | Expression::ApproxCountDistinct(_)
-        | Expression::LogicalAnd(_)
-        | Expression::LogicalOr(_)
-        | Expression::AggregateFunction(_) => true,
+    if crate::traversal::is_aggregate(expr) {
+        return true;
+    }
 
+    match expr {
         Expression::Alias(alias) => contains_aggregate(&alias.this),
         Expression::Add(op) | Expression::Sub(op) | Expression::Mul(op) | Expression::Div(op) => {
             contains_aggregate(&op.left) || contains_aggregate(&op.right)
         }
-        Expression::Function(func) => {
-            // Check for aggregate function names (fallback)
-            let name = func.name.to_uppercase();
-            matches!(
-                name.as_str(),
-                "SUM"
-                    | "COUNT"
-                    | "AVG"
-                    | "MIN"
-                    | "MAX"
-                    | "ARRAY_AGG"
-                    | "STRING_AGG"
-                    | "GROUP_CONCAT"
-            )
-        }
+        Expression::Function(func) => func.args.iter().any(contains_aggregate),
         _ => false,
     }
 }
@@ -411,34 +375,12 @@ fn extract_aggregations(expressions: &[Expression]) -> Vec<Expression> {
 }
 
 fn collect_aggregations(expr: &Expression, aggs: &mut Vec<Expression>) {
+    if crate::traversal::is_aggregate(expr) {
+        aggs.push(expr.clone());
+        return;
+    }
+
     match expr {
-        // Specific aggregate function variants
-        Expression::Sum(_)
-        | Expression::Count(_)
-        | Expression::Avg(_)
-        | Expression::Min(_)
-        | Expression::Max(_)
-        | Expression::ArrayAgg(_)
-        | Expression::StringAgg(_)
-        | Expression::ListAgg(_)
-        | Expression::Stddev(_)
-        | Expression::StddevPop(_)
-        | Expression::StddevSamp(_)
-        | Expression::Variance(_)
-        | Expression::VarPop(_)
-        | Expression::VarSamp(_)
-        | Expression::Median(_)
-        | Expression::Mode(_)
-        | Expression::First(_)
-        | Expression::Last(_)
-        | Expression::AnyValue(_)
-        | Expression::ApproxDistinct(_)
-        | Expression::ApproxCountDistinct(_)
-        | Expression::LogicalAnd(_)
-        | Expression::LogicalOr(_)
-        | Expression::AggregateFunction(_) => {
-            aggs.push(expr.clone());
-        }
         Expression::Alias(alias) => {
             collect_aggregations(&alias.this, aggs);
         }
@@ -447,23 +389,8 @@ fn collect_aggregations(expr: &Expression, aggs: &mut Vec<Expression>) {
             collect_aggregations(&op.right, aggs);
         }
         Expression::Function(func) => {
-            let name = func.name.to_uppercase();
-            if matches!(
-                name.as_str(),
-                "SUM"
-                    | "COUNT"
-                    | "AVG"
-                    | "MIN"
-                    | "MAX"
-                    | "ARRAY_AGG"
-                    | "STRING_AGG"
-                    | "GROUP_CONCAT"
-            ) {
-                aggs.push(expr.clone());
-            } else {
-                for arg in &func.args {
-                    collect_aggregations(arg, aggs);
-                }
+            for arg in &func.args {
+                collect_aggregations(arg, aggs);
             }
         }
         _ => {}

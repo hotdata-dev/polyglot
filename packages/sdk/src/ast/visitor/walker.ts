@@ -19,12 +19,11 @@ import {
   ast_node_count,
 } from '../../../wasm/polyglot_sql_wasm.js';
 import type { Expression } from '../../generated/Expression';
+import { type ExpressionType, getExprType } from '../helpers';
 import {
-  type ExpressionType,
-  getExprData,
-  getExprType,
-  isExpressionValue,
-} from '../helpers';
+  collectExpressionChildren,
+  visitExpressionChildren,
+} from './traversal';
 import type { NodePredicate, VisitorCallback, VisitorConfig } from './types';
 
 /** Serialize Expression to JSON for WASM functions */
@@ -37,49 +36,6 @@ function exprToJson(node: Expression): string {
 // ============================================================================
 
 /**
- * Recursively collect Expression children from any value.
- *
- * Handles:
- * - Expression values (single-key objects with object inner data)
- * - Arrays of Expressions
- * - Nested tuple arrays (like CASE whens)
- * - Non-Expression struct objects (like From, Where, GroupBy) that contain Expressions
- */
-function collectExprChildren(
-  value: unknown,
-  key: string,
-  results: Array<{ key: string; value: Expression | Expression[] }>,
-): void {
-  if (value === null || value === undefined) return;
-
-  if (Array.isArray(value)) {
-    if (value.length > 0 && isExpressionValue(value[0])) {
-      results.push({ key, value: value as Expression[] });
-    } else if (value.length > 0 && Array.isArray(value[0])) {
-      // Nested arrays (like whens in CASE)
-      for (const item of value) {
-        if (Array.isArray(item)) {
-          for (const subItem of item) {
-            if (isExpressionValue(subItem)) {
-              results.push({ key, value: subItem as Expression });
-            }
-          }
-        }
-      }
-    }
-  } else if (isExpressionValue(value)) {
-    results.push({ key, value: value as Expression });
-  } else if (typeof value === 'object') {
-    // Non-Expression struct (e.g., From, Where, GroupBy) — recurse into its fields
-    for (const [, subValue] of Object.entries(
-      value as Record<string, unknown>,
-    )) {
-      collectExprChildren(subValue, key, results);
-    }
-  }
-}
-
-/**
  * Get all child expressions from a node.
  *
  * Unwraps the outer Expression envelope, then iterates the inner data
@@ -89,17 +45,7 @@ function collectExprChildren(
 export function getChildren(
   node: Expression,
 ): Array<{ key: string; value: Expression | Expression[] }> {
-  const children: Array<{ key: string; value: Expression | Expression[] }> = [];
-
-  // Unwrap the outer envelope to get inner data
-  const innerData = getExprData(node);
-  if (!innerData || typeof innerData !== 'object') return children;
-
-  for (const [key, value] of Object.entries(innerData)) {
-    collectExprChildren(value, key, children);
-  }
-
-  return children;
+  return collectExpressionChildren(node);
 }
 
 /**
@@ -133,17 +79,11 @@ export function walk(
     typeCallback(node, parent, key, index);
   }
 
-  // Recursively walk children
-  const children = getChildren(node);
-  for (const child of children) {
-    if (Array.isArray(child.value)) {
-      child.value.forEach((childNode, i) => {
-        walk(childNode, visitor, node, child.key, i);
-      });
-    } else {
-      walk(child.value, visitor, node, child.key, null);
-    }
-  }
+  // Recursively walk every expression-bearing payload slot, including those
+  // nested inside arrays of ordinary AST structs.
+  visitExpressionChildren(node, (child, location) => {
+    walk(child, visitor, location.parent, location.key, location.index);
+  });
 
   // Call leave callback
   if (visitor.leave) {

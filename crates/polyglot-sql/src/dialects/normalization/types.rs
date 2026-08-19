@@ -453,17 +453,22 @@ pub(super) fn rewrite(
                             }
                         }
                         DataType::Float {
-                            precision: Some(p), ..
+                            precision: None,
+                            real_spelling: false,
+                            ..
+                        } => DataType::Double {
+                            precision: None,
+                            scale: None,
+                        },
+                        DataType::Float {
+                            precision: Some(p),
+                            real_spelling: false,
+                            ..
                         } => {
-                            // For Hive/Spark: FLOAT(1-32) -> FLOAT, FLOAT(33+) -> DOUBLE (IEEE 754 boundary)
-                            // For other targets: FLOAT(1-24) -> FLOAT, FLOAT(25+) -> DOUBLE (TSQL boundary)
-                            let boundary = match target {
-                                DialectType::Hive
-                                | DialectType::Spark
-                                | DialectType::Databricks => 32,
-                                _ => 24,
-                            };
-                            if *p <= boundary {
+                            // TSQL/Fabric normalize n to one of two source storage widths:
+                            // FLOAT(1..=24) is single precision and FLOAT(25..=53) is double
+                            // precision. The source default is FLOAT(53), handled above.
+                            if *p <= 24 {
                                 DataType::Float {
                                     precision: None,
                                     scale: None,

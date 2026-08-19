@@ -1,6 +1,6 @@
 {
   "name": "@polyglot-sql/sdk",
-  "version": "0.8.1",
+  "version": "0.9.2",
   "description": "SQL dialect translator powered by WebAssembly",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -28,6 +28,15 @@
       "browser": "./dist/manual.js",
       "import": "./dist/manual.js",
       "default": "./dist/manual.js"
+    },
+    "./compat": {
+      "types": "./dist/compat.d.ts",
+      "browser": "./dist/compat.js",
+      "node": {
+        "import": "./dist/compat.node.js"
+      },
+      "import": "./dist/compat.js",
+      "default": "./dist/compat.js"
     },
     "./polyglot_sql.wasm": {
       "types": "./dist/polyglot_sql.wasm.d.ts",

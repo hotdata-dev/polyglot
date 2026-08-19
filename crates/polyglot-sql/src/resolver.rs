@@ -33,6 +33,9 @@ pub enum ResolverError {
 
     #[error("Unknown set operation: {0}")]
     UnknownSetOperation(String),
+
+    #[error("Invalid set operation: {0}")]
+    InvalidSetOperation(String),
 }
 
 /// Result type for resolver operations
@@ -238,6 +241,14 @@ impl<'a> Resolver<'a> {
 
     /// Get named selects (column names) from an expression
     fn get_named_selects(&self, expr: &Expression) -> Vec<String> {
+        if let Ok(identifiers) = crate::set_operation::query_output_identifiers(expr, self.dialect)
+        {
+            return identifiers
+                .into_iter()
+                .map(|identifier| identifier.name)
+                .collect();
+        }
+
         match expr {
             Expression::Select(select) => self.get_select_column_names(select),
             Expression::Union(union) => {
@@ -405,6 +416,24 @@ impl<'a> Resolver<'a> {
         &self,
         expression: &Expression,
     ) -> ResolverResult<Vec<String>> {
+        if matches!(
+            expression,
+            Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
+        ) {
+            match crate::set_operation::set_operation_layout(expression, self.dialect) {
+                Ok(Some(layout)) => {
+                    return Ok(layout
+                        .outputs
+                        .into_iter()
+                        .map(|output| output.identifier.name)
+                        .collect())
+                }
+                Ok(None) => {}
+                Err(error) if error.is_indeterminate() => {}
+                Err(error) => return Err(ResolverError::InvalidSetOperation(error.to_string())),
+            }
+        }
+
         match expression {
             Expression::Select(select) => Ok(self.get_select_column_names(select)),
             Expression::Subquery(subquery) => {
@@ -931,6 +960,45 @@ mod tests {
 
         let table = resolver.get_table("emp_id");
         assert_eq!(table, Some("my_cte".to_string()));
+    }
+
+    #[test]
+    fn test_resolver_uses_name_aligned_set_operation_outputs() {
+        for dialect_type in [DialectType::DuckDB, DialectType::Snowflake] {
+            let expr = Dialect::get(dialect_type)
+                .parse(
+                    "SELECT combined.right_value FROM (\
+                     SELECT 1 AS left_value UNION ALL BY NAME \
+                     SELECT 2 AS right_value\
+                     ) AS combined",
+                )
+                .expect("parse")
+                .remove(0);
+            let scope = build_scope(&expr);
+            let schema = MappingSchema::with_dialect(dialect_type);
+            let mut resolver = Resolver::new(&scope, &schema, true);
+
+            assert_eq!(
+                resolver.get_table("right_value"),
+                Some("combined".to_string()),
+                "right-only output was not exposed for {dialect_type:?}"
+            );
+        }
+
+        let dialect_type = DialectType::BigQuery;
+        let expr = Dialect::get(dialect_type)
+            .parse(
+                "SELECT combined.c FROM (\
+                 SELECT 1 AS a, 2 AS b FULL OUTER UNION ALL BY NAME \
+                 SELECT 3 AS b, 4 AS c\
+                 ) AS combined",
+            )
+            .expect("parse")
+            .remove(0);
+        let scope = build_scope(&expr);
+        let schema = MappingSchema::with_dialect(dialect_type);
+        let mut resolver = Resolver::new(&scope, &schema, true);
+        assert_eq!(resolver.get_table("c"), Some("combined".to_string()));
     }
 
     #[test]

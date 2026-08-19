@@ -1,4 +1,5 @@
 mod annotate_types;
+mod builders;
 mod dialects;
 mod diff;
 mod errors;
@@ -22,6 +23,7 @@ use pyo3::prelude::*;
 
 #[pymodule]
 fn _polyglot_sql(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    builders::register(m)?;
     m.add_function(wrap_pyfunction!(transpile::transpile, m)?)?;
     m.add_function(wrap_pyfunction!(parse::parse, m)?)?;
     m.add_function(wrap_pyfunction!(parse::parse_one, m)?)?;

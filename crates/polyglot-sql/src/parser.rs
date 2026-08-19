@@ -3869,7 +3869,7 @@ impl Parser {
                 break;
             }
 
-            // Handle trailing comma (ClickHouse supports trailing commas in SELECT)
+            // Handle trailing commas in SELECT lists for dialects that support them.
             // ClickHouse: `from` after comma is a column name if followed by an operator
             // (e.g., `from + from` or `from in [0]`), comma, or line-end
             let from_is_column = matches!(
@@ -3916,6 +3916,7 @@ impl Parser {
                 || matches!(
                     self.config.dialect,
                     Some(crate::dialects::DialectType::ClickHouse)
+                        | Some(crate::dialects::DialectType::Snowflake)
                 ))
                 && (!from_is_column && self.check_from_keyword()
                     || self.check(TokenType::Where)
@@ -4630,7 +4631,8 @@ impl Parser {
                 }
 
                 // Check for set operations after the first table expression
-                let had_set_operation = self.check(TokenType::Union)
+                let had_set_operation = self.check_set_operation_modifier_start()
+                    || self.check(TokenType::Union)
                     || self.check(TokenType::Intersect)
                     || self.check(TokenType::Except);
                 let result = if had_set_operation {
@@ -7788,6 +7790,10 @@ impl Parser {
 
     /// Check if the current token starts a JOIN clause
     fn check_join_keyword(&self) -> bool {
+        if self.check_set_operation_modifier_start() {
+            return false;
+        }
+
         self.check(TokenType::Join) ||
         self.check(TokenType::Inner) ||
         self.check(TokenType::Left) ||
@@ -7804,6 +7810,10 @@ impl Parser {
     /// Try to parse a JOIN kind
     /// Returns (JoinKind, needs_join_keyword, use_inner_keyword, use_outer_keyword, join_hint)
     fn try_parse_join_kind(&mut self) -> Option<(JoinKind, bool, bool, bool, Option<String>)> {
+        if self.check_set_operation_modifier_start() {
+            return None;
+        }
+
         if matches!(
             self.config.dialect,
             Some(crate::dialects::DialectType::ClickHouse)
@@ -10245,6 +10255,44 @@ impl Parser {
         true
     }
 
+    /// Whether the current token starts a BigQuery set-operation mode such as
+    /// `FULL OUTER UNION`, `LEFT UNION`, `INNER INTERSECT`, or `OUTER EXCEPT`.
+    /// Keeping this check separate from JOIN parsing prevents the shared
+    /// LEFT/FULL/OUTER tokens from being consumed as an incomplete join.
+    fn check_set_operation_modifier_start(&self) -> bool {
+        if !matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::BigQuery)
+        ) {
+            return false;
+        }
+
+        let mut index = self.current;
+        let Some(first) = self.tokens.get(index).map(|token| token.token_type) else {
+            return false;
+        };
+
+        match first {
+            TokenType::Left | TokenType::Right | TokenType::Full => {
+                index += 1;
+                if self.tokens.get(index).is_some_and(|token| {
+                    matches!(token.token_type, TokenType::Outer | TokenType::Inner)
+                }) {
+                    index += 1;
+                }
+            }
+            TokenType::Inner | TokenType::Outer => index += 1,
+            _ => return false,
+        }
+
+        self.tokens.get(index).is_some_and(|token| {
+            matches!(
+                token.token_type,
+                TokenType::Union | TokenType::Intersect | TokenType::Except
+            )
+        })
+    }
+
     /// Parse set operations (UNION, INTERSECT, EXCEPT)
     fn parse_set_operation(&mut self, left: Expression) -> Result<Expression> {
         let mut result = left;
@@ -10458,9 +10506,11 @@ impl Parser {
         }
     }
 
-    /// Parse BigQuery set operation side (LEFT, RIGHT, FULL) and kind (INNER)
+    /// Parse BigQuery set operation side (LEFT, RIGHT, FULL) and kind
+    /// (INNER, OUTER).
     /// These modifiers appear BEFORE the UNION/INTERSECT/EXCEPT keyword
     fn parse_set_operation_side_kind(&mut self) -> (Option<String>, Option<String>) {
+        let start = self.current;
         let mut side = None;
         let mut kind = None;
 
@@ -10474,38 +10524,31 @@ impl Parser {
             let side_token = self.advance();
             let side_text = side_token.text.to_ascii_uppercase();
 
-            // Check if followed by set operation or INNER
-            if self.check_set_operation_start(TokenType::Union)
+            side = Some(side_text);
+
+            if self.match_token(TokenType::Outer) {
+                kind = Some("OUTER".to_string());
+            } else if self.match_token(TokenType::Inner) {
+                kind = Some("INNER".to_string());
+            }
+
+            if !(self.check_set_operation_start(TokenType::Union)
                 || self.check_set_operation_start(TokenType::Intersect)
-                || self.check_set_operation_start(TokenType::Except)
-                || self.check(TokenType::Inner)
+                || self.check_set_operation_start(TokenType::Except))
             {
-                side = Some(side_text);
-            } else {
-                // Not a set operation modifier, backtrack
                 self.current = saved;
                 return (None, None);
             }
         }
 
-        // Check for kind: INNER
-        if self.check(TokenType::Inner) {
-            let saved = self.current;
-            self.skip(); // consume INNER
-
-            // Check if followed by set operation
-            if self.check_set_operation_start(TokenType::Union)
+        // Check for standalone kind: INNER or OUTER.
+        if side.is_none() && (self.check(TokenType::Inner) || self.check(TokenType::Outer)) {
+            kind = Some(self.advance_text().to_ascii_uppercase());
+            if !(self.check_set_operation_start(TokenType::Union)
                 || self.check_set_operation_start(TokenType::Intersect)
-                || self.check_set_operation_start(TokenType::Except)
+                || self.check_set_operation_start(TokenType::Except))
             {
-                kind = Some("INNER".to_string());
-            } else {
-                // Not a set operation modifier, backtrack
-                self.current = saved;
-                if side.is_some() {
-                    // We already consumed a side token, need to backtrack that too
-                    self.current = saved - 1;
-                }
+                self.current = start;
                 return (None, None);
             }
         }
@@ -10521,7 +10564,7 @@ impl Parser {
         let mut corresponding = false;
         let mut on_columns = Vec::new();
 
-        // Check for BY NAME (DuckDB style)
+        // Check for BY NAME (DuckDB/Snowflake/BigQuery style)
         if self.match_token(TokenType::By) && self.match_identifier("NAME") {
             by_name = true;
         }
@@ -10540,8 +10583,11 @@ impl Parser {
             corresponding = true;
         }
 
-        // If CORRESPONDING is set, check for BY (columns)
-        if corresponding && self.match_token(TokenType::By) {
+        // BigQuery's preferred syntax is BY NAME ON (columns); the standard
+        // CORRESPONDING spelling uses BY (columns).
+        let has_column_list = (by_name && self.match_token(TokenType::On))
+            || (corresponding && self.match_token(TokenType::By));
+        if has_column_list {
             self.expect(TokenType::LParen)?;
             on_columns = self
                 .parse_identifier_list()?
@@ -30783,15 +30829,18 @@ impl Parser {
             self.skip(); // consume @
             let expr = self.parse_bitwise_or()?;
             Ok(Expression::Abs(Box::new(UnaryFunc::new(expr))))
-        } else if self.check(TokenType::Prior)
+        } else if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::Oracle)
+        ) && self.check(TokenType::Prior)
             && !self.check_next(TokenType::As)
             && !self.check_next(TokenType::Comma)
             && !self.check_next(TokenType::RParen)
             && !self.check_next(TokenType::Semicolon)
             && self.current + 1 < self.tokens.len()
         {
-            // Oracle PRIOR expression - references parent row's value in hierarchical queries
-            // Can appear in SELECT list, CONNECT BY, or other expression contexts
+            // Oracle PRIOR expression - references parent row's value in hierarchical queries.
+            // Other dialects only treat PRIOR as an operator in CONNECT BY expressions.
             // Python sqlglot: "PRIOR": lambda self: self.expression(exp.Prior, this=self._parse_bitwise())
             // When followed by AS/comma/rparen/end, treat PRIOR as an identifier (column name)
             self.skip(); // consume PRIOR
@@ -32225,6 +32274,7 @@ impl Parser {
                         inferred_type: None,
                     }),
                     field: Identifier::new(field_name),
+                    inferred_type: None,
                 }));
                 return self.maybe_parse_subscript(col_expr);
             }
@@ -32248,6 +32298,7 @@ impl Parser {
                         inferred_type: None,
                     }),
                     field: Identifier::new(field_name),
+                    inferred_type: None,
                 }));
                 return self.maybe_parse_subscript(col_expr);
             }
@@ -32274,6 +32325,7 @@ impl Parser {
                         inferred_type: None,
                     }),
                     field: Identifier::new(field_name),
+                    inferred_type: None,
                 }));
                 return self.maybe_parse_subscript(col_expr);
             }
@@ -33883,15 +33935,20 @@ impl Parser {
             ) && self.peek().token_type == TokenType::CurrentTime
             {
                 self.skip(); // consume CURRENT_TIME
+                let mut precision = None;
                 if self.match_token(TokenType::LParen) {
-                    // CURRENT_TIME(n) - consume args but ignore precision
+                    // CURRENT_TIME(n) - preserve the precision in Localtime.this.
                     if !self.check(TokenType::RParen) {
-                        let _ = self.parse_function_arguments()?;
+                        precision = self
+                            .parse_function_arguments()?
+                            .into_iter()
+                            .next()
+                            .map(Box::new);
                     }
                     self.expect(TokenType::RParen)?;
                 }
                 return self.maybe_parse_subscript(Expression::Localtime(Box::new(
-                    crate::expressions::Localtime { this: None },
+                    crate::expressions::Localtime { this: precision },
                 )));
             }
             if self.check_next(TokenType::LParen) {
@@ -34223,6 +34280,7 @@ impl Parser {
                             inferred_type: None,
                         }),
                         field: Identifier::new(field_name),
+                        inferred_type: None,
                     }));
                     return self.maybe_parse_subscript(col);
                 }
@@ -34240,6 +34298,7 @@ impl Parser {
                             inferred_type: None,
                         }),
                         field: Identifier::new(field_name),
+                        inferred_type: None,
                     }));
                     return self.maybe_parse_subscript(col_expr);
                 }
@@ -34652,8 +34711,8 @@ impl Parser {
     }
 
     /// Check if function name is a known aggregate function
-    fn is_aggregate_function(name: &str) -> bool {
-        crate::function_registry::is_aggregate_function_name(name)
+    fn is_aggregate_function(&self, name: &str) -> bool {
+        crate::function_registry::is_aggregate_function_name_for_dialect(name, self.config.dialect)
     }
 
     fn parse_clickhouse_overlay_family_function(
@@ -35243,9 +35302,28 @@ impl Parser {
                 let args = self.parse_function_args_list()?;
                 self.expect(TokenType::RParen)?;
                 let this = args.get(0).cloned().unwrap_or(Expression::Null(Null {}));
-                let format = args.get(1).cloned().map(Box::new);
-                let precision = args.get(2).cloned().map(Box::new);
-                let scale = args.get(3).cloned().map(Box::new);
+                let (format, precision, scale) =
+                    if self.config.dialect == Some(crate::dialects::DialectType::Snowflake)
+                        && args.len() <= 3
+                        && args.get(1).is_some_and(|arg| {
+                            matches!(arg, Expression::Literal(literal) if matches!(literal.as_ref(), Literal::Number(_)))
+                        })
+                    {
+                        // Snowflake's numeric overload is TO_NUMBER(expr, precision, scale).
+                        // Keep it distinct from TO_NUMBER(expr, format[, ...]) so target
+                        // validation can reason about the requested decimal semantics.
+                        (
+                            None,
+                            args.get(1).cloned().map(Box::new),
+                            args.get(2).cloned().map(Box::new),
+                        )
+                    } else {
+                        (
+                            args.get(1).cloned().map(Box::new),
+                            args.get(2).cloned().map(Box::new),
+                            args.get(3).cloned().map(Box::new),
+                        )
+                    };
                 let safe = if spec.canonical_name == "TRY_TO_NUMBER" {
                     Some(Box::new(Expression::Boolean(BooleanLiteral {
                         value: true,
@@ -36857,6 +36935,77 @@ impl Parser {
             return self.parse_generic_function(name, quoted);
         }
 
+        // Preserve BigQuery-specific semantics until cross-dialect normalization has
+        // selected a target. These functions cannot be treated as anonymous calls:
+        // TIMESTAMP defaults to UTC, SAFE_DIVIDE catches overflow as well as division
+        // by zero, and ROUND uses half-away-from-zero midpoint handling.
+        if !quoted
+            && matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::BigQuery)
+            )
+            && matches!(upper_name, "TIMESTAMP" | "SAFE_DIVIDE" | "ROUND")
+        {
+            let args = self.parse_function_args_list()?;
+            self.expect(TokenType::RParen)?;
+
+            match (upper_name, args.as_slice()) {
+                ("TIMESTAMP", [this]) => {
+                    return Ok(Expression::Timestamp(Box::new(
+                        crate::expressions::TimestampFunc {
+                            this: Some(Box::new(this.clone())),
+                            zone: None,
+                            with_tz: Some(true),
+                            safe: None,
+                        },
+                    )));
+                }
+                ("TIMESTAMP", [this, zone]) => {
+                    return Ok(Expression::Timestamp(Box::new(
+                        crate::expressions::TimestampFunc {
+                            this: Some(Box::new(this.clone())),
+                            zone: Some(Box::new(zone.clone())),
+                            with_tz: Some(true),
+                            safe: None,
+                        },
+                    )));
+                }
+                ("SAFE_DIVIDE", [this, expression]) => {
+                    return Ok(Expression::SafeDivide(Box::new(
+                        crate::expressions::SafeDivide {
+                            this: Box::new(this.clone()),
+                            expression: Box::new(expression.clone()),
+                        },
+                    )));
+                }
+                ("ROUND", [this]) => {
+                    return Ok(Expression::Round(Box::new(crate::expressions::RoundFunc {
+                        this: this.clone(),
+                        decimals: None,
+                    })));
+                }
+                ("ROUND", [this, decimals]) => {
+                    return Ok(Expression::Round(Box::new(crate::expressions::RoundFunc {
+                        this: this.clone(),
+                        decimals: Some(decimals.clone()),
+                    })));
+                }
+                _ => {
+                    return Ok(Expression::Function(Box::new(Function {
+                        name: name.to_string(),
+                        args,
+                        distinct: false,
+                        trailing_comments: Vec::new(),
+                        use_bracket_syntax: false,
+                        no_parens: false,
+                        quoted,
+                        span: None,
+                        inferred_type: None,
+                    })));
+                }
+            }
+        }
+
         let canonical_upper_name =
             crate::function_registry::canonical_typed_function_name_upper(upper_name);
 
@@ -37045,7 +37194,14 @@ impl Parser {
                 self.expect(TokenType::RParen)?;
                 let filter = self.parse_filter_clause()?;
 
-                if distinct || !order_by.is_empty() || limit.is_some() || filter.is_some() {
+                if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::DuckDB)
+                ) || distinct
+                    || !order_by.is_empty()
+                    || limit.is_some()
+                    || filter.is_some()
+                {
                     Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
                         name: name.to_string(),
                         args,
@@ -37344,18 +37500,45 @@ impl Parser {
                     while self.match_token(TokenType::Comma) {
                         args.push(self.parse_expression()?);
                     }
+                    let is_duckdb_top_n = matches!(
+                        self.config.dialect,
+                        Some(crate::dialects::DialectType::DuckDB)
+                    ) && matches!(canonical_upper_name, "MIN" | "MAX")
+                        && args.len() == 2;
+                    let order_by = if is_duckdb_top_n
+                        && self.match_keywords(&[TokenType::Order, TokenType::By])
+                    {
+                        self.parse_order_by_list()?
+                    } else {
+                        Vec::new()
+                    };
                     self.expect(TokenType::RParen)?;
-                    Ok(Expression::Function(Box::new(Function {
-                        name: name.to_string(),
-                        args,
-                        distinct: false,
-                        trailing_comments: Vec::new(),
-                        use_bracket_syntax: false,
-                        no_parens: false,
-                        quoted: false,
-                        span: None,
-                        inferred_type: None,
-                    })))
+
+                    if is_duckdb_top_n {
+                        let filter = self.parse_filter_clause()?;
+                        Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
+                            name: name.to_string(),
+                            args,
+                            distinct,
+                            filter,
+                            order_by,
+                            limit: None,
+                            ignore_nulls: None,
+                            inferred_type: None,
+                        })))
+                    } else {
+                        Ok(Expression::Function(Box::new(Function {
+                            name: name.to_string(),
+                            args,
+                            distinct: false,
+                            trailing_comments: Vec::new(),
+                            use_bracket_syntax: false,
+                            no_parens: false,
+                            quoted: false,
+                            span: None,
+                            inferred_type: None,
+                        })))
+                    }
                 } else {
                     // Check for IGNORE NULLS / RESPECT NULLS (BigQuery style)
                     let ignore_nulls = if self.match_token(TokenType::Ignore)
@@ -38622,7 +38805,7 @@ impl Parser {
 
     /// Parse a generic function call (fallback for unrecognized functions)
     fn parse_generic_function(&mut self, name: &str, quoted: bool) -> Result<Expression> {
-        let is_known_agg = Self::is_aggregate_function(name);
+        let is_known_agg = self.is_aggregate_function(name);
 
         let (mut args, distinct) = if self.check(TokenType::RParen) {
             (Vec::new(), false)
@@ -39898,6 +40081,7 @@ impl Parser {
                         expr = Expression::Dot(Box::new(DotAccess {
                             this: expr,
                             field: Identifier::new("*"),
+                            inferred_type: None,
                         }));
                     }
                 } else if self.check(TokenType::Identifier)
@@ -39931,6 +40115,7 @@ impl Parser {
                         expr = Expression::Dot(Box::new(DotAccess {
                             this: expr,
                             field: ident,
+                            inferred_type: None,
                         }));
                     }
                 } else if self.check(TokenType::Number) {
@@ -39939,6 +40124,7 @@ impl Parser {
                     expr = Expression::Dot(Box::new(DotAccess {
                         this: expr,
                         field: Identifier::new(field_name),
+                        inferred_type: None,
                     }));
                 } else if matches!(
                     self.config.dialect,
@@ -39958,6 +40144,7 @@ impl Parser {
                     expr = Expression::Dot(Box::new(DotAccess {
                         this: expr,
                         field: Identifier::new(field_name),
+                        inferred_type: None,
                     }));
                 } else if matches!(
                     self.config.dialect,
@@ -39977,6 +40164,7 @@ impl Parser {
                     expr = Expression::Dot(Box::new(DotAccess {
                         this: expr,
                         field: Identifier::new(type_name),
+                        inferred_type: None,
                     }));
                 } else if matches!(
                     self.config.dialect,
@@ -39992,6 +40180,7 @@ impl Parser {
                     expr = Expression::Dot(Box::new(DotAccess {
                         this: expr,
                         field: Identifier::new(format!("-{}", num)),
+                        inferred_type: None,
                     }));
                 } else {
                     return Err(self.parse_error("Expected field name after dot"));
@@ -49389,6 +49578,7 @@ impl Parser {
                 result = Some(Expression::Dot(Box::new(DotAccess {
                     this: result.take().unwrap(),
                     field: field_ident,
+                    inferred_type: None,
                 })));
             } else {
                 break;
@@ -54892,6 +55082,7 @@ impl Parser {
                 expr = Expression::Dot(Box::new(DotAccess {
                     this: expr,
                     field: part,
+                    inferred_type: None,
                 }));
             }
             expr
@@ -64735,6 +64926,53 @@ OPTIONS (
     #[test]
     fn test_union_all_by_name() {
         assert_roundtrip("SELECT 1 AS x UNION ALL BY NAME SELECT 2 AS x");
+    }
+
+    #[test]
+    fn test_bigquery_name_aligned_set_operation_modifiers() {
+        for (sql, expected) in [
+            (
+                "SELECT 1 AS a FULL OUTER UNION ALL BY NAME SELECT 2 AS b",
+                "SELECT 1 AS a FULL OUTER UNION ALL BY NAME SELECT 2 AS b",
+            ),
+            (
+                "SELECT 1 AS a LEFT OUTER UNION ALL BY NAME SELECT 2 AS a",
+                "SELECT 1 AS a LEFT OUTER UNION ALL BY NAME SELECT 2 AS a",
+            ),
+            (
+                "SELECT 1 AS a OUTER UNION ALL BY NAME SELECT 2 AS b",
+                "SELECT 1 AS a OUTER UNION ALL BY NAME SELECT 2 AS b",
+            ),
+            (
+                "SELECT 1 AS a INNER UNION ALL BY NAME SELECT 2 AS a",
+                "SELECT 1 AS a INNER UNION ALL BY NAME SELECT 2 AS a",
+            ),
+            (
+                "SELECT 1 AS a FULL OUTER UNION ALL BY NAME ON (b, a) SELECT 2 AS b",
+                "SELECT 1 AS a FULL OUTER UNION ALL BY NAME ON (b, a) SELECT 2 AS b",
+            ),
+            (
+                "SELECT 1 AS a FULL OUTER UNION ALL CORRESPONDING BY (b, a) SELECT 2 AS b",
+                "SELECT 1 AS a FULL OUTER UNION ALL BY NAME ON (b, a) SELECT 2 AS b",
+            ),
+            (
+                "SELECT 1 AS a, 2 AS b INTERSECT DISTINCT BY NAME ON (b, a) SELECT 3 AS b, 4 AS a",
+                "SELECT 1 AS a, 2 AS b INTERSECT DISTINCT BY NAME ON (b, a) SELECT 3 AS b, 4 AS a",
+            ),
+            (
+                "SELECT 1 AS a, 2 AS b EXCEPT DISTINCT BY NAME ON (b, a) SELECT 3 AS b, 4 AS a",
+                "SELECT 1 AS a, 2 AS b EXCEPT DISTINCT BY NAME ON (b, a) SELECT 3 AS b, 4 AS a",
+            ),
+        ] {
+            let parsed = crate::parse(sql, crate::dialects::DialectType::BigQuery)
+                .unwrap_or_else(|error| panic!("failed to parse {sql:?}: {error}"));
+            let generated = crate::generate(
+                parsed.first().expect("one statement"),
+                crate::dialects::DialectType::BigQuery,
+            )
+            .unwrap_or_else(|error| panic!("failed to generate {sql:?}: {error}"));
+            assert_eq!(generated, expected);
+        }
     }
 
     #[test]

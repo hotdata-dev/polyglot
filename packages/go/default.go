@@ -78,6 +78,22 @@ func GenerateDataType(dataType json.RawMessage, dialect string) (string, error) 
 	return client.GenerateDataType(dataType, dialect)
 }
 
+func Build(expression Expression) (json.RawMessage, error) {
+	client, err := DefaultClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.Build(expression)
+}
+
+func BuildSQL(expression Expression, dialect string) (string, error) {
+	client, err := DefaultClient()
+	if err != nil {
+		return "", err
+	}
+	return client.BuildSQL(expression, dialect)
+}
+
 func Validate(sql, dialect string, options ...ValidationOptions) (ValidationResult, error) {
 	client, err := DefaultClient()
 	if err != nil {

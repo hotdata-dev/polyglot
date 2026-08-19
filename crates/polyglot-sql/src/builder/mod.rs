@@ -55,9 +55,46 @@
 //! .build();
 //! ```
 
+pub(crate) mod engine;
+pub mod plan;
+
 use crate::expressions::*;
-use crate::generator::Generator;
+use crate::generator::{Generator, GeneratorConfig, NotInStyle};
 use crate::parser::Parser;
+
+/// Controls whether a repeated list or predicate clause appends to the existing
+/// clause (`true`, the default) or replaces it (`false`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClauseOptions {
+    pub append: bool,
+}
+
+impl Default for ClauseOptions {
+    fn default() -> Self {
+        Self { append: true }
+    }
+}
+
+/// Options for a `LATERAL VIEW` clause.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LateralViewOptions {
+    pub outer: bool,
+}
+
+/// Options for a `CREATE TABLE AS SELECT` statement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CtasOptions {
+    pub replace: bool,
+    pub temporary: bool,
+}
+
+fn generate_builder_sql(expression: &Expression) -> String {
+    let mut generator = Generator::with_config(GeneratorConfig {
+        not_in_style: NotInStyle::Infix,
+        ..Default::default()
+    });
+    generator.generate(expression).unwrap_or_default()
+}
 
 fn is_safe_identifier_name(name: &str) -> bool {
     if name.is_empty() {
@@ -149,6 +186,7 @@ pub fn col(name: &str) -> Expr {
             expr = Expression::Dot(Box::new(DotAccess {
                 this: expr,
                 field: builder_identifier(field),
+                inferred_type: None,
             }));
         }
 
@@ -781,11 +819,7 @@ where
     I: IntoIterator<Item = E>,
     E: IntoExpr,
 {
-    let mut builder = SelectBuilder::new();
-    for expr in expressions {
-        builder.select = builder.select.column(expr.into_expr().0);
-    }
-    builder
+    SelectBuilder::new().select_cols(expressions)
 }
 
 /// Start building a SELECT query beginning with a FROM clause.
@@ -803,11 +837,7 @@ where
 /// assert_eq!(sql, "SELECT id, name FROM users");
 /// ```
 pub fn from(table_name: &str) -> SelectBuilder {
-    let mut builder = SelectBuilder::new();
-    builder.select.from = Some(From {
-        expressions: vec![Expression::Table(Box::new(builder_table_ref(table_name)))],
-    });
-    builder
+    SelectBuilder::new().from(table_name)
 }
 
 /// Start building a `DELETE FROM` statement targeting the given table.
@@ -973,115 +1003,110 @@ impl Expr {
     ///
     /// Returns an empty string if generation fails.
     pub fn to_sql(&self) -> String {
-        Generator::sql(&self.0).unwrap_or_default()
+        generate_builder_sql(&self.0)
     }
 
     // -- Comparison operators --
 
     /// Produce a `self = other` equality comparison.
     pub fn eq(self, other: Expr) -> Expr {
-        Expr(Expression::Eq(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Eq, self.0, other.0))
     }
 
     /// Produce a `self <> other` inequality comparison.
     pub fn neq(self, other: Expr) -> Expr {
-        Expr(Expression::Neq(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Neq, self.0, other.0))
     }
 
     /// Produce a `self < other` less-than comparison.
     pub fn lt(self, other: Expr) -> Expr {
-        Expr(Expression::Lt(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Lt, self.0, other.0))
     }
 
     /// Produce a `self <= other` less-than-or-equal comparison.
     pub fn lte(self, other: Expr) -> Expr {
-        Expr(Expression::Lte(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Lte, self.0, other.0))
     }
 
     /// Produce a `self > other` greater-than comparison.
     pub fn gt(self, other: Expr) -> Expr {
-        Expr(Expression::Gt(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Gt, self.0, other.0))
     }
 
     /// Produce a `self >= other` greater-than-or-equal comparison.
     pub fn gte(self, other: Expr) -> Expr {
-        Expr(Expression::Gte(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Gte, self.0, other.0))
     }
 
     // -- Logical operators --
 
     /// Produce a `self AND other` logical conjunction.
     pub fn and(self, other: Expr) -> Expr {
-        Expr(Expression::And(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::And, self.0, other.0))
     }
 
     /// Produce a `self OR other` logical disjunction.
     pub fn or(self, other: Expr) -> Expr {
-        Expr(Expression::Or(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Or, self.0, other.0))
     }
 
     /// Produce a `NOT self` logical negation.
     pub fn not(self) -> Expr {
-        Expr(Expression::Not(Box::new(UnaryOp::new(self.0))))
+        Expr(engine::unary(engine::UnaryKind::Not, self.0))
     }
 
     /// Produce a `self XOR other` logical exclusive-or.
     pub fn xor(self, other: Expr) -> Expr {
-        Expr(Expression::Xor(Box::new(Xor {
-            this: Some(Box::new(self.0)),
-            expression: Some(Box::new(other.0)),
-            expressions: vec![],
-        })))
+        Expr(engine::binary(engine::BinaryKind::Xor, self.0, other.0))
     }
 
     // -- Arithmetic operators --
 
     /// Produce a `self + other` addition expression.
     pub fn add(self, other: Expr) -> Expr {
-        Expr(Expression::Add(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Add, self.0, other.0))
     }
 
     /// Produce a `self - other` subtraction expression.
     pub fn sub(self, other: Expr) -> Expr {
-        Expr(Expression::Sub(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Sub, self.0, other.0))
     }
 
     /// Produce a `self * other` multiplication expression.
     pub fn mul(self, other: Expr) -> Expr {
-        Expr(Expression::Mul(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Mul, self.0, other.0))
     }
 
     /// Produce a `self / other` division expression.
     pub fn div(self, other: Expr) -> Expr {
-        Expr(Expression::Div(Box::new(binary_op(self.0, other.0))))
+        Expr(engine::binary(engine::BinaryKind::Div, self.0, other.0))
+    }
+
+    /// Produce a `self % other` modulo expression.
+    pub fn modulo(self, other: Expr) -> Expr {
+        Expr(engine::binary(engine::BinaryKind::Mod, self.0, other.0))
+    }
+
+    /// Produce an arithmetic negation expression.
+    pub fn neg(self) -> Expr {
+        Expr(engine::unary(engine::UnaryKind::Neg, self.0))
+    }
+
+    /// Produce a generic `self IS other` predicate.
+    pub fn is(self, other: Expr) -> Expr {
+        Expr(engine::binary(engine::BinaryKind::Is, self.0, other.0))
     }
 
     // -- Other operators --
 
     /// Produce a `self IS NULL` predicate.
     pub fn is_null(self) -> Expr {
-        Expr(Expression::Is(Box::new(BinaryOp {
-            left: self.0,
-            right: Expression::Null(Null),
-            left_comments: Vec::new(),
-            operator_comments: Vec::new(),
-            trailing_comments: Vec::new(),
-            inferred_type: None,
-        })))
+        Expr(engine::unary(engine::UnaryKind::IsNull, self.0))
     }
 
     /// Produce a `self IS NOT NULL` predicate (implemented as `NOT (self IS NULL)`).
     pub fn is_not_null(self) -> Expr {
-        Expr(Expression::Not(Box::new(UnaryOp::new(Expression::Is(
-            Box::new(BinaryOp {
-                left: self.0,
-                right: Expression::Null(Null),
-                left_comments: Vec::new(),
-                operator_comments: Vec::new(),
-                trailing_comments: Vec::new(),
-                inferred_type: None,
-            }),
-        )))))
+        Expr(engine::unary(engine::UnaryKind::IsNotNull, self.0))
     }
 
     /// Produce a `self IN (values...)` membership test.
@@ -1112,13 +1137,7 @@ impl Expr {
 
     /// Produce a `self LIKE pattern` case-sensitive pattern match.
     pub fn like(self, pattern: Expr) -> Expr {
-        Expr(Expression::Like(Box::new(LikeOp {
-            left: self.0,
-            right: pattern.0,
-            escape: None,
-            quantifier: None,
-            inferred_type: None,
-        })))
+        Expr(engine::binary(engine::BinaryKind::Like, self.0, pattern.0))
     }
 
     /// Produce a `self AS alias` expression alias.
@@ -1165,13 +1184,7 @@ impl Expr {
     /// Supported by PostgreSQL, Snowflake, and other dialects. Dialects that do not
     /// support `ILIKE` natively may need transpilation.
     pub fn ilike(self, pattern: Expr) -> Expr {
-        Expr(Expression::ILike(Box::new(LikeOp {
-            left: self.0,
-            right: pattern.0,
-            escape: None,
-            quantifier: None,
-            inferred_type: None,
-        })))
+        Expr(engine::binary(engine::BinaryKind::ILike, self.0, pattern.0))
     }
 
     /// Produce a `REGEXP_LIKE(self, pattern)` regular expression match.
@@ -1179,11 +1192,7 @@ impl Expr {
     /// The generated SQL uses the `REGEXP_LIKE` function form. Different dialects may
     /// render this as `RLIKE`, `REGEXP`, or `REGEXP_LIKE` after transpilation.
     pub fn rlike(self, pattern: Expr) -> Expr {
-        Expr(Expression::RegexpLike(Box::new(RegexpFunc {
-            this: self.0,
-            pattern: pattern.0,
-            flags: None,
-        })))
+        Expr(engine::binary(engine::BinaryKind::RLike, self.0, pattern.0))
     }
 
     /// Produce a `self NOT IN (values...)` negated membership test.
@@ -1238,112 +1247,145 @@ impl SelectBuilder {
         }
     }
 
+    fn edit(mut self, edit: impl FnOnce(&mut Expression)) -> Self {
+        let mut expression = Expression::Select(Box::new(self.select));
+        edit(&mut expression);
+        self.select = match expression {
+            Expression::Select(select) => *select,
+            _ => unreachable!("select builder engine changed the expression kind"),
+        };
+        self
+    }
+
+    fn join_with_kind(self, table_name: &str, on: Option<Expr>, kind: JoinKind) -> Self {
+        let join = Join {
+            kind,
+            this: Expression::Table(Box::new(builder_table_ref(table_name))),
+            on: on.map(|expression| expression.0),
+            using: Vec::new(),
+            use_inner_keyword: false,
+            use_outer_keyword: false,
+            deferred_condition: false,
+            join_hint: None,
+            match_condition: None,
+            pivots: Vec::new(),
+            comments: Vec::new(),
+            nesting_group: 0,
+            directed: false,
+        };
+        self.edit(|expression| {
+            engine::append_join(expression, join).expect("select builder accepts JOIN clauses")
+        })
+    }
+
     /// Append columns to the SELECT list.
     ///
     /// Accepts any iterable of [`IntoExpr`] items. This is primarily useful when the
     /// builder was created via [`from()`] and columns need to be added afterward.
-    pub fn select_cols<I, E>(mut self, expressions: I) -> Self
+    pub fn select_cols<I, E>(self, expressions: I) -> Self
     where
         I: IntoIterator<Item = E>,
         E: IntoExpr,
     {
-        for expr in expressions {
-            self.select.expressions.push(expr.into_expr().0);
-        }
-        self
+        self.select_cols_with_options(expressions, ClauseOptions::default())
+    }
+
+    /// Add SELECT expressions, optionally replacing the current projection.
+    pub fn select_cols_with_options<I, E>(self, expressions: I, options: ClauseOptions) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: IntoExpr,
+    {
+        let values = expressions
+            .into_iter()
+            .map(|expression| expression.into_expr().0)
+            .collect();
+        self.edit(|expression| {
+            engine::append_select(expression, values, options.append)
+                .expect("select builder accepts SELECT clauses")
+        })
     }
 
     /// Set the FROM clause to reference the given table by name.
-    pub fn from(mut self, table_name: &str) -> Self {
-        self.select.from = Some(From {
-            expressions: vec![Expression::Table(Box::new(builder_table_ref(table_name)))],
-        });
-        self
+    pub fn from(self, table_name: &str) -> Self {
+        self.edit(|expression| {
+            engine::set_from(
+                expression,
+                vec![Expression::Table(Box::new(builder_table_ref(table_name)))],
+            )
+            .expect("select builder accepts FROM clauses")
+        })
     }
 
     /// Set the FROM clause to an arbitrary expression (e.g. a subquery or table function).
     ///
     /// Use this instead of [`SelectBuilder::from()`] when the source is not a simple
     /// table name -- for example, a [`subquery()`] or a table-valued function.
-    pub fn from_expr(mut self, expr: Expr) -> Self {
-        self.select.from = Some(From {
-            expressions: vec![expr.0],
-        });
-        self
+    pub fn from_expr(self, expr: Expr) -> Self {
+        self.edit(|expression| {
+            engine::set_from(expression, vec![expr.0]).expect("select builder accepts FROM clauses")
+        })
     }
 
     /// Add an inner `JOIN` clause with the given ON condition.
-    pub fn join(mut self, table_name: &str, on: Expr) -> Self {
-        self.select.joins.push(Join {
-            kind: JoinKind::Inner,
-            this: Expression::Table(Box::new(builder_table_ref(table_name))),
-            on: Some(on.0),
-            using: Vec::new(),
-            use_inner_keyword: false,
-            use_outer_keyword: false,
-            deferred_condition: false,
-            join_hint: None,
-            match_condition: None,
-            pivots: Vec::new(),
-            comments: Vec::new(),
-            nesting_group: 0,
-            directed: false,
-        });
-        self
+    pub fn join(self, table_name: &str, on: Expr) -> Self {
+        self.join_with_kind(table_name, Some(on), JoinKind::Inner)
     }
 
     /// Add a `LEFT JOIN` clause with the given ON condition.
-    pub fn left_join(mut self, table_name: &str, on: Expr) -> Self {
-        self.select.joins.push(Join {
-            kind: JoinKind::Left,
-            this: Expression::Table(Box::new(builder_table_ref(table_name))),
-            on: Some(on.0),
-            using: Vec::new(),
-            use_inner_keyword: false,
-            use_outer_keyword: false,
-            deferred_condition: false,
-            join_hint: None,
-            match_condition: None,
-            pivots: Vec::new(),
-            comments: Vec::new(),
-            nesting_group: 0,
-            directed: false,
-        });
-        self
+    pub fn left_join(self, table_name: &str, on: Expr) -> Self {
+        self.join_with_kind(table_name, Some(on), JoinKind::Left)
     }
 
-    /// Set the WHERE clause to filter rows by the given condition.
-    ///
-    /// Calling this multiple times replaces the previous WHERE condition. To combine
-    /// multiple predicates, chain them with [`.and()`](Expr::and) or [`.or()`](Expr::or)
-    /// on a single [`Expr`].
-    pub fn where_(mut self, condition: Expr) -> Self {
-        self.select.where_clause = Some(Where { this: condition.0 });
-        self
+    /// Add a predicate to the WHERE clause, combining repeated calls with `AND`.
+    pub fn where_(self, condition: Expr) -> Self {
+        self.where_with_options(condition, ClauseOptions::default())
+    }
+
+    /// Add or replace the WHERE clause according to `options.append`.
+    pub fn where_with_options(self, condition: Expr, options: ClauseOptions) -> Self {
+        self.edit(|expression| {
+            engine::apply_where(expression, condition.0, options.append)
+                .expect("select builder accepts WHERE clauses")
+        })
     }
 
     /// Set the GROUP BY clause with the given grouping expressions.
-    pub fn group_by<I, E>(mut self, expressions: I) -> Self
+    pub fn group_by<I, E>(self, expressions: I) -> Self
     where
         I: IntoIterator<Item = E>,
         E: IntoExpr,
     {
-        self.select.group_by = Some(GroupBy {
-            expressions: expressions.into_iter().map(|e| e.into_expr().0).collect(),
-            all: None,
-            totals: false,
-            comments: Vec::new(),
-        });
-        self
+        self.group_by_with_options(expressions, ClauseOptions::default())
+    }
+
+    /// Add or replace grouping expressions according to `options.append`.
+    pub fn group_by_with_options<I, E>(self, expressions: I, options: ClauseOptions) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: IntoExpr,
+    {
+        let values = expressions
+            .into_iter()
+            .map(|expression| expression.into_expr().0)
+            .collect();
+        self.edit(|expression| {
+            engine::apply_group_by(expression, values, options.append)
+                .expect("select builder accepts GROUP BY clauses")
+        })
     }
 
     /// Set the HAVING clause to filter groups by the given condition.
-    pub fn having(mut self, condition: Expr) -> Self {
-        self.select.having = Some(Having {
-            this: condition.0,
-            comments: Vec::new(),
-        });
-        self
+    pub fn having(self, condition: Expr) -> Self {
+        self.having_with_options(condition, ClauseOptions::default())
+    }
+
+    /// Add or replace the HAVING clause according to `options.append`.
+    pub fn having_with_options(self, condition: Expr, options: ClauseOptions) -> Self {
+        self.edit(|expression| {
+            engine::apply_having(expression, condition.0, options.append)
+                .expect("select builder accepts HAVING clauses")
+        })
     }
 
     /// Set the ORDER BY clause with the given sort expressions.
@@ -1351,47 +1393,28 @@ impl SelectBuilder {
     /// Expressions that are not already wrapped with [`.asc()`](Expr::asc) or
     /// [`.desc()`](Expr::desc) default to ascending order. String values are
     /// interpreted as column names via [`IntoExpr`].
-    pub fn order_by<I, E>(mut self, expressions: I) -> Self
+    pub fn order_by<I, E>(self, expressions: I) -> Self
     where
         I: IntoIterator<Item = E>,
         E: IntoExpr,
     {
-        self.select.order_by = Some(OrderBy {
-            siblings: false,
-            comments: Vec::new(),
-            expressions: expressions
-                .into_iter()
-                .map(|e| {
-                    let expr = e.into_expr().0;
-                    match expr {
-                        Expression::Ordered(_) => expr,
-                        other => Expression::Ordered(Box::new(Ordered {
-                            this: other,
-                            desc: false,
-                            nulls_first: None,
-                            explicit_asc: false,
-                            with_fill: None,
-                        })),
-                    }
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|e| {
-                    if let Expression::Ordered(o) = e {
-                        *o
-                    } else {
-                        Ordered {
-                            this: e,
-                            desc: false,
-                            nulls_first: None,
-                            explicit_asc: false,
-                            with_fill: None,
-                        }
-                    }
-                })
-                .collect(),
-        });
-        self
+        self.order_by_with_options(expressions, ClauseOptions::default())
+    }
+
+    /// Add or replace ordering expressions according to `options.append`.
+    pub fn order_by_with_options<I, E>(self, expressions: I, options: ClauseOptions) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: IntoExpr,
+    {
+        let values = expressions
+            .into_iter()
+            .map(|expression| engine::ordered(expression.into_expr().0))
+            .collect();
+        self.edit(|expression| {
+            engine::apply_order_by(expression, values, options.append)
+                .expect("select builder accepts ORDER BY clauses")
+        })
     }
 
     /// Set the SORT BY clause with the given sort expressions.
@@ -1400,104 +1423,89 @@ impl SelectBuilder {
     /// as opposed to ORDER BY which sorts globally. Expressions that are not already
     /// wrapped with [`.asc()`](Expr::asc) or [`.desc()`](Expr::desc) default to
     /// ascending order.
-    pub fn sort_by<I, E>(mut self, expressions: I) -> Self
+    pub fn sort_by<I, E>(self, expressions: I) -> Self
     where
         I: IntoIterator<Item = E>,
         E: IntoExpr,
     {
-        self.select.sort_by = Some(SortBy {
-            expressions: expressions
-                .into_iter()
-                .map(|e| {
-                    let expr = e.into_expr().0;
-                    match expr {
-                        Expression::Ordered(o) => *o,
-                        other => Ordered {
-                            this: other,
-                            desc: false,
-                            nulls_first: None,
-                            explicit_asc: false,
-                            with_fill: None,
-                        },
-                    }
-                })
-                .collect(),
-        });
-        self
+        self.sort_by_with_options(expressions, ClauseOptions::default())
+    }
+
+    /// Add or replace SORT BY expressions according to `options.append`.
+    pub fn sort_by_with_options<I, E>(self, expressions: I, options: ClauseOptions) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: IntoExpr,
+    {
+        let values = expressions
+            .into_iter()
+            .map(|expression| engine::ordered(expression.into_expr().0))
+            .collect();
+        self.edit(|expression| {
+            engine::apply_sort_by(expression, values, options.append)
+                .expect("select builder accepts SORT BY clauses")
+        })
     }
 
     /// Set the LIMIT clause to restrict the result set to `count` rows.
-    pub fn limit(mut self, count: usize) -> Self {
-        self.select.limit = Some(Limit {
-            this: Expression::Literal(Box::new(Literal::Number(count.to_string()))),
-            percent: false,
-            comments: Vec::new(),
-        });
-        self
+    pub fn limit(self, count: usize) -> Self {
+        self.edit(|expression| {
+            engine::apply_limit(
+                expression,
+                Expression::Literal(Box::new(Literal::Number(count.to_string()))),
+            )
+            .expect("select builder accepts LIMIT clauses")
+        })
     }
 
     /// Set the OFFSET clause to skip the first `count` rows.
-    pub fn offset(mut self, count: usize) -> Self {
-        self.select.offset = Some(Offset {
-            this: Expression::Literal(Box::new(Literal::Number(count.to_string()))),
-            rows: None,
-        });
-        self
+    pub fn offset(self, count: usize) -> Self {
+        self.edit(|expression| {
+            engine::apply_offset(
+                expression,
+                Expression::Literal(Box::new(Literal::Number(count.to_string()))),
+            )
+            .expect("select builder accepts OFFSET clauses")
+        })
     }
 
     /// Enable the DISTINCT modifier on the SELECT clause.
-    pub fn distinct(mut self) -> Self {
-        self.select.distinct = true;
-        self
+    pub fn distinct(self) -> Self {
+        self.edit(|expression| {
+            engine::apply_distinct(expression, true)
+                .expect("select builder accepts DISTINCT clauses")
+        })
     }
 
     /// Add a QUALIFY clause to filter rows after window function evaluation.
     ///
     /// QUALIFY is supported by Snowflake, BigQuery, DuckDB, and Databricks. It acts
     /// like a WHERE clause but is applied after window functions are computed.
-    pub fn qualify(mut self, condition: Expr) -> Self {
-        self.select.qualify = Some(Qualify { this: condition.0 });
-        self
+    pub fn qualify(self, condition: Expr) -> Self {
+        self.qualify_with_options(condition, ClauseOptions::default())
+    }
+
+    /// Add or replace the QUALIFY clause according to `options.append`.
+    pub fn qualify_with_options(self, condition: Expr, options: ClauseOptions) -> Self {
+        self.edit(|expression| {
+            engine::apply_qualify(expression, condition.0, options.append)
+                .expect("select builder accepts QUALIFY clauses")
+        })
     }
 
     /// Add a `RIGHT JOIN` clause with the given ON condition.
-    pub fn right_join(mut self, table_name: &str, on: Expr) -> Self {
-        self.select.joins.push(Join {
-            kind: JoinKind::Right,
-            this: Expression::Table(Box::new(builder_table_ref(table_name))),
-            on: Some(on.0),
-            using: Vec::new(),
-            use_inner_keyword: false,
-            use_outer_keyword: false,
-            deferred_condition: false,
-            join_hint: None,
-            match_condition: None,
-            pivots: Vec::new(),
-            comments: Vec::new(),
-            nesting_group: 0,
-            directed: false,
-        });
-        self
+    pub fn right_join(self, table_name: &str, on: Expr) -> Self {
+        self.join_with_kind(table_name, Some(on), JoinKind::Right)
+    }
+
+    /// Add a `FULL JOIN` clause with the given ON condition.
+    pub fn full_join(self, table_name: &str, on: Expr) -> Self {
+        self.join_with_kind(table_name, Some(on), JoinKind::Full)
     }
 
     /// Add a `CROSS JOIN` clause (Cartesian product, no ON condition).
-    pub fn cross_join(mut self, table_name: &str) -> Self {
-        self.select.joins.push(Join {
-            kind: JoinKind::Cross,
-            this: Expression::Table(Box::new(builder_table_ref(table_name))),
-            on: None,
-            using: Vec::new(),
-            use_inner_keyword: false,
-            use_outer_keyword: false,
-            deferred_condition: false,
-            join_hint: None,
-            match_condition: None,
-            pivots: Vec::new(),
-            comments: Vec::new(),
-            nesting_group: 0,
-            directed: false,
-        });
-        self
+    pub fn cross_join(self, table_name: &str) -> Self {
+        self.join_with_kind(table_name, None, JoinKind::Cross)
     }
 
     /// Add a `LATERAL VIEW` clause for Hive/Spark user-defined table function (UDTF)
@@ -1507,21 +1515,41 @@ impl SelectBuilder {
     /// `table_alias` names the virtual table, and `column_aliases` name the output
     /// columns produced by the function.
     pub fn lateral_view<S: AsRef<str>>(
-        mut self,
+        self,
         table_function: Expr,
         table_alias: &str,
         column_aliases: impl IntoIterator<Item = S>,
     ) -> Self {
-        self.select.lateral_views.push(LateralView {
-            this: table_function.0,
-            table_alias: Some(builder_identifier(table_alias)),
-            column_aliases: column_aliases
-                .into_iter()
-                .map(|c| builder_identifier(c.as_ref()))
-                .collect(),
-            outer: false,
-        });
-        self
+        self.lateral_view_with_options(
+            table_function,
+            table_alias,
+            column_aliases,
+            LateralViewOptions::default(),
+        )
+    }
+
+    /// Add a `LATERAL VIEW` clause with options such as `OUTER`.
+    pub fn lateral_view_with_options<S: AsRef<str>>(
+        self,
+        table_function: Expr,
+        table_alias: &str,
+        column_aliases: impl IntoIterator<Item = S>,
+        options: LateralViewOptions,
+    ) -> Self {
+        let aliases = column_aliases
+            .into_iter()
+            .map(|c| builder_identifier(c.as_ref()))
+            .collect();
+        self.edit(|expression| {
+            engine::append_lateral_view(
+                expression,
+                table_function.0,
+                Some(builder_identifier(table_alias)),
+                aliases,
+                options.outer,
+            )
+            .expect("select builder accepts LATERAL VIEW clauses")
+        })
     }
 
     /// Add a named `WINDOW` clause definition.
@@ -1529,69 +1557,50 @@ impl SelectBuilder {
     /// The window `name` can then be referenced in window function OVER clauses
     /// elsewhere in the query. The definition is constructed via [`WindowDefBuilder`].
     /// Multiple calls append additional named windows.
-    pub fn window(mut self, name: &str, def: WindowDefBuilder) -> Self {
-        let named_window = NamedWindow {
-            name: builder_identifier(name),
-            spec: Over {
-                window_name: None,
-                partition_by: def.partition_by,
-                order_by: def.order_by,
-                frame: None,
-                alias: None,
-            },
-        };
-        match self.select.windows {
-            Some(ref mut windows) => windows.push(named_window),
-            None => self.select.windows = Some(vec![named_window]),
-        }
-        self
+    pub fn window(self, name: &str, def: WindowDefBuilder) -> Self {
+        let order_by = def.order_by;
+        self.edit(|expression| {
+            engine::append_window(
+                expression,
+                builder_identifier(name),
+                def.partition_by,
+                order_by,
+            )
+            .expect("select builder accepts WINDOW clauses")
+        })
     }
 
     /// Add a `FOR UPDATE` locking clause.
     ///
     /// Appends a `FOR UPDATE` lock to the SELECT statement. This is used by
     /// databases (PostgreSQL, MySQL, Oracle) to lock selected rows for update.
-    pub fn for_update(mut self) -> Self {
-        self.select.locks.push(Lock {
-            update: Some(Box::new(Expression::Boolean(BooleanLiteral {
-                value: true,
-            }))),
-            expressions: vec![],
-            wait: None,
-            key: None,
-        });
-        self
+    pub fn for_update(self) -> Self {
+        self.edit(|expression| {
+            engine::append_lock(expression, engine::LockKind::Update)
+                .expect("select builder accepts locking clauses")
+        })
     }
 
     /// Add a `FOR SHARE` locking clause.
     ///
     /// Appends a `FOR SHARE` lock to the SELECT statement. This allows other
     /// transactions to read the locked rows but prevents updates.
-    pub fn for_share(mut self) -> Self {
-        self.select.locks.push(Lock {
-            update: None,
-            expressions: vec![],
-            wait: None,
-            key: None,
-        });
-        self
+    pub fn for_share(self) -> Self {
+        self.edit(|expression| {
+            engine::append_lock(expression, engine::LockKind::Share)
+                .expect("select builder accepts locking clauses")
+        })
     }
 
     /// Add a query hint (e.g., Oracle `/*+ FULL(t) */`).
     ///
     /// Hints are rendered for Oracle, MySQL, Spark, Hive, Databricks, and PostgreSQL
     /// dialects. Multiple calls append additional hints.
-    pub fn hint(mut self, hint_text: &str) -> Self {
-        let hint_expr = HintExpression::Raw(hint_text.to_string());
-        match &mut self.select.hint {
-            Some(h) => h.expressions.push(hint_expr),
-            None => {
-                self.select.hint = Some(Hint {
-                    expressions: vec![hint_expr],
-                })
-            }
-        }
-        self
+    pub fn hint(self, hint_text: &str) -> Self {
+        self.edit(|expression| {
+            engine::append_hint(expression, hint_text.to_string())
+                .expect("select builder accepts query hints")
+        })
     }
 
     /// Convert this SELECT into a `CREATE TABLE AS SELECT` statement.
@@ -1610,44 +1619,18 @@ impl SelectBuilder {
     /// assert_eq!(sql, "CREATE TABLE new_table AS SELECT * FROM t");
     /// ```
     pub fn ctas(self, table_name: &str) -> Expression {
-        Expression::CreateTable(Box::new(CreateTable {
-            name: builder_table_ref(table_name),
-            on_cluster: None,
-            columns: vec![],
-            constraints: vec![],
-            if_not_exists: false,
-            temporary: false,
-            or_replace: false,
-            table_modifier: None,
-            as_select: Some(self.build()),
-            as_select_parenthesized: false,
-            on_commit: None,
-            clone_source: None,
-            clone_at_clause: None,
-            is_copy: false,
-            shallow_clone: false,
-            deep_clone: false,
-            leading_comments: vec![],
-            with_properties: vec![],
-            teradata_post_name_options: vec![],
-            with_data: None,
-            with_statistics: None,
-            teradata_indexes: vec![],
-            with_cte: None,
-            properties: vec![],
-            partition_of: None,
-            post_table_properties: vec![],
-            mysql_table_options: vec![],
-            tidb_table_options: vec![],
-            inherits: vec![],
-            on_property: None,
-            copy_grants: false,
-            using_template: None,
-            rollup: None,
-            uuid: None,
-            with_partition_columns: vec![],
-            with_connection: None,
-        }))
+        self.ctas_with_options(table_name, CtasOptions::default())
+    }
+
+    /// Build a `CREATE TABLE AS SELECT` statement with replacement/temporary options.
+    pub fn ctas_with_options(self, table_name: &str, options: CtasOptions) -> Expression {
+        engine::create_table_as(
+            self.build(),
+            builder_table_ref(table_name),
+            options.replace,
+            options.temporary,
+        )
+        .expect("select builder CTAS source is a query")
     }
 
     /// Combine this SELECT with another via `UNION` (duplicate elimination).
@@ -1685,10 +1668,10 @@ impl SelectBuilder {
 
     /// Consume this builder, generate, and return the SQL string.
     ///
-    /// Equivalent to calling `.build()` followed by [`Generator::sql()`]. Returns an
-    /// empty string if generation fails.
+    /// Uses canonical builder rendering (including infix `NOT IN`) and returns an empty
+    /// string if generation fails.
     pub fn to_sql(self) -> String {
-        Generator::sql(&self.build()).unwrap_or_default()
+        generate_builder_sql(&self.build())
     }
 }
 
@@ -1705,9 +1688,20 @@ pub struct DeleteBuilder {
 }
 
 impl DeleteBuilder {
-    /// Set the WHERE clause to restrict which rows are deleted.
-    pub fn where_(mut self, condition: Expr) -> Self {
-        self.delete.where_clause = Some(Where { this: condition.0 });
+    /// Add a predicate to the WHERE clause, combining repeated calls with `AND`.
+    pub fn where_(self, condition: Expr) -> Self {
+        self.where_with_options(condition, ClauseOptions::default())
+    }
+
+    /// Add or replace the WHERE clause according to `options.append`.
+    pub fn where_with_options(mut self, condition: Expr, options: ClauseOptions) -> Self {
+        let mut expression = Expression::Delete(Box::new(self.delete));
+        engine::apply_where(&mut expression, condition.0, options.append)
+            .expect("delete builder accepts WHERE clauses");
+        self.delete = match expression {
+            Expression::Delete(delete) => *delete,
+            _ => unreachable!("delete builder engine changed the expression kind"),
+        };
         self
     }
 
@@ -1718,7 +1712,7 @@ impl DeleteBuilder {
 
     /// Consume this builder, generate, and return the SQL string.
     pub fn to_sql(self) -> String {
-        Generator::sql(&self.build()).unwrap_or_default()
+        generate_builder_sql(&self.build())
     }
 }
 
@@ -1737,38 +1731,54 @@ pub struct InsertBuilder {
 }
 
 impl InsertBuilder {
+    fn edit(mut self, edit: impl FnOnce(&mut Expression)) -> Self {
+        let mut expression = Expression::Insert(Box::new(self.insert));
+        edit(&mut expression);
+        self.insert = match expression {
+            Expression::Insert(insert) => *insert,
+            _ => unreachable!("insert builder engine changed the expression kind"),
+        };
+        self
+    }
+
     /// Set the target column names for the INSERT statement.
-    pub fn columns<I, S>(mut self, columns: I) -> Self
+    pub fn columns<I, S>(self, columns: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.insert.columns = columns
+        let columns = columns
             .into_iter()
             .map(|c| builder_identifier(c.as_ref()))
             .collect();
-        self
+        self.edit(|expression| {
+            engine::set_insert_columns(expression, columns)
+                .expect("insert builder accepts target columns")
+        })
     }
 
     /// Append a row of values to the VALUES clause.
     ///
     /// Call this method multiple times to insert multiple rows in a single statement.
-    pub fn values<I>(mut self, values: I) -> Self
+    pub fn values<I>(self, values: I) -> Self
     where
         I: IntoIterator<Item = Expr>,
     {
-        self.insert
-            .values
-            .push(values.into_iter().map(|v| v.0).collect());
-        self
+        let row = values.into_iter().map(|v| v.0).collect();
+        self.edit(|expression| {
+            engine::apply_insert_values(expression, vec![row], true)
+                .expect("insert builder accepts VALUES clauses")
+        })
     }
 
     /// Set the source query for an `INSERT INTO ... SELECT ...` statement.
     ///
     /// When a query is set, the VALUES clause is ignored during generation.
-    pub fn query(mut self, query: SelectBuilder) -> Self {
-        self.insert.query = Some(query.build());
-        self
+    pub fn query(self, query: SelectBuilder) -> Self {
+        self.edit(|expression| {
+            engine::set_insert_query(expression, query.build())
+                .expect("insert builder accepts query sources")
+        })
     }
 
     /// Consume this builder and produce the final [`Expression::Insert`] AST node.
@@ -1778,7 +1788,7 @@ impl InsertBuilder {
 
     /// Consume this builder, generate, and return the SQL string.
     pub fn to_sql(self) -> String {
-        Generator::sql(&self.build()).unwrap_or_default()
+        generate_builder_sql(&self.build())
     }
 }
 
@@ -1796,28 +1806,57 @@ pub struct UpdateBuilder {
 }
 
 impl UpdateBuilder {
-    /// Add a `SET column = value` assignment.
-    ///
-    /// Call this method multiple times to set multiple columns.
-    pub fn set(mut self, column: &str, value: Expr) -> Self {
-        self.update.set.push((builder_identifier(column), value.0));
+    fn edit(mut self, edit: impl FnOnce(&mut Expression)) -> Self {
+        let mut expression = Expression::Update(Box::new(self.update));
+        edit(&mut expression);
+        self.update = match expression {
+            Expression::Update(update) => *update,
+            _ => unreachable!("update builder engine changed the expression kind"),
+        };
         self
     }
 
-    /// Set the WHERE clause to restrict which rows are updated.
-    pub fn where_(mut self, condition: Expr) -> Self {
-        self.update.where_clause = Some(Where { this: condition.0 });
+    /// Add a `SET column = value` assignment.
+    ///
+    /// Call this method multiple times to set multiple columns.
+    pub fn set(self, column: &str, value: Expr) -> Self {
+        self.edit(|expression| {
+            engine::append_update_assignments(
+                expression,
+                vec![(builder_identifier(column), value.0)],
+            )
+            .expect("update builder accepts SET assignments")
+        })
+    }
+
+    /// Add a predicate to the WHERE clause, combining repeated calls with `AND`.
+    pub fn where_(self, condition: Expr) -> Self {
+        self.where_with_options(condition, ClauseOptions::default())
+    }
+
+    /// Add or replace the WHERE clause according to `options.append`.
+    pub fn where_with_options(mut self, condition: Expr, options: ClauseOptions) -> Self {
+        let mut expression = Expression::Update(Box::new(self.update));
+        engine::apply_where(&mut expression, condition.0, options.append)
+            .expect("update builder accepts WHERE clauses");
+        self.update = match expression {
+            Expression::Update(update) => *update,
+            _ => unreachable!("update builder engine changed the expression kind"),
+        };
         self
     }
 
     /// Set the FROM clause for PostgreSQL/Snowflake-style `UPDATE ... FROM ...` syntax.
     ///
     /// This allows joining against other tables within the UPDATE statement.
-    pub fn from(mut self, table_name: &str) -> Self {
-        self.update.from_clause = Some(From {
-            expressions: vec![Expression::Table(Box::new(builder_table_ref(table_name)))],
-        });
-        self
+    pub fn from(self, table_name: &str) -> Self {
+        self.edit(|expression| {
+            engine::set_from(
+                expression,
+                vec![Expression::Table(Box::new(builder_table_ref(table_name)))],
+            )
+            .expect("update builder accepts FROM clauses")
+        })
     }
 
     /// Consume this builder and produce the final [`Expression::Update`] AST node.
@@ -1827,7 +1866,7 @@ impl UpdateBuilder {
 
     /// Consume this builder, generate, and return the SQL string.
     pub fn to_sql(self) -> String {
-        Generator::sql(&self.build()).unwrap_or_default()
+        generate_builder_sql(&self.build())
     }
 }
 
@@ -1933,13 +1972,16 @@ impl CaseBuilder {
     /// Use this instead of [`.build()`](CaseBuilder::build) when you need the
     /// [`Expression`] directly rather than an [`Expr`] wrapper.
     pub fn build_expr(self) -> Expression {
-        Expression::Case(Box::new(Case {
-            operand: self.operand,
-            whens: self.whens,
-            else_: self.else_,
-            comments: Vec::new(),
-            inferred_type: None,
-        }))
+        let mut expression = engine::case(self.operand);
+        for (condition, result) in self.whens {
+            engine::append_case_when(&mut expression, condition, result)
+                .expect("case builder accepts WHEN branches");
+        }
+        if let Some(result) = self.else_ {
+            engine::set_case_else(&mut expression, result)
+                .expect("case builder accepts ELSE branches");
+        }
+        expression
     }
 }
 
@@ -1975,23 +2017,10 @@ pub fn subquery(query: SelectBuilder, alias_name: &str) -> Expr {
 /// This is the lower-level version of [`subquery()`] that accepts a pre-built
 /// [`Expression`] instead of a [`SelectBuilder`].
 pub fn subquery_expr(expr: Expression, alias_name: &str) -> Expr {
-    Expr(Expression::Subquery(Box::new(Subquery {
-        this: expr,
-        alias: Some(builder_identifier(alias_name)),
-        column_aliases: Vec::new(),
-        alias_explicit_as: false,
-        alias_keyword: None,
-        order_by: None,
-        limit: None,
-        offset: None,
-        distribute_by: None,
-        sort_by: None,
-        cluster_by: None,
-        lateral: false,
-        modifiers_inside: true,
-        trailing_comments: Vec::new(),
-        inferred_type: None,
-    })))
+    Expr(
+        engine::subquery(expr, Some(builder_identifier(alias_name)), true)
+            .expect("subquery builder source is a query"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2053,31 +2082,40 @@ impl SetOpBuilder {
     ///
     /// Expressions not already wrapped with [`.asc()`](Expr::asc) or
     /// [`.desc()`](Expr::desc) default to ascending order.
-    pub fn order_by<I, E>(mut self, expressions: I) -> Self
+    pub fn order_by<I, E>(self, expressions: I) -> Self
     where
         I: IntoIterator<Item = E>,
         E: IntoExpr,
     {
-        self.order_by = Some(OrderBy {
-            siblings: false,
-            comments: Vec::new(),
-            expressions: expressions
-                .into_iter()
-                .map(|e| {
-                    let expr = e.into_expr().0;
-                    match expr {
-                        Expression::Ordered(o) => *o,
-                        other => Ordered {
-                            this: other,
-                            desc: false,
-                            nulls_first: None,
-                            explicit_asc: false,
-                            with_fill: None,
-                        },
-                    }
+        self.order_by_with_options(expressions, ClauseOptions::default())
+    }
+
+    /// Add or replace ordering expressions according to `options.append`.
+    pub fn order_by_with_options<I, E>(mut self, expressions: I, options: ClauseOptions) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: IntoExpr,
+    {
+        let values: Vec<_> = expressions
+            .into_iter()
+            .map(|expression| engine::ordered(expression.into_expr().0))
+            .collect();
+        if options.append {
+            self.order_by
+                .get_or_insert_with(|| OrderBy {
+                    siblings: false,
+                    comments: Vec::new(),
+                    expressions: Vec::new(),
                 })
-                .collect(),
-        });
+                .expressions
+                .extend(values);
+        } else {
+            self.order_by = Some(OrderBy {
+                siblings: false,
+                comments: Vec::new(),
+                expressions: values,
+            });
+        }
         self
     }
 
@@ -2102,70 +2140,31 @@ impl SetOpBuilder {
     /// The returned expression is one of [`Expression::Union`], [`Expression::Intersect`],
     /// or [`Expression::Except`] depending on how the builder was created.
     pub fn build(self) -> Expression {
-        match self.kind {
-            SetOpKind::Union => Expression::Union(Box::new(Union {
-                left: self.left,
-                right: self.right,
-                all: self.all,
-                distinct: false,
-                with: None,
-                order_by: self.order_by,
-                limit: self.limit,
-                offset: self.offset,
-                distribute_by: None,
-                sort_by: None,
-                cluster_by: None,
-                by_name: false,
-                side: None,
-                kind: None,
-                corresponding: false,
-                strict: false,
-                on_columns: Vec::new(),
-            })),
-            SetOpKind::Intersect => Expression::Intersect(Box::new(Intersect {
-                left: self.left,
-                right: self.right,
-                all: self.all,
-                distinct: false,
-                with: None,
-                order_by: self.order_by,
-                limit: self.limit,
-                offset: self.offset,
-                distribute_by: None,
-                sort_by: None,
-                cluster_by: None,
-                by_name: false,
-                side: None,
-                kind: None,
-                corresponding: false,
-                strict: false,
-                on_columns: Vec::new(),
-            })),
-            SetOpKind::Except => Expression::Except(Box::new(Except {
-                left: self.left,
-                right: self.right,
-                all: self.all,
-                distinct: false,
-                with: None,
-                order_by: self.order_by,
-                limit: self.limit,
-                offset: self.offset,
-                distribute_by: None,
-                sort_by: None,
-                cluster_by: None,
-                by_name: false,
-                side: None,
-                kind: None,
-                corresponding: false,
-                strict: false,
-                on_columns: Vec::new(),
-            })),
+        let kind = match self.kind {
+            SetOpKind::Union => engine::SetKind::Union,
+            SetOpKind::Intersect => engine::SetKind::Intersect,
+            SetOpKind::Except => engine::SetKind::Except,
+        };
+        let mut expression = engine::set_operation(kind, self.left, self.right, !self.all)
+            .expect("set builder operands are queries");
+        if let Some(order_by) = self.order_by {
+            engine::apply_order_by(&mut expression, order_by.expressions, false)
+                .expect("set operations accept ORDER BY clauses");
         }
+        if let Some(limit) = self.limit {
+            engine::apply_limit(&mut expression, *limit)
+                .expect("set operations accept LIMIT clauses");
+        }
+        if let Some(offset) = self.offset {
+            engine::apply_offset(&mut expression, *offset)
+                .expect("set operations accept OFFSET clauses");
+        }
+        expression
     }
 
     /// Consume this builder, generate, and return the SQL string.
     pub fn to_sql(self) -> String {
-        Generator::sql(&self.build()).unwrap_or_default()
+        generate_builder_sql(&self.build())
     }
 }
 
@@ -2417,21 +2416,6 @@ impl IntoLiteral for bool {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn binary_op(left: Expression, right: Expression) -> BinaryOp {
-    BinaryOp {
-        left,
-        right,
-        left_comments: Vec::new(),
-        operator_comments: Vec::new(),
-        trailing_comments: Vec::new(),
-        inferred_type: None,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // MergeBuilder
 // ---------------------------------------------------------------------------
 
@@ -2454,10 +2438,7 @@ fn binary_op(left: Expression, right: Expression) -> BinaryOp {
 /// ```
 pub fn merge_into(target: &str) -> MergeBuilder {
     MergeBuilder {
-        target: Expression::Table(Box::new(builder_table_ref(target))),
-        using: None,
-        on: None,
-        whens: Vec::new(),
+        expression: engine::merge(Expression::Table(Box::new(builder_table_ref(target)))),
     }
 }
 
@@ -2465,61 +2446,29 @@ pub fn merge_into(target: &str) -> MergeBuilder {
 ///
 /// Created by the [`merge_into()`] entry-point function.
 pub struct MergeBuilder {
-    target: Expression,
-    using: Option<Expression>,
-    on: Option<Expression>,
-    whens: Vec<Expression>,
+    expression: Expression,
 }
 
 impl MergeBuilder {
     /// Set the source table and ON join condition.
     pub fn using(mut self, source: &str, on: Expr) -> Self {
-        self.using = Some(Expression::Table(Box::new(builder_table_ref(source))));
-        self.on = Some(on.0);
+        engine::set_merge_using(
+            &mut self.expression,
+            Expression::Table(Box::new(builder_table_ref(source))),
+            on.0,
+        )
+        .expect("merge builder accepts a USING clause");
         self
     }
 
     /// Add a `WHEN MATCHED THEN UPDATE SET` clause.
     pub fn when_matched_update(mut self, assignments: Vec<(&str, Expr)>) -> Self {
-        let eqs: Vec<Expression> = assignments
+        let assignments = assignments
             .into_iter()
-            .map(|(col_name, val)| {
-                Expression::Eq(Box::new(BinaryOp {
-                    left: Expression::boxed_column(Column {
-                        name: builder_identifier(col_name),
-                        table: None,
-                        join_mark: false,
-                        trailing_comments: Vec::new(),
-                        span: None,
-                        inferred_type: None,
-                    }),
-                    right: val.0,
-                    left_comments: Vec::new(),
-                    operator_comments: Vec::new(),
-                    trailing_comments: Vec::new(),
-                    inferred_type: None,
-                }))
-            })
+            .map(|(column, value)| (builder_identifier(column), value.0))
             .collect();
-
-        let action = Expression::Tuple(Box::new(Tuple {
-            expressions: vec![
-                Expression::Var(Box::new(Var {
-                    this: "UPDATE".to_string(),
-                })),
-                Expression::Tuple(Box::new(Tuple { expressions: eqs })),
-            ],
-        }));
-
-        let when = Expression::When(Box::new(When {
-            matched: Some(Box::new(Expression::Boolean(BooleanLiteral {
-                value: true,
-            }))),
-            source: None,
-            condition: None,
-            then: Box::new(action),
-        }));
-        self.whens.push(when);
+        engine::append_merge_update(&mut self.expression, assignments, None)
+            .expect("merge builder accepts matched update actions");
         self
     }
 
@@ -2529,132 +2478,72 @@ impl MergeBuilder {
         condition: Expr,
         assignments: Vec<(&str, Expr)>,
     ) -> Self {
-        let eqs: Vec<Expression> = assignments
+        let assignments = assignments
             .into_iter()
-            .map(|(col_name, val)| {
-                Expression::Eq(Box::new(BinaryOp {
-                    left: Expression::boxed_column(Column {
-                        name: builder_identifier(col_name),
-                        table: None,
-                        join_mark: false,
-                        trailing_comments: Vec::new(),
-                        span: None,
-                        inferred_type: None,
-                    }),
-                    right: val.0,
-                    left_comments: Vec::new(),
-                    operator_comments: Vec::new(),
-                    trailing_comments: Vec::new(),
-                    inferred_type: None,
-                }))
-            })
+            .map(|(column, value)| (builder_identifier(column), value.0))
             .collect();
-
-        let action = Expression::Tuple(Box::new(Tuple {
-            expressions: vec![
-                Expression::Var(Box::new(Var {
-                    this: "UPDATE".to_string(),
-                })),
-                Expression::Tuple(Box::new(Tuple { expressions: eqs })),
-            ],
-        }));
-
-        let when = Expression::When(Box::new(When {
-            matched: Some(Box::new(Expression::Boolean(BooleanLiteral {
-                value: true,
-            }))),
-            source: None,
-            condition: Some(Box::new(condition.0)),
-            then: Box::new(action),
-        }));
-        self.whens.push(when);
+        engine::append_merge_update(&mut self.expression, assignments, Some(condition.0))
+            .expect("merge builder accepts conditional matched update actions");
         self
     }
 
     /// Add a `WHEN MATCHED THEN DELETE` clause.
     pub fn when_matched_delete(mut self) -> Self {
-        let action = Expression::Var(Box::new(Var {
-            this: "DELETE".to_string(),
-        }));
+        engine::append_merge_delete(&mut self.expression, None)
+            .expect("merge builder accepts matched delete actions");
+        self
+    }
 
-        let when = Expression::When(Box::new(When {
-            matched: Some(Box::new(Expression::Boolean(BooleanLiteral {
-                value: true,
-            }))),
-            source: None,
-            condition: None,
-            then: Box::new(action),
-        }));
-        self.whens.push(when);
+    /// Add a conditional `WHEN MATCHED THEN DELETE` clause.
+    pub fn when_matched_delete_where(mut self, condition: Expr) -> Self {
+        engine::append_merge_delete(&mut self.expression, Some(condition.0))
+            .expect("merge builder accepts conditional matched delete actions");
         self
     }
 
     /// Add a `WHEN NOT MATCHED THEN INSERT (cols) VALUES (vals)` clause.
     pub fn when_not_matched_insert(mut self, columns: &[&str], values: Vec<Expr>) -> Self {
-        let col_exprs: Vec<Expression> = columns
-            .iter()
-            .map(|c| {
-                Expression::boxed_column(Column {
-                    name: builder_identifier(c),
-                    table: None,
-                    join_mark: false,
-                    trailing_comments: Vec::new(),
-                    span: None,
-                    inferred_type: None,
-                })
-            })
-            .collect();
-        let val_exprs: Vec<Expression> = values.into_iter().map(|v| v.0).collect();
+        engine::append_merge_insert(
+            &mut self.expression,
+            columns
+                .iter()
+                .map(|column| builder_identifier(column))
+                .collect(),
+            values.into_iter().map(|value| value.0).collect(),
+            None,
+        )
+        .expect("merge builder accepts not-matched insert actions");
+        self
+    }
 
-        let action = Expression::Tuple(Box::new(Tuple {
-            expressions: vec![
-                Expression::Var(Box::new(Var {
-                    this: "INSERT".to_string(),
-                })),
-                Expression::Tuple(Box::new(Tuple {
-                    expressions: col_exprs,
-                })),
-                Expression::Tuple(Box::new(Tuple {
-                    expressions: val_exprs,
-                })),
-            ],
-        }));
-
-        let when = Expression::When(Box::new(When {
-            matched: Some(Box::new(Expression::Boolean(BooleanLiteral {
-                value: false,
-            }))),
-            source: None,
-            condition: None,
-            then: Box::new(action),
-        }));
-        self.whens.push(when);
+    /// Add a conditional `WHEN NOT MATCHED THEN INSERT` clause.
+    pub fn when_not_matched_insert_where(
+        mut self,
+        condition: Expr,
+        columns: &[&str],
+        values: Vec<Expr>,
+    ) -> Self {
+        engine::append_merge_insert(
+            &mut self.expression,
+            columns
+                .iter()
+                .map(|column| builder_identifier(column))
+                .collect(),
+            values.into_iter().map(|value| value.0).collect(),
+            Some(condition.0),
+        )
+        .expect("merge builder accepts conditional not-matched insert actions");
         self
     }
 
     /// Consume this builder and produce the final [`Expression::Merge`] AST node.
     pub fn build(self) -> Expression {
-        let whens_expr = Expression::Whens(Box::new(Whens {
-            expressions: self.whens,
-        }));
-
-        Expression::Merge(Box::new(Merge {
-            this: Box::new(self.target),
-            using: Box::new(
-                self.using
-                    .unwrap_or(Expression::Null(crate::expressions::Null)),
-            ),
-            on: self.on.map(Box::new),
-            using_cond: None,
-            whens: Some(Box::new(whens_expr)),
-            with_: None,
-            returning: None,
-        }))
+        self.expression
     }
 
     /// Consume this builder, generate, and return the SQL string.
     pub fn to_sql(self) -> String {
-        Generator::sql(&self.build()).unwrap_or_default()
+        generate_builder_sql(&self.build())
     }
 }
 
@@ -2896,6 +2785,27 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_operator_grouping() {
+        assert_eq!(
+            or(col("a").eq(lit(1)), col("b").eq(lit(2)))
+                .and(col("c").eq(lit(3)))
+                .to_sql(),
+            "(a = 1 OR b = 2) AND c = 3"
+        );
+        assert_eq!(
+            col("a")
+                .eq(lit(1))
+                .and(or(col("b").eq(lit(2)), col("c").eq(lit(3))))
+                .to_sql(),
+            "a = 1 AND (b = 2 OR c = 3)"
+        );
+        assert_eq!(col("a").add(col("b")).mul(col("c")).to_sql(), "(a + b) * c");
+        assert_eq!(col("a").mul(col("b").add(col("c"))).to_sql(), "a * (b + c)");
+        assert_eq!(col("a").sub(col("b").sub(col("c"))).to_sql(), "a - (b - c)");
+        assert_eq!(col("a").div(col("b").div(col("c"))).to_sql(), "a / (b / c)");
+    }
+
+    #[test]
     fn test_cast() {
         let sql = select([col("id").cast("VARCHAR")]).from("users").to_sql();
         assert_eq!(sql, "SELECT CAST(id AS VARCHAR) FROM users");
@@ -3026,8 +2936,27 @@ mod tests {
             .to_sql();
         assert_eq!(
             sql,
-            "SELECT id FROM users WHERE NOT status IN ('deleted', 'banned')"
+            "SELECT id FROM users WHERE status NOT IN ('deleted', 'banned')"
         );
+    }
+
+    #[test]
+    fn repeated_clauses_append_unless_replacement_is_requested() {
+        let appended = select(["x"])
+            .where_(col("x").gt(lit(0)))
+            .where_(col("x").lt(lit(10)))
+            .group_by(["x"])
+            .group_by(["y"])
+            .to_sql();
+        assert_eq!(appended, "SELECT x WHERE x > 0 AND x < 10 GROUP BY x, y");
+
+        let replaced = select(["x"])
+            .where_(col("x").gt(lit(0)))
+            .where_with_options(col("x").eq(lit(5)), ClauseOptions { append: false })
+            .group_by(["x"])
+            .group_by_with_options(["y"], ClauseOptions { append: false })
+            .to_sql();
+        assert_eq!(replaced, "SELECT x WHERE x = 5 GROUP BY y");
     }
 
     // -- Step 4: CaseBuilder tests --
@@ -3179,6 +3108,20 @@ mod tests {
             .to_sql();
         assert!(sql.contains("LATERAL VIEW"));
         assert!(sql.contains("EXPLODE"));
+
+        let expression = select(["id"])
+            .from("t")
+            .lateral_view_with_options(
+                func("EXPLODE", [col("arr")]),
+                "lv",
+                ["value"],
+                LateralViewOptions { outer: true },
+            )
+            .build();
+        let Expression::Select(select) = expression else {
+            panic!("expected SELECT")
+        };
+        assert!(select.lateral_views[0].outer);
     }
 
     #[test]
@@ -3236,6 +3179,19 @@ mod tests {
         let expr = select(["*"]).from("t").ctas("new_table");
         let sql = Generator::sql(&expr).unwrap();
         assert_eq!(sql, "CREATE TABLE new_table AS SELECT * FROM t");
+
+        let expr = select(["*"]).from("t").ctas_with_options(
+            "new_table",
+            CtasOptions {
+                replace: true,
+                temporary: true,
+            },
+        );
+        let Expression::CreateTable(create) = expr else {
+            panic!("expected CREATE TABLE")
+        };
+        assert!(create.or_replace);
+        assert!(create.temporary);
     }
 
     // -- MergeBuilder tests --

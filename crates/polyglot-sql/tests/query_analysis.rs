@@ -130,6 +130,10 @@ fn analyze_query_reports_function_projection_arguments() {
         Some("events")
     );
     assert_eq!(transform_function.column_args[0].column, "created_at");
+    assert_eq!(
+        analysis.projections[0].type_hint.as_deref(),
+        Some("TIMESTAMP")
+    );
 }
 
 #[test]
@@ -263,6 +267,93 @@ fn analyze_query_reports_set_operations() {
 }
 
 #[test]
+fn analyze_query_reports_name_aligned_set_operation_outputs() {
+    let sql = "SELECT 1 AS left_value UNION ALL BY NAME SELECT 2 AS right_value";
+    for dialect in [DialectType::DuckDB, DialectType::Snowflake] {
+        let analysis = analyze_query(
+            sql,
+            AnalyzeQueryOptions {
+                dialect,
+                schema: None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("analysis failed for {dialect:?}: {error}"));
+
+        assert_eq!(
+            analysis.set_operations[0].output_columns,
+            vec!["left_value", "right_value"]
+        );
+        assert_eq!(
+            analysis
+                .projections
+                .iter()
+                .map(|projection| projection.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("left_value"), Some("right_value")]
+        );
+        assert!(analysis
+            .projections
+            .iter()
+            .all(|projection| projection.nullability == ProjectionNullability::Nullable));
+    }
+}
+
+#[test]
+fn analyze_query_reports_bigquery_name_alignment_modes() {
+    for (sql, expected_names, expected_nullability) in [
+        (
+            "SELECT 1 AS a, 2 AS b UNION ALL BY NAME SELECT 3 AS b, 4 AS a",
+            vec!["a", "b"],
+            vec![
+                ProjectionNullability::NonNull,
+                ProjectionNullability::NonNull,
+            ],
+        ),
+        (
+            "SELECT 1 AS a, 2 AS b INNER UNION ALL BY NAME SELECT 3 AS b, 4 AS c",
+            vec!["b"],
+            vec![ProjectionNullability::NonNull],
+        ),
+        (
+            "SELECT 1 AS a, 2 AS b FULL OUTER UNION ALL BY NAME SELECT 3 AS b, 4 AS c",
+            vec!["a", "b", "c"],
+            vec![
+                ProjectionNullability::Nullable,
+                ProjectionNullability::NonNull,
+                ProjectionNullability::Nullable,
+            ],
+        ),
+        (
+            "SELECT 1 AS a, 2 AS b FULL OUTER UNION ALL BY NAME ON (c, a) SELECT 3 AS b, 4 AS c",
+            vec!["c", "a"],
+            vec![
+                ProjectionNullability::Nullable,
+                ProjectionNullability::Nullable,
+            ],
+        ),
+    ] {
+        let analysis = analyze_query(
+            sql,
+            AnalyzeQueryOptions {
+                dialect: DialectType::BigQuery,
+                schema: None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("analysis failed for {sql:?}: {error}"));
+
+        assert_eq!(analysis.set_operations[0].output_columns, expected_names);
+        assert_eq!(
+            analysis
+                .projections
+                .iter()
+                .map(|projection| projection.nullability)
+                .collect::<Vec<_>>(),
+            expected_nullability
+        );
+    }
+}
+
+#[test]
 fn analyze_query_rejects_non_query_statements() {
     let err = analyze_query(
         "CREATE TABLE t (a INT)",
@@ -362,6 +453,89 @@ fn analyze_query_resolves_unique_unqualified_columns_with_alias_schema() {
 }
 
 #[test]
+fn analyze_query_resolves_natural_join_merged_column_with_schema() {
+    let natural_join_schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [
+            {
+                "name": "source_table",
+                "columns": [
+                    {"name": "shared_key", "type": "VARCHAR"}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+    let analysis = analyze_query(
+        "SELECT shared_key AS output_key FROM source_table \
+         NATURAL JOIN (SELECT shared_key FROM source_table) derived",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: Some(natural_join_schema),
+        },
+    )
+    .unwrap();
+
+    let projection = &analysis.projections[0];
+    assert_eq!(projection.name.as_deref(), Some("output_key"));
+    assert_eq!(projection.type_hint.as_deref(), Some("TEXT"));
+    assert!(
+        !projection.upstream.is_empty(),
+        "merged column should retain physical upstreams"
+    );
+    assert!(projection.upstream.iter().all(|reference| {
+        reference.column == "shared_key"
+            && reference.source_name.as_deref() == Some("source_table")
+            && reference.table.as_deref() == Some("source_table")
+            && reference.source_kind == SourceKind::Table
+            && !reference.unqualified
+            && reference.confidence == ReferenceConfidence::Resolved
+    }));
+}
+
+#[test]
+fn analyze_query_propagates_schema_type_through_anonymous_derived_table() {
+    let derived_table_schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [
+            {
+                "name": "source_table",
+                "columns": [
+                    {"name": "source_value", "type": "VARCHAR"}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    for sql in [
+        "SELECT source_value FROM (SELECT source_value FROM source_table)",
+        "SELECT derived.source_value FROM (SELECT source_value FROM source_table) AS derived",
+    ] {
+        let analysis = analyze_query(
+            sql,
+            AnalyzeQueryOptions {
+                dialect: DialectType::DuckDB,
+                schema: Some(derived_table_schema.clone()),
+            },
+        )
+        .unwrap();
+
+        let projection = &analysis.projections[0];
+        assert_eq!(projection.type_hint.as_deref(), Some("TEXT"), "{sql}");
+        assert!(
+            projection.upstream.iter().any(|reference| {
+                reference.column == "source_value"
+                    && reference.source_name.as_deref() == Some("source_table")
+                    && reference.table.as_deref() == Some("source_table")
+                    && reference.source_kind == SourceKind::Table
+                    && reference.confidence == ReferenceConfidence::Resolved
+            }),
+            "{sql}: {:#?}",
+            projection.upstream
+        );
+    }
+}
+
+#[test]
 fn analyze_query_preserves_precise_schema_type_hints() {
     let analysis = analyze_query(
         "SELECT amount FROM orders",
@@ -437,6 +611,21 @@ fn analyze_query_classifies_typed_aggregates() {
         analysis.projections[0].nullability,
         ProjectionNullability::NonNull
     );
+
+    let duckdb_analysis = analyze_query(
+        "SELECT COUNT_IF(numeric_value > 0), MEDIAN(numeric_value), FIRST(numeric_value), ARG_MAX_NULL(label, numeric_value), ARG_MIN_NULL(label, numeric_value) FROM source_table",
+        AnalyzeQueryOptions {
+            dialect: DialectType::DuckDB,
+            schema: None,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(duckdb_analysis.projections.len(), 5);
+    assert!(duckdb_analysis
+        .projections
+        .iter()
+        .all(|projection| projection.transform_kind == TransformKind::Aggregation));
 }
 
 #[test]
@@ -665,6 +854,19 @@ fn unnest_analysis_schema() -> ValidationSchema {
     .unwrap()
 }
 
+fn struct_field_analysis_schema() -> ValidationSchema {
+    serde_json::from_value(json!({
+        "tables": [{
+            "name": "source_table",
+            "columns": [
+                {"name": "nested_items", "type": "STRUCT(field_value VARCHAR)[]"},
+                {"name": "composite_value", "type": "STRUCT(field_value VARCHAR, label VARCHAR)"}
+            ]
+        }]
+    }))
+    .unwrap()
+}
+
 #[test]
 fn analyze_query_resolves_nested_set_operation_inside_derived_table() {
     let analysis = analyze_query(
@@ -762,6 +964,47 @@ fn analyze_query_resolves_unnest_virtual_output_aliases_with_schema() {
                     && reference.column == "arr"),
             "expected t.arr upstream for {sql:?}, got {:?}",
             analysis.projections[0].upstream
+        );
+    }
+}
+
+#[test]
+fn analyze_query_resolves_struct_fields_and_types_issue_408() {
+    let cases = [
+        (
+            "SELECT composite_value.field_value AS output_value FROM source_table",
+            "composite_value",
+        ),
+        (
+            "SELECT source_table.composite_value.field_value AS output_value FROM source_table",
+            "composite_value",
+        ),
+        (
+            "SELECT item.field_value AS output_value FROM source_table s \
+             CROSS JOIN UNNEST(s.nested_items) AS expanded(item)",
+            "nested_items",
+        ),
+    ];
+
+    for (sql, expected_column) in cases {
+        let analysis = analyze_query(
+            sql,
+            AnalyzeQueryOptions {
+                dialect: DialectType::DuckDB,
+                schema: Some(struct_field_analysis_schema()),
+            },
+        )
+        .unwrap_or_else(|error| panic!("analyze_query failed for {sql:?}: {error}"));
+        let projection = &analysis.projections[0];
+
+        assert_eq!(projection.type_hint.as_deref(), Some("TEXT"));
+        assert!(
+            projection.upstream.iter().any(|reference| {
+                reference.table.as_deref() == Some("source_table")
+                    && reference.column == expected_column
+            }),
+            "expected source_table.{expected_column} upstream for {sql:?}, got {:?}",
+            projection.upstream
         );
     }
 }

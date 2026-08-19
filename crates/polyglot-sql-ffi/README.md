@@ -118,6 +118,8 @@ typedef struct {
 - `polyglot_validate(sql, dialect)`
 - `polyglot_validate_with_options(sql, dialect, options_json)` (`ValidationOptions` JSON, e.g. `{"strictSyntax": true, "semantic": true}`)
 - `polyglot_optimize(sql, dialect)` (full optimizer pipeline)
+- `polyglot_build(request_json)` (evaluates a versioned, stateless builder plan
+  and returns either an expression AST or generated SQL)
 - `polyglot_lineage(column_name, sql, dialect)`
 - `polyglot_lineage_at(ordinal, sql, dialect)` (zero-based ordinal)
 - `polyglot_lineage_at_with_schema(ordinal, sql, schema_json, dialect)` (`ValidationSchema` JSON)
@@ -201,6 +203,8 @@ polyglot_result_t r = polyglot_format_with_options(sql, "generic", opts);
 - `polyglot_format`: JSON array of SQL strings
 - `polyglot_format_with_options`: JSON array of SQL strings
 - `polyglot_optimize`: JSON array of SQL strings
+- `polyglot_build`: JSON `Expression` when `output.kind` is `ast`, otherwise a
+  SQL string when `output.kind` is `sql`
 - `polyglot_lineage`: JSON `LineageNode`
 - `polyglot_lineage_at`: JSON `LineageNode`
 - `polyglot_lineage_at_with_schema`: JSON `LineageNode`

@@ -22,12 +22,8 @@ import {
   ast_set_order_by,
 } from '../../../wasm/polyglot_sql_wasm.js';
 import type { Expression } from '../../generated/Expression';
-import {
-  getExprData,
-  getExprType,
-  isExpressionValue,
-  makeExpr,
-} from '../helpers';
+import { getExprData, getExprType, makeExpr } from '../helpers';
+import { mapExpressionChildren } from './traversal';
 import type {
   NodePredicate,
   TransformCallback,
@@ -139,67 +135,6 @@ function applyOrderBy(node: Expression, orderBy: Expression[]): Expression {
 // ============================================================================
 
 /**
- * Recursively transform any value that may contain Expression children.
- *
- * Handles:
- * - Expression values → full transformNode
- * - Arrays of Expressions → map with transformNode
- * - Nested tuple arrays (CASE whens) → map elements
- * - Non-Expression struct objects (From, Where, etc.) → recurse into fields
- * - Primitives and null → pass through unchanged
- */
-function transformValue(
-  value: unknown,
-  config: TransformConfig,
-  parent: Expression,
-): unknown {
-  if (value === null || value === undefined) return value;
-
-  if (Array.isArray(value)) {
-    if (value.length > 0 && isExpressionValue(value[0])) {
-      return value.map((item, i) =>
-        transformNode(item as Expression, config, parent, null, i),
-      );
-    }
-    if (value.length > 0 && Array.isArray(value[0])) {
-      return value.map((tuple) => {
-        if (Array.isArray(tuple)) {
-          return tuple.map((item, i) => {
-            if (isExpressionValue(item)) {
-              return transformNode(item as Expression, config, parent, null, i);
-            }
-            return item;
-          });
-        }
-        return tuple;
-      });
-    }
-    return value;
-  }
-
-  if (isExpressionValue(value)) {
-    return transformNode(value as Expression, config, parent, null, null);
-  }
-
-  if (typeof value === 'object') {
-    // Non-Expression struct — recurse into its fields
-    const obj = value as Record<string, unknown>;
-    const newObj = { ...obj };
-    let changed = false;
-    for (const [k, v] of Object.entries(newObj)) {
-      const newV = transformValue(v, config, parent);
-      if (newV !== v) {
-        newObj[k] = newV;
-        changed = true;
-      }
-    }
-    return changed ? newObj : value;
-  }
-
-  return value;
-}
-
-/**
  * Recursively clone and transform an AST node
  */
 function transformNode(
@@ -246,16 +181,15 @@ function transformNode(
   if (innerData === null || innerData === undefined) {
     newNode = makeExpr(currentType, innerData);
   } else {
-    // Create a shallow copy of the inner data
-    const newInnerData = { ...innerData };
-
-    // Transform children within the inner data
-    for (const [propKey, value] of Object.entries(newInnerData)) {
-      const newValue = transformValue(value, config, currentNode);
-      if (newValue !== value) {
-        newInnerData[propKey] = newValue;
-      }
-    }
+    const newInnerData = mapExpressionChildren(currentNode, (child, location) =>
+      transformNode(
+        child,
+        config,
+        location.parent,
+        location.key,
+        location.index,
+      ),
+    );
 
     // Re-wrap in the envelope
     newNode = makeExpr(currentType, newInnerData);
@@ -611,46 +545,6 @@ export function clone(node: Expression): Expression {
 // ============================================================================
 
 /**
- * Recursively remove matching Expression nodes from any value.
- */
-function removeFromValue(
-  value: unknown,
-  predicate: NodePredicate,
-  parent: Expression,
-): unknown {
-  if (value === null || value === undefined) return value;
-
-  if (Array.isArray(value)) {
-    if (value.length > 0 && isExpressionValue(value[0])) {
-      return value
-        .filter((item) => !predicate(item as Expression, parent))
-        .map((item) => remove(item as Expression, predicate));
-    }
-    return value;
-  }
-
-  if (isExpressionValue(value)) {
-    return remove(value as Expression, predicate);
-  }
-
-  if (typeof value === 'object') {
-    const obj = value as Record<string, unknown>;
-    const newObj = { ...obj };
-    let changed = false;
-    for (const [k, v] of Object.entries(newObj)) {
-      const newV = removeFromValue(v, predicate, parent);
-      if (newV !== v) {
-        newObj[k] = newV;
-        changed = true;
-      }
-    }
-    return changed ? newObj : value;
-  }
-
-  return value;
-}
-
-/**
  * Remove all nodes matching a predicate
  * Note: This can only remove nodes that are in arrays (like expressions in SELECT)
  * Removing required nodes will leave them unchanged
@@ -658,16 +552,13 @@ function removeFromValue(
 export function remove(node: Expression, predicate: NodePredicate): Expression {
   const nodeType = getExprType(node);
   const innerData = getExprData(node);
+  if (innerData === null || innerData === undefined) return node;
 
-  // Clone inner data with filtering
-  const newInnerData = { ...innerData };
-
-  for (const [key, value] of Object.entries(newInnerData)) {
-    const newValue = removeFromValue(value, predicate, node);
-    if (newValue !== value) {
-      newInnerData[key] = newValue;
-    }
-  }
+  const newInnerData = mapExpressionChildren(
+    node,
+    (child) => remove(child, predicate),
+    (child, location) => predicate(child, location.parent),
+  );
 
   return makeExpr(nodeType, newInnerData);
 }

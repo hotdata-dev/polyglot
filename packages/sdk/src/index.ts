@@ -1130,6 +1130,8 @@ export {
   upper,
   WindowDefBuilder,
 } from './builders';
+// Additive SQLGlot-compatible immutable builder namespace.
+export * as compat from './compat';
 export type { DiffEdit, DiffOptions, DiffResult, EditType } from './diff';
 // Re-export diff module
 export { changesOnly, diff, hasChanges } from './diff';
@@ -1202,6 +1204,7 @@ export type {
 } from './validation/schema-validator';
 export { validateWithSchema } from './validation/schema-validator';
 
+import * as compat from './compat';
 import { changesOnly, diff, hasChanges } from './diff';
 // Import new modules for default export
 import {
@@ -1251,4 +1254,5 @@ export default {
   plan,
   Dialect,
   Polyglot,
+  compat,
 };

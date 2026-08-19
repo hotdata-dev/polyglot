@@ -10,21 +10,38 @@ from polyglot_sql._polyglot_sql import (
     ValidationError,
     ValidationErrorInfo,
     ValidationResult,
+    _builder_builtin,
+    alias_,
     analyze_query,
+    and_,
+    case,
+    col,
+    column,
+    condition,
+    convert,
+    delete,
     dialects,
     diff,
     format_sql,
+    from_,
+    func,
     generate,
     lineage,
     lineage_at,
     lineage_at_with_schema,
     lineage_with_schema,
+    insert,
+    intersect,
+    lit,
+    merge_into,
+    not_,
     output_columns,
     output_columns_with_schema,
     openlineage_column_lineage,
     openlineage_job_event,
     openlineage_run_event,
     optimize,
+    or_,
     parse,
     parse_data_type,
     parse_one,
@@ -34,11 +51,181 @@ from polyglot_sql._polyglot_sql import (
     set_offset,
     set_order_by,
     source_tables,
+    select,
+    table_,
     tokenize,
     transpile,
+    union,
+    update,
+    except_,
+    extract,
     validate,
     version as _version,
 )
+
+
+def _builtin(name, *args):
+    return _builder_builtin(name, *args)
+
+
+def count(expression):
+    return _builtin("count", expression)
+
+
+def count_star():
+    return _builtin("count_star")
+
+
+def count_distinct(expression):
+    return _builtin("count_distinct", expression)
+
+
+def sum_(expression):
+    return _builtin("sum", expression)
+
+
+def avg(expression):
+    return _builtin("avg", expression)
+
+
+def min_(expression):
+    return _builtin("min", expression)
+
+
+def max_(expression):
+    return _builtin("max", expression)
+
+
+def approx_distinct(expression):
+    return _builtin("approx_distinct", expression)
+
+
+def upper(expression):
+    return _builtin("upper", expression)
+
+
+def lower(expression):
+    return _builtin("lower", expression)
+
+
+def length(expression):
+    return _builtin("length", expression)
+
+
+def trim(expression):
+    return _builtin("trim", expression)
+
+
+def ltrim(expression):
+    return _builtin("ltrim", expression)
+
+
+def rtrim(expression):
+    return _builtin("rtrim", expression)
+
+
+def reverse(expression):
+    return _builtin("reverse", expression)
+
+
+def initcap(expression):
+    return _builtin("initcap", expression)
+
+
+def substring(expression, start, length=None):
+    if length is None:
+        return _builtin("substring", expression, start)
+    return _builtin("substring", expression, start, length)
+
+
+def replace_(expression, old, new):
+    return _builtin("replace", expression, old, new)
+
+
+def concat_ws(separator, *expressions):
+    return _builtin("concat_ws", separator, *expressions)
+
+
+def coalesce(*expressions):
+    return _builtin("coalesce", *expressions)
+
+
+def null_if(left, right):
+    return _builtin("null_if", left, right)
+
+
+def if_null(expression, fallback):
+    return _builtin("if_null", expression, fallback)
+
+
+def abs_(expression):
+    return _builtin("abs", expression)
+
+
+def round_(expression, decimals=None):
+    if decimals is None:
+        return _builtin("round", expression)
+    return _builtin("round", expression, decimals)
+
+
+def floor(expression):
+    return _builtin("floor", expression)
+
+
+def ceil(expression):
+    return _builtin("ceil", expression)
+
+
+def power(base, exponent):
+    return _builtin("power", base, exponent)
+
+
+def sqrt(expression):
+    return _builtin("sqrt", expression)
+
+
+def ln(expression):
+    return _builtin("ln", expression)
+
+
+def exp(expression):
+    return _builtin("exp", expression)
+
+
+def sign(expression):
+    return _builtin("sign", expression)
+
+
+def greatest(*expressions):
+    return _builtin("greatest", *expressions)
+
+
+def least(*expressions):
+    return _builtin("least", *expressions)
+
+
+def current_date():
+    return _builtin("current_date")
+
+
+def current_time():
+    return _builtin("current_time")
+
+
+def current_timestamp():
+    return _builtin("current_timestamp")
+
+
+def row_number():
+    return _builtin("row_number")
+
+
+def rank():
+    return _builtin("rank")
+
+
+def dense_rank():
+    return _builtin("dense_rank")
 
 # Expression subclasses — import all from native module
 from polyglot_sql._polyglot_sql import (
@@ -1007,6 +1194,27 @@ __all__ = [
     "ValidationResult",
     "ValidationErrorInfo",
     "__version__",
+    # SQLGlot-compatible builder subset
+    "select",
+    "from_",
+    "column",
+    "col",
+    "table_",
+    "convert",
+    "lit",
+    "condition",
+    "and_",
+    "or_",
+    "not_",
+    "alias_",
+    "func",
+    "case",
+    "update",
+    "delete",
+    "insert",
+    "union",
+    "intersect",
+    "except_",
     # Key expression subclasses
     "Select",
     "Column",

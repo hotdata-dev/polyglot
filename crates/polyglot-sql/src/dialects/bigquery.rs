@@ -476,6 +476,33 @@ impl DialectImpl for BigQueryDialect {
                 vec![f.this],
             )))),
 
+            // Preserve typed BigQuery constructors through parsing, then expose their
+            // canonical spellings to cross-dialect normalization.
+            Expression::Timestamp(f) => {
+                let mut args = Vec::new();
+                if let Some(this) = f.this {
+                    args.push(*this);
+                }
+                if let Some(zone) = f.zone {
+                    args.push(*zone);
+                }
+                Ok(Expression::Function(Box::new(Function::new(
+                    "TIMESTAMP".to_string(),
+                    args,
+                ))))
+            }
+
+            Expression::Round(f) => {
+                let mut args = vec![f.this];
+                if let Some(decimals) = f.decimals {
+                    args.push(decimals);
+                }
+                Ok(Expression::Function(Box::new(Function::new(
+                    "ROUND".to_string(),
+                    args,
+                ))))
+            }
+
             // ===== IfFunc -> IF in BigQuery =====
             Expression::IfFunc(f) => {
                 let mut args = vec![f.condition, f.true_value];

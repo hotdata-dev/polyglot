@@ -1,4 +1,7 @@
-use super::{NormalizationContext, RewriteOutcome};
+use super::{
+    scalar::{expression_numeric_kind, NumericKind},
+    NormalizationContext, RewriteOutcome,
+};
 use crate::dialects::DialectType;
 use crate::error::Result;
 use crate::expressions::*;
@@ -29,11 +32,13 @@ pub(super) enum Action {
     CollectListToArrayAgg,
     CollectSetConvert,
     PercentileConvert,
+    DuckDBQuantileConvert,
     CorrIsnanWrap,
     FirstToAnyValue,
     PercentileContConvert,
     ClickHouseUniqToApproxCountDistinct,
     ClickHouseAnyToAnyValue,
+    SnowflakeMedianToClickHouse,
 }
 
 pub(super) fn rewrite(
@@ -45,6 +50,65 @@ pub(super) fn rewrite(
     let e = expression;
     let expression = (|| -> Result<Expression> {
         match action {
+            Action::SnowflakeMedianToClickHouse => {
+                let mut agg = if let Expression::Median(agg) = e {
+                    *agg
+                } else {
+                    unreachable!("action only triggered for Median expressions")
+                };
+
+                let has_unsupported_modifiers = agg.distinct
+                    || !agg.order_by.is_empty()
+                    || agg.having_max.is_some()
+                    || agg.limit.is_some()
+                    || agg.ignore_nulls == Some(false);
+                if has_unsupported_modifiers {
+                    if context.strict {
+                        return Err(crate::error::Error::unsupported(
+                            "Snowflake MEDIAN modifiers cannot be preserved for ClickHouse",
+                            target.to_string(),
+                        ));
+                    }
+                    return Ok(Expression::Median(Box::new(agg)));
+                }
+
+                let mut input = agg.this;
+                input = match expression_numeric_kind(&input) {
+                    NumericKind::Float => input,
+                    NumericKind::Integer => cast_integer_median_input(input),
+                    NumericKind::Decimal => widen_zero_scale_median_input(input),
+                    NumericKind::Unknown if context.strict => {
+                        return Err(crate::error::Error::unsupported(
+                            "Snowflake MEDIAN with an unresolved input type cannot be preserved",
+                            target.to_string(),
+                        ));
+                    }
+                    NumericKind::Unknown => input,
+                };
+
+                // ClickHouse aggregate functions ignore NULL inputs, so a SQL FILTER
+                // can be preserved by feeding NULL to rows that do not match.
+                if let Some(condition) = agg.filter.take() {
+                    input = Expression::IfFunc(Box::new(IfFunc {
+                        condition,
+                        true_value: input,
+                        false_value: Some(Expression::Null(Null)),
+                        original_name: None,
+                        inferred_type: None,
+                    }));
+                }
+
+                Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
+                    name: "medianExactWeightedInterpolatedOrNull".to_string(),
+                    args: vec![input, Expression::number(1)],
+                    distinct: false,
+                    filter: None,
+                    order_by: Vec::new(),
+                    limit: None,
+                    ignore_nulls: None,
+                    inferred_type: agg.inferred_type,
+                })))
+            }
             Action::ArrayAggCollectList => {
                 let agg = if let Expression::ArrayAgg(a) = e {
                     *a
@@ -128,10 +192,16 @@ pub(super) fn rewrite(
                         } else {
                             "ARG_MIN_NULL"
                         };
-                        Ok(Expression::Function(Box::new(Function::new(
-                            func_name.to_string(),
-                            vec![agg.this, *having_expr],
-                        ))))
+                        Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
+                            name: func_name.to_string(),
+                            args: vec![agg.this, *having_expr],
+                            distinct: agg.distinct,
+                            filter: agg.filter,
+                            order_by: agg.order_by,
+                            limit: agg.limit,
+                            ignore_nulls: agg.ignore_nulls,
+                            inferred_type: agg.inferred_type,
+                        })))
                     } else {
                         Ok(Expression::AnyValue(agg))
                     }
@@ -184,11 +254,10 @@ pub(super) fn rewrite(
                             expressions: quantiles,
                         }));
 
-                        // Preserve DISTINCT modifier
-                        let mut new_func =
-                            Function::new("APPROX_QUANTILE".to_string(), vec![x_expr, array_expr]);
-                        new_func.distinct = agg.distinct;
-                        Ok(Expression::Function(Box::new(new_func)))
+                        let mut new_agg = *agg;
+                        new_agg.name = "APPROX_QUANTILE".to_string();
+                        new_agg.args = vec![x_expr, array_expr];
+                        Ok(Expression::AggregateFunction(Box::new(new_agg)))
                     } else {
                         Ok(Expression::AggregateFunction(agg))
                     }
@@ -1083,6 +1152,80 @@ pub(super) fn rewrite(
                 }
             }
 
+            Action::DuckDBQuantileConvert => {
+                let mut aggregate = if let Expression::AggregateFunction(aggregate) = e {
+                    *aggregate
+                } else {
+                    unreachable!("action only triggered for AggregateFunction expressions")
+                };
+                let name = aggregate.name.to_ascii_uppercase();
+
+                match name.as_str() {
+                    "QUANTILE" => {
+                        aggregate.name = match target {
+                            DialectType::Spark | DialectType::Databricks | DialectType::Hive => {
+                                "PERCENTILE"
+                            }
+                            DialectType::Presto | DialectType::Trino => "APPROX_PERCENTILE",
+                            DialectType::BigQuery => "PERCENTILE_CONT",
+                            _ => "QUANTILE",
+                        }
+                        .to_string();
+                        Ok(Expression::AggregateFunction(Box::new(aggregate)))
+                    }
+                    "APPROX_QUANTILE" => {
+                        if matches!(target, DialectType::Snowflake) {
+                            aggregate.name = "APPROX_PERCENTILE".to_string();
+                        }
+                        Ok(Expression::AggregateFunction(Box::new(aggregate)))
+                    }
+                    "QUANTILE_CONT" | "QUANTILE_DISC"
+                        if aggregate.args.len() == 2
+                            && matches!(
+                                target,
+                                DialectType::PostgreSQL
+                                    | DialectType::Redshift
+                                    | DialectType::Snowflake
+                            ) =>
+                    {
+                        // DISTINCT, an inner ORDER BY, LIMIT, and explicit null
+                        // handling cannot be represented by these targets' ordered-set
+                        // aggregate syntax. Keep the original aggregate intact rather
+                        // than silently dropping any of those modifiers.
+                        if aggregate.distinct
+                            || !aggregate.order_by.is_empty()
+                            || aggregate.limit.is_some()
+                            || aggregate.ignore_nulls.is_some()
+                        {
+                            return Ok(Expression::AggregateFunction(Box::new(aggregate)));
+                        }
+
+                        let mut args = aggregate.args;
+                        let column = args.remove(0);
+                        let percentile = args.remove(0);
+                        let percentile = PercentileFunc {
+                            this: column.clone(),
+                            percentile,
+                            order_by: Some(vec![Ordered {
+                                this: column,
+                                desc: false,
+                                nulls_first: None,
+                                explicit_asc: false,
+                                with_fill: None,
+                            }]),
+                            filter: aggregate.filter,
+                        };
+
+                        if name == "QUANTILE_CONT" {
+                            Ok(Expression::PercentileCont(Box::new(percentile)))
+                        } else {
+                            Ok(Expression::PercentileDisc(Box::new(percentile)))
+                        }
+                    }
+                    _ => Ok(Expression::AggregateFunction(Box::new(aggregate))),
+                }
+            }
+
             Action::CorrIsnanWrap => {
                 // CORR(a, b) -> CASE WHEN ISNAN(CORR(a, b)) THEN NULL ELSE CORR(a, b) END
                 // The CORR expression could be AggregateFunction, WindowFunction, or Filter-wrapped
@@ -1187,4 +1330,52 @@ pub(super) fn rewrite(
     })()?;
 
     Ok(RewriteOutcome::Rewritten(expression))
+}
+
+fn cast_integer_median_input(expression: Expression) -> Expression {
+    Expression::Cast(Box::new(Cast {
+        this: expression,
+        // Snowflake fixed-point numbers have at most 38 digits. One fractional
+        // digit is required so an even-sized integer median can retain `.5`.
+        to: DataType::Decimal {
+            precision: Some(39),
+            scale: Some(1),
+        },
+        trailing_comments: Vec::new(),
+        double_colon_syntax: false,
+        format: None,
+        default: None,
+        inferred_type: None,
+    }))
+}
+
+fn widen_zero_scale_median_input(expression: Expression) -> Expression {
+    let decimal_shape = match &expression {
+        Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast) => {
+            match &cast.to {
+                DataType::Decimal { precision, scale } => Some((*precision, *scale)),
+                _ => None,
+            }
+        }
+        other => match other.inferred_type() {
+            Some(DataType::Decimal { precision, scale }) => Some((*precision, *scale)),
+            _ => None,
+        },
+    };
+
+    match decimal_shape {
+        Some((precision, scale)) if scale.unwrap_or(0) == 0 => Expression::Cast(Box::new(Cast {
+            this: expression,
+            to: DataType::Decimal {
+                precision: Some(precision.unwrap_or(38).saturating_add(1).min(76)),
+                scale: Some(1),
+            },
+            trailing_comments: Vec::new(),
+            double_colon_syntax: false,
+            format: None,
+            default: None,
+            inferred_type: None,
+        })),
+        _ => expression,
+    }
 }

@@ -74,3 +74,29 @@ pub use qualify_tables::{qualify_tables, QualifyTablesOptions};
 pub use simplify::{always_false, always_true, is_false, is_null, is_zero, simplify, Simplifier};
 /// Subquery merging, unnesting, and correlation analysis
 pub use subquery::{is_correlated, is_mergeable, merge_subqueries, unnest_subqueries};
+
+/// Qualify a schema-aware expression without changing physical table aliases.
+///
+/// Anonymous derived tables need stable aliases before column qualification so
+/// their projected columns can be registered in the scoped schema. Physical
+/// table names and set-operation structure are otherwise left unchanged.
+pub(crate) fn qualify_schema_aware_expression(
+    expression: crate::expressions::Expression,
+    schema: &dyn crate::schema::Schema,
+    dialect: Option<crate::dialects::DialectType>,
+) -> Result<crate::expressions::Expression, QualifyColumnsError> {
+    let effective_dialect = dialect.or_else(|| schema.dialect());
+    let mut table_options = QualifyTablesOptions::new()
+        .with_alias_unaliased_tables(false)
+        .with_alias_unaliased_subqueries(true)
+        .with_normalize_set_operation_subqueries(false);
+    let mut column_options = QualifyColumnsOptions::new().with_allow_partial(true);
+
+    if let Some(dialect) = effective_dialect {
+        table_options = table_options.with_dialect(dialect);
+        column_options = column_options.with_dialect(dialect);
+    }
+
+    let expression = qualify_tables(expression, &table_options);
+    qualify_columns(expression, schema, &column_options)
+}

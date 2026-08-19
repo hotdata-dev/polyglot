@@ -2086,7 +2086,33 @@ impl SnowflakeDialect {
                 ))))
             }
 
-            // TO_CHAR is native to Snowflake
+            // Canonicalize temporal TO_CHAR so target generators can translate the
+            // format model. Numeric/binary TO_CHAR overloads stay source-specific.
+            "TO_CHAR"
+                if f.args.len() == 2
+                    && Self::is_temporal_expr(&f.args[0])
+                    && matches!(&f.args[1], Expression::Literal(lit) if matches!(lit.as_ref(), Literal::String(_))) =>
+            {
+                let mut args = f.args;
+                let this = args.remove(0);
+                let Literal::String(format) = (match args.remove(0) {
+                    Expression::Literal(lit) => *lit,
+                    _ => unreachable!(),
+                }) else {
+                    unreachable!()
+                };
+
+                Ok(Expression::TimeToStr(Box::new(
+                    crate::expressions::TimeToStr {
+                        this: Box::new(this),
+                        format: Self::normalize_snowflake_format(&format),
+                        culture: None,
+                        zone: None,
+                    },
+                )))
+            }
+
+            // Other TO_CHAR overloads are native to Snowflake.
             "TO_CHAR" => Ok(Expression::Function(Box::new(f))),
 
             // ROUND with named args: ROUND(EXPR => x, SCALE => y, ROUNDING_MODE => z)
@@ -3372,7 +3398,42 @@ impl SnowflakeDialect {
                 ))))
             }
 
-            // TRY_TO_DOUBLE -> keep as TRY_TO_DOUBLE in Snowflake (native function)
+            // Canonicalize TRY_TO_DOUBLE so targets with nullable conversion
+            // functions can preserve Snowflake's NULL-on-failure behavior.
+            "TRY_TO_DOUBLE" if f.args.len() == 1 => {
+                let this = f.args.into_iter().next().unwrap();
+                Ok(Expression::ToDouble(Box::new(
+                    crate::expressions::ToDouble {
+                        this: Box::new(this),
+                        format: None,
+                        safe: Some(Box::new(Expression::Boolean(
+                            crate::expressions::BooleanLiteral { value: true },
+                        ))),
+                    },
+                )))
+            }
+            "TRY_TO_DOUBLE"
+                if f.args.len() == 2
+                    && matches!(&f.args[1], Expression::Literal(lit) if matches!(lit.as_ref(), Literal::String(_))) =>
+            {
+                let mut args = f.args;
+                let this = args.remove(0);
+                let Literal::String(format) = (match args.remove(0) {
+                    Expression::Literal(lit) => *lit,
+                    _ => unreachable!(),
+                }) else {
+                    unreachable!()
+                };
+                Ok(Expression::ToDouble(Box::new(
+                    crate::expressions::ToDouble {
+                        this: Box::new(this),
+                        format: Some(format),
+                        safe: Some(Box::new(Expression::Boolean(
+                            crate::expressions::BooleanLiteral { value: true },
+                        ))),
+                    },
+                )))
+            }
             "TRY_TO_DOUBLE" => Ok(Expression::Function(Box::new(f))),
 
             // REGEXP_REPLACE with 2 args -> add empty string replacement
@@ -3560,6 +3621,39 @@ impl SnowflakeDialect {
             }
         }
         result
+    }
+
+    fn is_temporal_expr(expr: &Expression) -> bool {
+        match expr {
+            Expression::CurrentDate(_)
+            | Expression::CurrentTime(_)
+            | Expression::CurrentTimestamp(_)
+            | Expression::CurrentTimestampLTZ(_)
+            | Expression::CurrentDatetime(_)
+            | Expression::Localtime(_)
+            | Expression::Localtimestamp(_)
+            | Expression::Systimestamp(_)
+            | Expression::UtcTime(_)
+            | Expression::UtcTimestamp(_)
+            | Expression::Date(_)
+            | Expression::Time(_)
+            | Expression::ToDate(_)
+            | Expression::ToTimestamp(_)
+            | Expression::DateStrToDate(_)
+            | Expression::TimeStrToTime(_)
+            | Expression::StrToTime(_) => true,
+            Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast) => {
+                matches!(
+                    cast.to,
+                    DataType::Date | DataType::Time { .. } | DataType::Timestamp { .. }
+                )
+            }
+            Expression::Paren(paren) => Self::is_temporal_expr(&paren.this),
+            other => matches!(
+                other.inferred_type(),
+                Some(DataType::Date | DataType::Time { .. } | DataType::Timestamp { .. })
+            ),
+        }
     }
 
     /// Normalize format string argument if it's a string literal

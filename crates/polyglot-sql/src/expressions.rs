@@ -1318,6 +1318,7 @@ impl Expression {
             }
 
             Expression::Column(c) => c.inferred_type.as_ref(),
+            Expression::Dot(dot) => dot.inferred_type.as_ref(),
             Expression::Function(f) => f.inferred_type.as_ref(),
             Expression::AggregateFunction(f) => f.inferred_type.as_ref(),
             Expression::WindowFunction(f) => f.inferred_type.as_ref(),
@@ -1546,6 +1547,7 @@ impl Expression {
             }
 
             Expression::Column(c) => c.inferred_type = Some(dt),
+            Expression::Dot(dot) => dot.inferred_type = Some(dt),
             Expression::Function(f) => f.inferred_type = Some(dt),
             Expression::AggregateFunction(f) => f.inferred_type = Some(dt),
             Expression::WindowFunction(f) => f.inferred_type = Some(dt),
@@ -3791,7 +3793,7 @@ impl Default for Select {
 ///
 /// When `all` is true, duplicate rows are preserved (UNION ALL).
 /// ORDER BY, LIMIT, and OFFSET can be applied to the combined result.
-/// Supports DuckDB's BY NAME modifier and BigQuery's CORRESPONDING modifier.
+/// Supports DuckDB/Snowflake BY NAME and BigQuery BY NAME/CORRESPONDING modifiers.
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct Union {
@@ -3821,7 +3823,7 @@ pub struct Union {
     /// CLUSTER BY clause (Hive/Spark)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_by: Option<ClusterBy>,
-    /// DuckDB BY NAME modifier
+    /// DuckDB, Snowflake, and BigQuery BY NAME modifier
     #[serde(default)]
     pub by_name: bool,
     /// BigQuery: Set operation side (LEFT, RIGHT, FULL)
@@ -3890,7 +3892,7 @@ pub struct Intersect {
     /// CLUSTER BY clause (Hive/Spark)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_by: Option<ClusterBy>,
-    /// DuckDB BY NAME modifier
+    /// DuckDB, Snowflake, and BigQuery BY NAME modifier
     #[serde(default)]
     pub by_name: bool,
     /// BigQuery: Set operation side (LEFT, RIGHT, FULL)
@@ -3957,7 +3959,7 @@ pub struct Except {
     /// CLUSTER BY clause (Hive/Spark)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_by: Option<ClusterBy>,
-    /// DuckDB BY NAME modifier
+    /// DuckDB, Snowflake, and BigQuery BY NAME modifier
     #[serde(default)]
     pub by_name: bool,
     /// BigQuery: Set operation side (LEFT, RIGHT, FULL)
@@ -7438,6 +7440,8 @@ pub struct Subscript {
 pub struct DotAccess {
     pub this: Expression,
     pub field: Identifier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inferred_type: Option<DataType>,
 }
 
 /// Method call (expr.method(args))
@@ -15342,6 +15346,21 @@ mod tests {
         // Run with: cargo test -p polyglot-sql --features bindings export_typescript_types
         Expression::export_all(&ts_rs::Config::default())
             .expect("Failed to export Expression types");
+
+        let mut variant_names = String::from(
+            "// This file was generated from the Rust Expression enum. Do not edit it manually.\n\n",
+        );
+        variant_names.push_str("export const EXPRESSION_VARIANT_NAMES = [\n");
+        for name in Expression::SERIALIZED_VARIANT_NAMES {
+            use std::fmt::Write;
+            writeln!(variant_names, "  {name:?},").expect("writing to a String cannot fail");
+        }
+        variant_names.push_str("] as const;\n");
+
+        let output_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("bindings/ExpressionVariantNames.ts");
+        std::fs::write(output_path, variant_names)
+            .expect("Failed to export serialized Expression variant names");
     }
 
     #[test]

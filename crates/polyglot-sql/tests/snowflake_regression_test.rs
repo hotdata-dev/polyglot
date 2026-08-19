@@ -7,7 +7,7 @@
 use polyglot_sql::dialects::{Dialect, DialectType};
 use polyglot_sql::expressions::{Expression, Literal};
 use polyglot_sql::tokens::TokenType;
-use polyglot_sql::{generate, parse_one, transpile};
+use polyglot_sql::{generate, parse_one, transpile, ExpressionWalk};
 
 fn parse_and_generate(sql: &str) -> String {
     let result = transpile(sql, DialectType::Snowflake, DialectType::Snowflake).unwrap();
@@ -27,6 +27,88 @@ fn snowflake_string_value(sql: &str) -> String {
         .find(|token| token.token_type == TokenType::String)
         .expect("SQL should contain a string token")
         .text
+}
+
+// =====================================================================
+// PRIOR identifier and CONNECT BY semantics
+// Related: https://github.com/tobilg/polyglot/issues/406
+// =====================================================================
+
+#[test]
+fn test_snowflake_prior_is_an_identifier_outside_connect_by() {
+    for sql in [
+        "SELECT prior.* FROM a_relation",
+        "SELECT prior.a_column FROM a_relation",
+        "SELECT prior FROM a_relation",
+        "SELECT prior.* FROM a_relation AS prior",
+    ] {
+        let expression =
+            parse_one(sql, DialectType::Snowflake).expect("PRIOR identifier should parse");
+
+        assert!(
+            !expression
+                .dfs()
+                .any(|node| matches!(node, Expression::Prior(_))),
+            "PRIOR should remain an identifier outside CONNECT BY for {sql}"
+        );
+        assert_eq!(
+            generate(&expression, DialectType::Snowflake)
+                .expect("PRIOR identifier should generate"),
+            sql
+        );
+    }
+}
+
+#[test]
+fn test_snowflake_prior_remains_an_operator_inside_connect_by() {
+    let sql = "SELECT * FROM employees CONNECT BY PRIOR employee_id = manager_id";
+    let expression = parse_one(sql, DialectType::Snowflake).expect("CONNECT BY PRIOR should parse");
+
+    assert!(
+        expression
+            .dfs()
+            .any(|node| matches!(node, Expression::Prior(_))),
+        "PRIOR should be represented as an operator inside CONNECT BY"
+    );
+    assert_eq!(
+        generate(&expression, DialectType::Snowflake).expect("CONNECT BY PRIOR should generate"),
+        sql
+    );
+}
+
+// =====================================================================
+// Trailing SELECT commas at nested query boundaries
+// Related: https://github.com/tobilg/polyglot/issues/407
+// =====================================================================
+
+#[test]
+fn test_snowflake_trailing_select_comma_before_rparen() {
+    for (sql, expected) in [
+        (
+            "WITH values_cte AS (SELECT 1 AS value_column, ) SELECT value_column FROM values_cte",
+            "WITH values_cte AS (SELECT 1 AS value_column) SELECT value_column FROM values_cte",
+        ),
+        (
+            "SELECT * FROM (SELECT 1 AS value_column, ) AS values_table",
+            "SELECT * FROM (SELECT 1 AS value_column) AS values_table",
+        ),
+    ] {
+        assert_eq!(parse_then_generate(sql), expected, "failed for {sql}");
+    }
+}
+
+#[test]
+fn test_snowflake_trailing_select_comma_scope_remains_narrow() {
+    for sql in [
+        "SELECT 1 AS value_column,, FROM a_relation",
+        "SELECT COALESCE(1, )",
+        "SELECT ARRAY_CONSTRUCT(1, )",
+    ] {
+        assert!(
+            parse_one(sql, DialectType::Snowflake).is_err(),
+            "unsupported comma placement should fail for {sql}"
+        );
+    }
 }
 
 // =====================================================================
@@ -156,6 +238,40 @@ fn test_snowflake_datediff_transpile_identity_preserves_start_end_order() {
         parse_and_generate("SELECT DATEDIFF('day', '2024-01-01', '2024-01-10')"),
         "SELECT DATEDIFF(DAY, '2024-01-01', '2024-01-10')"
     );
+}
+
+// =====================================================================
+// Numeric conversion overloads
+// Related: https://github.com/tobilg/polyglot/issues/399
+// =====================================================================
+
+#[test]
+fn test_snowflake_try_to_number_numeric_args_are_precision_and_scale() {
+    let expression = parse_one(
+        "SELECT TRY_TO_NUMBER('12.34', 9, 2)",
+        DialectType::Snowflake,
+    )
+    .expect("Snowflake TRY_TO_NUMBER should parse");
+    let to_number = expression
+        .dfs()
+        .find_map(|node| match node {
+            Expression::ToNumber(to_number) => Some(to_number),
+            _ => None,
+        })
+        .expect("TRY_TO_NUMBER should use the typed numeric conversion AST");
+
+    assert!(to_number.format.is_none());
+    assert!(matches!(
+        to_number.precision.as_deref(),
+        Some(Expression::Literal(literal))
+            if matches!(literal.as_ref(), Literal::Number(value) if value == "9")
+    ));
+    assert!(matches!(
+        to_number.scale.as_deref(),
+        Some(Expression::Literal(literal))
+            if matches!(literal.as_ref(), Literal::Number(value) if value == "2")
+    ));
+    assert!(to_number.safe.is_some());
 }
 
 // =====================================================================
@@ -644,5 +760,45 @@ fn to_number_decimal_only_for_snowflake_to_datafusion() {
     assert!(
         oracle_df.to_uppercase().contains("DOUBLE"),
         "oracle->datafusion should keep DOUBLE, got: {oracle_df}"
+    );
+}
+
+/// The safe variant TRY_TO_NUMBER(x) must also lower for the DataFusion target —
+/// DataFusion has no TRY_TO_NUMBER function, so passing it through is a runtime
+/// error. It lowers to TRY_CAST(x AS DECIMAL(38,0)) for a Snowflake source
+/// (matching NUMBER(38,0)), TRY_CAST(x AS DOUBLE) otherwise. Native TO_NUMBER
+/// targets (Snowflake) keep it. Regression guard: upstream's ToNumber dispatch
+/// only normalized the non-safe form, silently leaving TRY_TO_NUMBER intact.
+#[test]
+fn try_to_number_lowers_to_try_cast_for_datafusion() {
+    let sf_df = transpile(
+        "SELECT TRY_TO_NUMBER('x') AS v",
+        DialectType::Snowflake,
+        DialectType::DataFusion,
+    )
+    .unwrap()
+    .join(";\n");
+    let up = sf_df.to_uppercase();
+    assert!(
+        up.contains("TRY_CAST")
+            && (up.contains("DECIMAL(38, 0)") || up.contains("DECIMAL(38,0)")),
+        "snowflake->datafusion TRY_TO_NUMBER should be TRY_CAST(... AS DECIMAL(38,0)), got: {sf_df}"
+    );
+    assert!(
+        !up.contains("TRY_TO_NUMBER"),
+        "TRY_TO_NUMBER must not survive into DataFusion output, got: {sf_df}"
+    );
+
+    // Snowflake target keeps the native safe function.
+    let sf_sf = transpile(
+        "SELECT TRY_TO_NUMBER('x') AS v",
+        DialectType::Snowflake,
+        DialectType::Snowflake,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        sf_sf.to_uppercase().contains("TRY_TO_NUMBER"),
+        "snowflake->snowflake should keep TRY_TO_NUMBER, got: {sf_sf}"
     );
 }

@@ -128,6 +128,50 @@ impl ConnectorOperator {
             Self::Or => "OR",
         }
     }
+
+    fn infix_operator(self) -> InfixOperator {
+        match self {
+            Self::And => InfixOperator::And,
+            Self::Or => InfixOperator::Or,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InfixOperator {
+    Or,
+    Xor,
+    And,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+impl InfixOperator {
+    fn precedence(self) -> u8 {
+        match self {
+            Self::Or => 1,
+            Self::Xor => 2,
+            Self::And => 3,
+            Self::Add | Self::Sub => 4,
+            Self::Mul | Self::Div | Self::Mod => 5,
+        }
+    }
+
+    fn is_arithmetic(self) -> bool {
+        matches!(
+            self,
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperandSide {
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3165,13 +3209,20 @@ impl Generator {
 
             Expression::And(op) => self.generate_connector_op(op, ConnectorOperator::And),
             Expression::Or(op) => self.generate_connector_op(op, ConnectorOperator::Or),
-            Expression::Add(op) => self.generate_binary_op(op, "+"),
-            Expression::Sub(op) => self.generate_binary_op(op, "-"),
-            Expression::Mul(op) => self.generate_binary_op(op, "*"),
-            Expression::Div(op) => self.generate_binary_op(op, "/"),
+            Expression::Add(op) => self.generate_precedence_binary_op(op, "+", InfixOperator::Add),
+            Expression::Sub(op) => self.generate_precedence_binary_op(op, "-", InfixOperator::Sub),
+            Expression::Mul(op) => self.generate_precedence_binary_op(op, "*", InfixOperator::Mul),
+            Expression::Div(op) => self.generate_precedence_binary_op(op, "/", InfixOperator::Div),
             Expression::IntDiv(f) => {
                 use crate::dialects::DialectType;
-                if matches!(self.config.dialect, Some(DialectType::DuckDB)) {
+                if matches!(self.config.dialect, Some(DialectType::ClickHouse)) {
+                    self.write("intDiv(");
+                    self.generate_expression(&f.this)?;
+                    self.write(", ");
+                    self.generate_expression(&f.expression)?;
+                    self.write(")");
+                    Ok(())
+                } else if matches!(self.config.dialect, Some(DialectType::DuckDB)) {
                     // DuckDB uses // operator for integer division
                     self.generate_expression(&f.this)?;
                     self.write(" // ");
@@ -3201,9 +3252,9 @@ impl Generator {
             }
             Expression::Mod(op) => {
                 if matches!(self.config.dialect, Some(DialectType::Teradata)) {
-                    self.generate_binary_op(op, "MOD")
+                    self.generate_precedence_binary_op(op, "MOD", InfixOperator::Mod)
                 } else {
-                    self.generate_binary_op(op, "%")
+                    self.generate_precedence_binary_op(op, "%", InfixOperator::Mod)
                 }
             }
             Expression::Eq(op) => self.generate_binary_op(op, "="),
@@ -7176,7 +7227,7 @@ impl Generator {
         }
 
         // BigQuery: CORRESPONDING/STRICT CORRESPONDING -> BY NAME, BY (cols) -> ON (cols)
-        // DuckDB: BY NAME
+        // DuckDB/Snowflake: BY NAME
         if union.corresponding || union.by_name {
             self.write_space();
             self.write_keyword("BY NAME");
@@ -7350,7 +7401,7 @@ impl Generator {
         }
 
         // BigQuery: CORRESPONDING/STRICT CORRESPONDING -> BY NAME, BY (cols) -> ON (cols)
-        // DuckDB: BY NAME
+        // DuckDB/Snowflake: BY NAME
         if intersect.corresponding || intersect.by_name {
             self.write_space();
             self.write_keyword("BY NAME");
@@ -7558,7 +7609,7 @@ impl Generator {
         }
 
         // BigQuery: CORRESPONDING/STRICT CORRESPONDING -> BY NAME, BY (cols) -> ON (cols)
-        // DuckDB: BY NAME
+        // DuckDB/Snowflake: BY NAME
         if except.corresponding || except.by_name {
             self.write_space();
             self.write_keyword("BY NAME");
@@ -23726,6 +23777,30 @@ impl Generator {
     }
 
     fn generate_binary_op(&mut self, op: &BinaryOp, operator: &str) -> Result<()> {
+        self.generate_binary_op_with_precedence(op, operator, None)
+    }
+
+    fn generate_precedence_binary_op(
+        &mut self,
+        op: &BinaryOp,
+        operator: &str,
+        infix_operator: InfixOperator,
+    ) -> Result<()> {
+        self.generate_binary_op_with_precedence(op, operator, Some(infix_operator))
+    }
+
+    fn generate_binary_op_with_precedence(
+        &mut self,
+        op: &BinaryOp,
+        operator: &str,
+        infix_operator: Option<InfixOperator>,
+    ) -> Result<()> {
+        let wrap_left = infix_operator.is_some_and(|parent| {
+            Self::infix_operand_needs_parentheses(parent, &op.left, OperandSide::Left)
+        });
+        if wrap_left {
+            self.write("(");
+        }
         // Generate left expression, but skip trailing comments if they're already in left_comments
         // to avoid duplication (comments are captured as both expr.trailing_comments
         // and BinaryOp.left_comments during parsing)
@@ -23754,20 +23829,23 @@ impl Generator {
             | Expression::Sub(inner_op)
             | Expression::Mul(inner_op)
             | Expression::Div(inner_op)
+            | Expression::Mod(inner_op)
             | Expression::Concat(inner_op) => {
                 // Generate binary op without its trailing comments
-                self.generate_binary_op_no_trailing(inner_op, match &op.left {
-                    Expression::Add(_) => "+",
-                    Expression::Sub(_) => "-",
-                    Expression::Mul(_) => "*",
-                    Expression::Div(_) => "/",
-                    Expression::Concat(_) => "||",
-                    _ => unreachable!("op.left variant already matched by outer arm as Add/Sub/Mul/Div/Concat"),
-                })?;
+                let (nested_operator, nested_infix_operator) =
+                    self.nested_binary_operator(&op.left);
+                self.generate_binary_op_no_trailing(
+                    inner_op,
+                    nested_operator,
+                    nested_infix_operator,
+                )?;
             }
             _ => {
                 self.generate_expression(&op.left)?;
             }
+        }
+        if wrap_left {
+            self.write(")");
         }
         // Output comments after left operand
         for comment in &op.left_comments {
@@ -23795,7 +23873,16 @@ impl Generator {
             self.write_formatted_comment(comment);
         }
         self.write_space();
+        let wrap_right = infix_operator.is_some_and(|parent| {
+            Self::infix_operand_needs_parentheses(parent, &op.right, OperandSide::Right)
+        });
+        if wrap_right {
+            self.write("(");
+        }
         self.generate_expression(&op.right)?;
+        if wrap_right {
+            self.write(")");
+        }
         // Output trailing comments after right operand
         for comment in &op.trailing_comments {
             self.write_space();
@@ -23807,28 +23894,31 @@ impl Generator {
     fn generate_connector_op(&mut self, op: &BinaryOp, connector: ConnectorOperator) -> Result<()> {
         let keyword = connector.keyword();
         let Some(terms) = self.flatten_connector_terms(op, connector) else {
-            return self.generate_binary_op(op, keyword);
+            return self.generate_precedence_binary_op(op, keyword, connector.infix_operator());
         };
 
-        let wrap_clickhouse_or_term = |generator: &mut Self, term: &Expression| -> Result<()> {
-            let should_wrap = matches!(connector, ConnectorOperator::Or)
-                && matches!(generator.config.dialect, Some(DialectType::ClickHouse))
-                && matches!(
-                    generator.config.source_dialect,
-                    Some(DialectType::ClickHouse)
-                )
-                && matches!(term, Expression::And(_));
-            if should_wrap {
-                generator.write("(");
-                generator.generate_expression(term)?;
-                generator.write(")");
-            } else {
-                generator.generate_expression(term)?;
-            }
-            Ok(())
-        };
+        let generate_term =
+            |generator: &mut Self, term: &Expression, side: OperandSide| -> Result<()> {
+                let should_wrap_for_precedence =
+                    Self::infix_operand_needs_parentheses(connector.infix_operator(), term, side);
+                let should_wrap_for_clickhouse = matches!(connector, ConnectorOperator::Or)
+                    && matches!(generator.config.dialect, Some(DialectType::ClickHouse))
+                    && matches!(
+                        generator.config.source_dialect,
+                        Some(DialectType::ClickHouse)
+                    )
+                    && matches!(term, Expression::And(_));
+                if should_wrap_for_precedence || should_wrap_for_clickhouse {
+                    generator.write("(");
+                    generator.generate_expression(term)?;
+                    generator.write(")");
+                } else {
+                    generator.generate_expression(term)?;
+                }
+                Ok(())
+            };
 
-        wrap_clickhouse_or_term(self, terms[0])?;
+        generate_term(self, terms[0], OperandSide::Left)?;
         for term in terms.iter().skip(1) {
             if self.config.pretty && matches!(self.config.dialect, Some(DialectType::Snowflake)) {
                 self.write_newline();
@@ -23839,7 +23929,7 @@ impl Generator {
                 self.write_keyword(keyword);
             }
             self.write_space();
-            wrap_clickhouse_or_term(self, term)?;
+            generate_term(self, term, OperandSide::Right)?;
         }
 
         Ok(())
@@ -23887,6 +23977,88 @@ impl Generator {
         } else {
             None
         }
+    }
+
+    fn infix_operator(expression: &Expression) -> Option<InfixOperator> {
+        match expression {
+            Expression::Or(_) => Some(InfixOperator::Or),
+            Expression::Xor(_) => Some(InfixOperator::Xor),
+            Expression::And(_) => Some(InfixOperator::And),
+            Expression::Add(_) => Some(InfixOperator::Add),
+            Expression::Sub(_) => Some(InfixOperator::Sub),
+            Expression::Mul(_) => Some(InfixOperator::Mul),
+            Expression::Div(_) => Some(InfixOperator::Div),
+            Expression::Mod(_) => Some(InfixOperator::Mod),
+            _ => None,
+        }
+    }
+
+    fn nested_binary_operator(
+        &self,
+        expression: &Expression,
+    ) -> (&'static str, Option<InfixOperator>) {
+        match expression {
+            Expression::Add(_) => ("+", Some(InfixOperator::Add)),
+            Expression::Sub(_) => ("-", Some(InfixOperator::Sub)),
+            Expression::Mul(_) => ("*", Some(InfixOperator::Mul)),
+            Expression::Div(_) => ("/", Some(InfixOperator::Div)),
+            Expression::Mod(_) => (
+                if matches!(self.config.dialect, Some(DialectType::Teradata)) {
+                    "MOD"
+                } else {
+                    "%"
+                },
+                Some(InfixOperator::Mod),
+            ),
+            Expression::Concat(_) => ("||", None),
+            _ => unreachable!("nested binary expression variant was checked by the caller"),
+        }
+    }
+
+    fn infix_operand_needs_parentheses(
+        parent: InfixOperator,
+        child: &Expression,
+        side: OperandSide,
+    ) -> bool {
+        if matches!(child, Expression::Paren(_)) {
+            return false;
+        }
+
+        let Some(child_operator) = Self::infix_operator(child) else {
+            return false;
+        };
+
+        match child_operator.precedence().cmp(&parent.precedence()) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => {
+                matches!(side, OperandSide::Right)
+                    && parent.is_arithmetic()
+                    && child_operator.is_arithmetic()
+                    && !matches!(
+                        (parent, child_operator),
+                        (InfixOperator::Add, InfixOperator::Add)
+                            | (InfixOperator::Mul, InfixOperator::Mul)
+                    )
+            }
+        }
+    }
+
+    fn generate_infix_operand(
+        &mut self,
+        parent: InfixOperator,
+        expression: &Expression,
+        side: OperandSide,
+    ) -> Result<()> {
+        let needs_parentheses = Self::infix_operand_needs_parentheses(parent, expression, side);
+        if needs_parentheses {
+            self.write("(");
+        }
+        self.generate_expression(expression)?;
+        if needs_parentheses {
+            self.write(")");
+        }
+        Ok(())
     }
 
     fn missing_closing_parens_outside_quotes(sql: &str) -> usize {
@@ -24052,7 +24224,18 @@ impl Generator {
     }
 
     /// Generate binary op without trailing comments (used when nested inside another binary op)
-    fn generate_binary_op_no_trailing(&mut self, op: &BinaryOp, operator: &str) -> Result<()> {
+    fn generate_binary_op_no_trailing(
+        &mut self,
+        op: &BinaryOp,
+        operator: &str,
+        infix_operator: Option<InfixOperator>,
+    ) -> Result<()> {
+        let wrap_left = infix_operator.is_some_and(|parent| {
+            Self::infix_operand_needs_parentheses(parent, &op.left, OperandSide::Left)
+        });
+        if wrap_left {
+            self.write("(");
+        }
         // Generate left expression, but skip trailing comments
         match &op.left {
             Expression::Column(col) => {
@@ -24070,19 +24253,22 @@ impl Generator {
             | Expression::Sub(inner_op)
             | Expression::Mul(inner_op)
             | Expression::Div(inner_op)
+            | Expression::Mod(inner_op)
             | Expression::Concat(inner_op) => {
-                self.generate_binary_op_no_trailing(inner_op, match &op.left {
-                    Expression::Add(_) => "+",
-                    Expression::Sub(_) => "-",
-                    Expression::Mul(_) => "*",
-                    Expression::Div(_) => "/",
-                    Expression::Concat(_) => "||",
-                    _ => unreachable!("op.left variant already matched by outer arm as Add/Sub/Mul/Div/Concat"),
-                })?;
+                let (nested_operator, nested_infix_operator) =
+                    self.nested_binary_operator(&op.left);
+                self.generate_binary_op_no_trailing(
+                    inner_op,
+                    nested_operator,
+                    nested_infix_operator,
+                )?;
             }
             _ => {
                 self.generate_expression(&op.left)?;
             }
+        }
+        if wrap_left {
+            self.write(")");
         }
         // Output left_comments
         for comment in &op.left_comments {
@@ -24101,6 +24287,12 @@ impl Generator {
             self.write_formatted_comment(comment);
         }
         self.write_space();
+        let wrap_right = infix_operator.is_some_and(|parent| {
+            Self::infix_operand_needs_parentheses(parent, &op.right, OperandSide::Right)
+        });
+        if wrap_right {
+            self.write("(");
+        }
         // Generate right expression, but skip trailing comments if it's a Column
         // (the parent's left_comments will output them)
         match &op.right {
@@ -24118,6 +24310,9 @@ impl Generator {
             _ => {
                 self.generate_expression(&op.right)?;
             }
+        }
+        if wrap_right {
+            self.write(")");
         }
         // Skip trailing_comments - parent will handle them via its left_comments
         Ok(())
@@ -37828,6 +38023,48 @@ impl Generator {
         }
     }
 
+    fn postgres_tsql_literal_string(expr: &Expression) -> Option<Cow<'_, str>> {
+        match expr {
+            Expression::Literal(literal) => match literal.as_ref() {
+                Literal::String(value) => Some(Cow::Borrowed(value)),
+                _ => None,
+            },
+            Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast)
+                if Self::is_string_data_type(&cast.to) =>
+            {
+                let value = Self::postgres_tsql_literal_string(&cast.this)?;
+                match &cast.to {
+                    DataType::Char { length } => Some(Self::postgres_string_cast_literal(
+                        value,
+                        length.unwrap_or(1),
+                    )),
+                    DataType::VarChar {
+                        length: Some(length),
+                        ..
+                    }
+                    | DataType::String {
+                        length: Some(length),
+                    } => Some(Self::postgres_string_cast_literal(value, *length)),
+                    DataType::TextWithLength { length } => {
+                        Some(Self::postgres_string_cast_literal(value, *length))
+                    }
+                    _ => Some(value),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn postgres_string_cast_literal(value: Cow<'_, str>, length: u32) -> Cow<'_, str> {
+        let length = length as usize;
+        let value_length = value.chars().count();
+        if value_length > length {
+            Cow::Owned(value.chars().take(length).collect())
+        } else {
+            value
+        }
+    }
+
     fn postgres_year_is_outside_tsql_range(value: &str, format: &str) -> bool {
         fn component_is_outside(component: &str, forced_negative: bool) -> bool {
             let component = component.trim().trim_end_matches(',');
@@ -37909,13 +38146,11 @@ impl Generator {
                 if target_type == "DATE"
                     && matches!(self.config.source_dialect, Some(DialectType::PostgreSQL))
                 {
-                    if let Expression::Literal(literal) = this {
-                        if let Literal::String(value) = literal.as_ref() {
-                            if Self::postgres_year_is_outside_tsql_range(value, format) {
-                                self.unsupported(
-                                    "PostgreSQL TO_DATE literal is outside the T-SQL/Fabric DATE range 0001-01-01 through 9999-12-31",
-                                )?;
-                            }
+                    if let Some(value) = Self::postgres_tsql_literal_string(this) {
+                        if Self::postgres_year_is_outside_tsql_range(&value, format) {
+                            self.unsupported(
+                                "PostgreSQL TO_DATE literal is outside the T-SQL/Fabric DATE range 0001-01-01 through 9999-12-31",
+                            )?;
                         }
                     }
                 }
@@ -39174,6 +39409,18 @@ impl Generator {
                 self.write("'");
                 self.write(")");
             }
+            Some(DialectType::Snowflake) => {
+                self.write_keyword("TO_CHAR");
+                self.write("(");
+                self.generate_expression(&e.this)?;
+                self.write(", '");
+                if e.format.contains('%') {
+                    self.write(&Self::strftime_to_snowflake_format(&e.format));
+                } else {
+                    self.write(&e.format);
+                }
+                self.write("')");
+            }
             Some(DialectType::Drill) => {
                 // Drill: TO_CHAR with Java format
                 self.write_keyword("TO_CHAR");
@@ -39207,6 +39454,19 @@ impl Generator {
                 self.write(&e.format);
                 self.write("'");
                 self.write(")");
+            }
+            Some(DialectType::ClickHouse) => {
+                // ClickHouse: formatDateTime(value, strftime_format)
+                let format = if e.format.contains('%') {
+                    e.format.clone()
+                } else {
+                    Self::snowflake_format_to_strftime(&e.format)
+                };
+                self.write("formatDateTime(");
+                self.generate_expression(&e.this)?;
+                self.write(", '");
+                self.write(&format);
+                self.write("')");
             }
             Some(DialectType::BigQuery) => {
                 // BigQuery: FORMAT_DATE(format, value) - note swapped arg order
@@ -39524,7 +39784,27 @@ impl Generator {
 
     fn generate_to_double(&mut self, e: &ToDouble) -> Result<()> {
         // TO_DOUBLE(this, [format])
-        self.write_keyword("TO_DOUBLE");
+        if self.config.dialect == Some(DialectType::ClickHouse)
+            && e.safe.is_some()
+            && e.format.is_none()
+        {
+            self.write("toFloat64OrNull");
+        } else if self.config.dialect == Some(DialectType::DuckDB)
+            && e.safe.is_some()
+            && e.format.is_none()
+        {
+            self.write_keyword("TRY_CAST");
+            self.write("(");
+            self.generate_expression(&e.this)?;
+            self.write_space();
+            self.write_keyword("AS DOUBLE");
+            self.write(")");
+            return Ok(());
+        } else if e.safe.is_some() {
+            self.write_keyword("TRY_TO_DOUBLE");
+        } else {
+            self.write_keyword("TO_DOUBLE");
+        }
         self.write("(");
         self.generate_expression(&e.this)?;
         if let Some(format) = &e.format {
@@ -39560,22 +39840,22 @@ impl Generator {
         }
         self.write("(");
         self.generate_expression(&e.this)?;
-        let precision_is_snowflake_default = e.precision.is_none()
+        let scale_is_snowflake_default = e.scale.is_none()
             || matches!(
-                e.precision.as_deref(),
+                e.scale.as_deref(),
                 Some(Expression::Literal(lit))
                     if matches!(lit.as_ref(), Literal::Number(n) if n == "0")
             );
         let is_snowflake_default_precision =
             matches!(self.config.dialect, Some(DialectType::Snowflake))
                 && e.nlsparam.is_none()
-                && e.scale.is_none()
+                && e.format.is_none()
                 && matches!(
-                    e.format.as_deref(),
+                    e.precision.as_deref(),
                     Some(Expression::Literal(lit))
                         if matches!(lit.as_ref(), Literal::Number(n) if n == "38")
                 )
-                && precision_is_snowflake_default;
+                && scale_is_snowflake_default;
 
         if !is_snowflake_default_precision {
             if let Some(format) = &e.format {
@@ -41460,12 +41740,12 @@ impl Generator {
         // Python: return self.connector_sql(expression, "XOR", stack)
         // Handles: this XOR expression or expressions joined by XOR
         if let Some(this) = &e.this {
-            self.generate_expression(this)?;
+            self.generate_infix_operand(InfixOperator::Xor, this, OperandSide::Left)?;
             if let Some(expression) = &e.expression {
                 self.write_space();
                 self.write_keyword("XOR");
                 self.write_space();
-                self.generate_expression(expression)?;
+                self.generate_infix_operand(InfixOperator::Xor, expression, OperandSide::Right)?;
             }
         }
 
@@ -41476,7 +41756,15 @@ impl Generator {
                 self.write_keyword("XOR");
                 self.write_space();
             }
-            self.generate_expression(expr)?;
+            self.generate_infix_operand(
+                InfixOperator::Xor,
+                expr,
+                if i == 0 && e.this.is_none() {
+                    OperandSide::Left
+                } else {
+                    OperandSide::Right
+                },
+            )?;
         }
         Ok(())
     }
@@ -41513,6 +41801,90 @@ mod tests {
     fn roundtrip(sql: &str) -> String {
         let ast = Parser::parse_sql(sql).unwrap();
         Generator::sql(&ast[0]).unwrap()
+    }
+
+    fn test_column(name: &str) -> Expression {
+        crate::builder::col(name).into_inner()
+    }
+
+    #[test]
+    fn test_programmatic_infix_ast_preserves_grouping() {
+        let cases = [
+            (
+                Expression::And(Box::new(BinaryOp::new(
+                    Expression::Or(Box::new(BinaryOp::new(test_column("a"), test_column("b")))),
+                    test_column("c"),
+                ))),
+                "(a OR b) AND c",
+            ),
+            (
+                Expression::And(Box::new(BinaryOp::new(
+                    test_column("a"),
+                    Expression::Or(Box::new(BinaryOp::new(test_column("b"), test_column("c")))),
+                ))),
+                "a AND (b OR c)",
+            ),
+            (
+                Expression::Mul(Box::new(BinaryOp::new(
+                    Expression::Add(Box::new(BinaryOp::new(test_column("a"), test_column("b")))),
+                    test_column("c"),
+                ))),
+                "(a + b) * c",
+            ),
+            (
+                Expression::Mul(Box::new(BinaryOp::new(
+                    test_column("a"),
+                    Expression::Add(Box::new(BinaryOp::new(test_column("b"), test_column("c")))),
+                ))),
+                "a * (b + c)",
+            ),
+            (
+                Expression::Sub(Box::new(BinaryOp::new(
+                    test_column("a"),
+                    Expression::Sub(Box::new(BinaryOp::new(test_column("b"), test_column("c")))),
+                ))),
+                "a - (b - c)",
+            ),
+            (
+                Expression::Div(Box::new(BinaryOp::new(
+                    test_column("a"),
+                    Expression::Div(Box::new(BinaryOp::new(test_column("b"), test_column("c")))),
+                ))),
+                "a / (b / c)",
+            ),
+            (
+                Expression::Mod(Box::new(BinaryOp::new(
+                    test_column("a"),
+                    Expression::Mul(Box::new(BinaryOp::new(test_column("b"), test_column("c")))),
+                ))),
+                "a % (b * c)",
+            ),
+            (
+                Expression::Add(Box::new(BinaryOp::new(
+                    test_column("a"),
+                    Expression::Add(Box::new(BinaryOp::new(test_column("b"), test_column("c")))),
+                ))),
+                "a + b + c",
+            ),
+            (
+                Expression::Add(Box::new(BinaryOp::new(
+                    test_column("a"),
+                    Expression::Mul(Box::new(BinaryOp::new(test_column("b"), test_column("c")))),
+                ))),
+                "a + b * c",
+            ),
+            (
+                Expression::Or(Box::new(BinaryOp::new(
+                    test_column("a"),
+                    Expression::And(Box::new(BinaryOp::new(test_column("b"), test_column("c")))),
+                ))),
+                "a OR b AND c",
+            ),
+        ];
+
+        for (expression, expected) in cases {
+            assert_eq!(Generator::sql(&expression).unwrap(), expected);
+        }
     }
 
     #[test]

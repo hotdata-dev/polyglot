@@ -176,6 +176,25 @@ def test_output_columns_preserves_unnamed_slots_and_wildcards():
     }
 
 
+def test_duckdb_union_by_name_outputs_and_lineage():
+    sql = "SELECT 1 AS left_value UNION ALL BY NAME SELECT 2 AS right_value"
+
+    output = polyglot_sql.output_columns(sql, dialect="duckdb")
+    assert output == {
+        "columns": [
+            {"kind": "named", "name": "left_value", "ordinal": 0},
+            {"kind": "named", "name": "right_value", "ordinal": 1},
+        ],
+        "ordinalComplete": True,
+    }
+
+    result = polyglot_sql.lineage_at(1, sql, dialect="duckdb")
+    assert "right_value" in collect_names(result)
+    assert [child["set_branch"] for child in result["downstream"]] == [
+        {"operator": "union", "ordinal": 1, "all": True}
+    ]
+
+
 def test_bigquery_unnest_lineage_marks_virtual_source():
     sql = """
 SELECT date_val AS week_start

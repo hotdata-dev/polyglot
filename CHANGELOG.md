@@ -4,6 +4,148 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.9.2] - 2026-08-18
+
+### Fixed
+- DuckDB schema-aware validation, analysis, output discovery, and lineage now
+  distinguish struct field access from table qualification. Direct struct
+  columns and struct values emitted by `UNNEST` resolve their scalar field type
+  and retain lineage to the physical source column, while genuinely unknown
+  qualifiers remain errors.
+- DuckDB aggregate parsing and discovery now cover the documented 1.4 LTS
+  expression-level aggregate catalog and aliases consistently, including
+  unordered `LIST`, `ARG_MAX_NULL`/`ARG_MIN_NULL`, `PRODUCT`,
+  `HISTOGRAM_EXACT`, and the quantile and statistical aggregates. Compact query
+  analysis classifies these calls as aggregations, aggregate-local modifiers
+  remain intact, and existing quantile transpilation behavior is preserved.
+- TypeScript AST walking, transformation, cloning, and removal now recurse into
+  expressions nested inside serialized AST structs, including aggregate and
+  query `ORDER BY` entries, joins, CTE bodies, and window definitions. Walker
+  and transformer callbacks now cover the same nodes with stable parent, key,
+  and index metadata.
+- SQL generation now adds the parentheses required to preserve programmatically
+  constructed boolean and arithmetic expression trees. Native and serialized
+  builders retain nested operator precedence and the right-hand grouping of
+  non-associative operators such as subtraction and division.
+
+## [0.9.1] - 2026-08-14
+
+### Added
+- Rust AST consumers can use `get_output_column_names_for_dialect` to discover
+  result columns with dialect-specific name-aligned set-operation semantics,
+  while retaining the existing leftmost-branch fallback for indeterminate
+  output shapes.
+
+### Fixed
+- Schema-aware analysis and lineage now resolve unqualified columns merged by
+  `NATURAL JOIN`, including derived, chained, and outer joins, to their physical
+  inputs and preserve their schema-derived types. Joins whose common columns
+  cannot be established remain unexpanded.
+- Anonymous derived tables now receive collision-free internal aliases during
+  schema-aware qualification, so their projections retain physical upstream
+  lineage and type hints without renaming physical tables or restructuring set
+  operations.
+- DuckDB and Snowflake `UNION [ALL] BY NAME` output discovery, ordinal lineage,
+  resolution, nullability, and compact query analysis now align branches by
+  column name instead of position. BigQuery name-aligned set operations now
+  support `STRICT`, `INNER`, `LEFT`, `FULL [OUTER]`, explicit `ON` ordering, and
+  `CORRESPONDING BY` normalization with dialect-aware identifier matching. The
+  corrected behavior is reflected across Rust, Python, C FFI, Go, WASM, and
+  TypeScript APIs.
+- DuckDB `DATE_TRUNC` now infers its result from the temporal input overload:
+  dates and timestamps produce timestamps with the appropriate timezone
+  semantics, while intervals remain intervals. Specialized `COALESCE` nodes
+  also infer their common argument type consistently.
+- Aggregate discovery now uses one shared classifier across AST helpers,
+  compact query analysis, semantic validation, dialect checks, OpenLineage, and
+  planning. DuckDB `COUNT_IF`, `MEDIAN`, and `FIRST`, along with the other typed
+  aggregate variants, are recognized consistently while scalar lookalikes and
+  window-only functions remain excluded.
+
+## [0.9.0] - 2026-08-11
+
+### Added
+- Rust, Python, Go, and TypeScript now share one builder feature set, including
+  scalar and named-function helpers, query clauses, all join and set-operation
+  variants, named windows, lateral views, hints, row locks, CTAS, INSERT,
+  UPDATE, DELETE, and conditional MERGE actions.
+- The versioned builder protocol now uses a typed, immutable
+  `{ base, operations }` plan with typed operators, join kinds, and nested plans.
+- A shared, immutable SQLGlot-compatible builder subset is now available in
+  Python, Go, and TypeScript. Python exposes familiar module functions and
+  `Expression` methods, Go provides idiomatic plan constructors with
+  `Build`/`BuildSQL` terminals, and TypeScript exposes an additive `compat`
+  namespace and `@polyglot-sql/sdk/compat` entry point.
+- The C FFI and WASM layers now expose versioned, stateless builder-plan
+  evaluators backed by the same Rust AST implementation.
+
+### Changed
+- Builder AST construction and mutation are centralized in a binding-neutral
+  Rust engine shared by the native fluent API, serialized plans, and overlapping
+  AST transforms.
+- The existing TypeScript builder classes now adapt to the immutable shared plan;
+  the duplicate stateful WASM builder implementation has been removed.
+- Repeated Rust fluent clauses now append instead of replace. Rust callers that
+  need replacement can use the corresponding `*_with_options` method and
+  `ClauseOptions { append: false }`.
+- Repeated list and predicate clauses append by default in every language.
+  Callers can request replacement with `append = false` using each language's
+  idiomatic options API.
+- The TypeScript compatibility facade uses idiomatic camelCase method names.
+
+### Fixed
+- BigQuery-to-ClickHouse transpilation now preserves default UTC and
+  microsecond semantics for supported `TIMESTAMP` calls and guards floating
+  `SAFE_DIVIDE` results against non-finite values. Strict mode rejects dynamic
+  or out-of-range timestamp cases, unresolved division types, and floating
+  `ROUND` operations whose halfway behavior cannot be preserved.
+- Supported Snowflake temporal `TO_CHAR` and one-argument `TRY_TO_DOUBLE` calls
+  now lower to ClickHouse `formatDateTime` and nullable conversion functions.
+  `TRY_TO_NUMBER` numeric arguments are parsed as precision and scale, while
+  strict mode rejects unsupported format-model conversions, decimal
+  `TRY_TO_NUMBER` conversions, and Snowflake `FLATTEN` table-function semantics.
+- Snowflake-to-ClickHouse rewrites now preserve `REGEXP_LIKE` full-string and
+  literal-flag behavior, exact interpolated `MEDIAN`, null-propagating
+  `GREATEST`/`LEAST`, and supported decimal rounding modes. Strict mode rejects
+  dynamic regex parameters, unresolved median types, and incompatible
+  floating-point rounding.
+- Snowflake current date/time rewrites retain supported precision in permissive
+  ClickHouse output. Strict mode now reports source-session dependencies on
+  `TIMEZONE` and `WEEK_START` for current temporal values and week truncation,
+  without introducing a source-session API or silently assuming target
+  settings.
+- PostgreSQL, Redshift, and T-SQL integer division now lowers to ClickHouse
+  `intDiv` with source-compatible widths and truncation. Strict mode rejects
+  unresolved operands, incompatible decimal scale rules, and floating division
+  that could replace source errors with non-finite ClickHouse results, while
+  retaining safe statically known cases.
+- T-SQL and Fabric `FLOAT` precision now maps to the correct target width:
+  omitted precision and values from 25 through 53 use double precision, values
+  from 1 through 24 use single precision, and `REAL` remains single precision.
+  T-SQL/Fabric identity output preserves the declared precision.
+- PostgreSQL JSON text extraction for ClickHouse now uses nullable
+  `JSONExtract` results, preserving the distinction between missing or JSON-null
+  paths and present empty strings. Object paths, array indices, nested `#>>`
+  paths, and `JSON_EXTRACT_PATH_TEXT` use the appropriate ClickHouse path
+  representation.
+- Strict ClickHouse transpilation now diagnoses null-semantic dependencies for
+  outer joins and empty-input-sensitive aggregates, naming the required
+  `join_use_nulls = 1` and `aggregate_functions_null_for_empty = 1` settings.
+  Permissive modes do not inject settings, while count-like aggregates, inner
+  joins, and ClickHouse identity transpilation remain unaffected.
+- Snowflake now treats unquoted `PRIOR` as an identifier outside `CONNECT BY`,
+  including bare projections and qualified column or star access. Hierarchical
+  `PRIOR` expressions remain contextual in Snowflake, while Oracle retains its
+  broader operator behavior.
+- Snowflake `SELECT` lists now accept a trailing comma before a closing
+  parenthesis in CTEs and derived tables. Double commas and trailing commas in
+  function argument lists remain rejected.
+
+### Removed
+- The unreleased nested `apply` builder-plan shape and stringly typed operator
+  fields have been replaced by the final version 1 protocol without a legacy
+  compatibility shim.
+
 ## [0.8.1] - 2026-08-05
 
 ### Fixed

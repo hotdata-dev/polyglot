@@ -632,6 +632,48 @@ mod strict_unsupported_regressions {
     }
 
     #[test]
+    fn postgres_clickhouse_json_text_extraction_preserves_nullability() {
+        let cases = [
+            (
+                "SELECT payload ->> 'status' FROM events",
+                "SELECT JSONExtract(payload, 'status', 'Nullable(String)') FROM events",
+            ),
+            (
+                "SELECT payload ->> '0' FROM events",
+                "SELECT JSONExtract(payload, '0', 'Nullable(String)') FROM events",
+            ),
+            (
+                "SELECT payload ->> 0 FROM events",
+                "SELECT JSONExtract(payload, 1, 'Nullable(String)') FROM events",
+            ),
+            (
+                "SELECT payload #>> '{user,status}' FROM events",
+                "SELECT JSONExtract(payload, 'user', 'status', 'Nullable(String)') FROM events",
+            ),
+            (
+                "SELECT payload #>> '{users,0,status}' FROM events",
+                "SELECT JSONExtract(payload, 'users', 1, 'status', 'Nullable(String)') FROM events",
+            ),
+            (
+                "SELECT JSON_EXTRACT_PATH_TEXT(payload, k1, k2) FROM events",
+                "SELECT JSONExtract(payload, k1, k2, 'Nullable(String)') FROM events",
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let actual = transpile_with_level(
+                sql,
+                DialectType::PostgreSQL,
+                DialectType::ClickHouse,
+                UnsupportedLevel::Raise,
+            )
+            .unwrap_or_else(|error| panic!("strict PostgreSQL -> ClickHouse failed: {error}"));
+
+            assert_eq!(actual, [expected], "unexpected transpilation for {sql}");
+        }
+    }
+
+    #[test]
     fn postgres_unknown_null_casts_lower_safely_for_tsql_targets() {
         for write in [DialectType::Fabric, DialectType::TSQL] {
             let direct = transpile_with_level(
@@ -1150,6 +1192,841 @@ mod strict_unsupported_regressions {
     }
 
     #[test]
+    fn bigquery_clickhouse_timestamp_preserves_utc_and_microseconds() {
+        let without_zone = transpile_with_level(
+            "SELECT TIMESTAMP('2025-01-01 00:00:00')",
+            DialectType::BigQuery,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("strict ClickHouse transpile should preserve BigQuery's default UTC zone");
+        assert_eq!(
+            without_zone,
+            vec!["SELECT toDateTime64('2025-01-01 00:00:00', 6, 'UTC')"]
+        );
+
+        let with_zone = transpile_with_level(
+            "SELECT TIMESTAMP('2025-01-01 00:00:00', 'America/Los_Angeles')",
+            DialectType::BigQuery,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("strict ClickHouse transpile should preserve an explicit BigQuery time zone");
+        assert_eq!(
+            with_zone,
+            vec!["SELECT toTimeZone(toDateTime64('2025-01-01 00:00:00', 6, 'America/Los_Angeles'), 'UTC')"]
+        );
+    }
+
+    #[test]
+    fn tsql_and_fabric_float_widths_map_to_clickhouse_semantics() {
+        let cases = [
+            (
+                "SELECT CONVERT(FLOAT, 1)",
+                "SELECT CAST(1 AS Nullable(Float64))",
+            ),
+            (
+                "SELECT CONVERT(FLOAT(1), 1)",
+                "SELECT CAST(1 AS Nullable(Float32))",
+            ),
+            (
+                "SELECT CONVERT(FLOAT(24), 1)",
+                "SELECT CAST(1 AS Nullable(Float32))",
+            ),
+            (
+                "SELECT CONVERT(FLOAT(25), 1)",
+                "SELECT CAST(1 AS Nullable(Float64))",
+            ),
+            (
+                "SELECT CONVERT(FLOAT(53), 1)",
+                "SELECT CAST(1 AS Nullable(Float64))",
+            ),
+            (
+                "SELECT CONVERT(REAL, 1)",
+                "SELECT CAST(1 AS Nullable(Float32))",
+            ),
+        ];
+
+        for source in [DialectType::TSQL, DialectType::Fabric] {
+            for (sql, expected) in cases {
+                let output = transpile_with_level(
+                    sql,
+                    source,
+                    DialectType::ClickHouse,
+                    UnsupportedLevel::Raise,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("strict {source:?} -> ClickHouse transpilation failed: {error}")
+                });
+                assert_eq!(output, vec![expected], "{source:?}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn tsql_float_width_boundary_is_source_defined_for_spark_and_hive() {
+        for target in [DialectType::Spark, DialectType::Hive] {
+            for (sql, expected_type) in [
+                ("SELECT CONVERT(FLOAT, 1)", "DOUBLE"),
+                ("SELECT CONVERT(FLOAT(24), 1)", "FLOAT"),
+                ("SELECT CONVERT(FLOAT(25), 1)", "DOUBLE"),
+                ("SELECT CONVERT(FLOAT(32), 1)", "DOUBLE"),
+                ("SELECT CONVERT(FLOAT(53), 1)", "DOUBLE"),
+            ] {
+                let output =
+                    transpile_with_level(sql, DialectType::TSQL, target, UnsupportedLevel::Raise)
+                        .unwrap_or_else(|error| {
+                            panic!("strict TSQL -> {target:?} transpilation failed: {error}")
+                        });
+                assert_eq!(
+                    output,
+                    vec![format!("SELECT CAST(1 AS {expected_type})")],
+                    "{target:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tsql_and_fabric_float_identity_keeps_declared_precision() {
+        for source in [DialectType::TSQL, DialectType::Fabric] {
+            for target in [DialectType::TSQL, DialectType::Fabric] {
+                let output = transpile_with_level(
+                    "SELECT CAST(1 AS FLOAT), CAST(1 AS FLOAT(25))",
+                    source,
+                    target,
+                    UnsupportedLevel::Raise,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("strict {source:?} -> {target:?} transpilation failed: {error}")
+                });
+                assert_eq!(
+                    output,
+                    vec!["SELECT CAST(1 AS FLOAT), CAST(1 AS FLOAT(25))"],
+                    "{source:?} -> {target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_snowflake_clickhouse_lowers_supported_conversions() {
+        let temporal = transpile_with_level(
+            "SELECT TO_CHAR(DATE '2025-01-15', 'YYYY-MM')",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("temporal TO_CHAR should lower to ClickHouse");
+        assert_eq!(
+            temporal,
+            vec!["SELECT formatDateTime(CAST('2025-01-15' AS DATE), '%Y-%m')"]
+        );
+
+        let safe_double = transpile_with_level(
+            "SELECT TRY_TO_DOUBLE('abc')",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("one-argument TRY_TO_DOUBLE should lower to ClickHouse");
+        assert_eq!(safe_double, vec!["SELECT toFloat64OrNull('abc')"]);
+    }
+
+    #[test]
+    fn snowflake_clickhouse_current_time_preserves_precision_in_permissive_mode() {
+        for level in [UnsupportedLevel::Warn, UnsupportedLevel::Ignore] {
+            let output = transpile_with_level(
+                "SELECT CURRENT_DATE(), CURRENT_TIMESTAMP(), CURRENT_TIME(), CURRENT_TIMESTAMP(0), CURRENT_TIME(3), CURRENT_TIMESTAMP(9)",
+                DialectType::Snowflake,
+                DialectType::ClickHouse,
+                level,
+            )
+            .expect("permissive ClickHouse transpile should retain session-relative expressions");
+
+            assert_eq!(
+                output,
+                vec!["SELECT CURRENT_DATE, now64(9), toTime64(now64(9), 9), now64(0), toTime64(now64(3), 3), now64(9)"]
+            );
+        }
+    }
+
+    #[test]
+    fn strict_snowflake_clickhouse_rejects_session_dependent_temporal_semantics() {
+        let cases = [
+            ("SELECT CURRENT_DATE", "TIMEZONE"),
+            ("SELECT CURRENT_DATE()", "TIMEZONE"),
+            ("SELECT CURRENT_TIME(3)", "TIMEZONE"),
+            ("SELECT CURRENT_TIMESTAMP(3)", "TIMEZONE"),
+            ("SELECT LOCALTIME(3)", "TIMEZONE"),
+            ("SELECT LOCALTIMESTAMP(3)", "TIMEZONE"),
+            ("SELECT TO_CHAR(CURRENT_DATE(), 'YYYY-MM')", "TIMEZONE"),
+            (
+                "SELECT DATE_TRUNC('WEEK', TO_DATE('2025-01-05'))",
+                "WEEK_START",
+            ),
+            (
+                "SELECT DATE_TRUNC('WK', TO_DATE('2025-01-05'))",
+                "WEEK_START",
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let err = transpile_with_level(
+                sql,
+                DialectType::Snowflake,
+                DialectType::ClickHouse,
+                UnsupportedLevel::Raise,
+            )
+            .expect_err("strict ClickHouse transpile should reject unknown session semantics");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?} in error for {sql:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_snowflake_clickhouse_session_diagnostics_are_deduplicated() {
+        let err = transpile_with_level(
+            "SELECT CURRENT_DATE(), CURRENT_TIMESTAMP(), CURRENT_TIME(), DATE_TRUNC('WEEK', TO_DATE('2025-01-05'))",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect_err("strict ClickHouse transpile should report unknown session semantics");
+        let message = err.to_string();
+
+        assert_eq!(message.matches("TIMEZONE").count(), 1, "{message}");
+        assert_eq!(message.matches("WEEK_START").count(), 1, "{message}");
+
+        let immediate = transpile_with_level(
+            "SELECT CURRENT_DATE(), DATE_TRUNC('WEEK', TO_DATE('2025-01-05'))",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Immediate,
+        )
+        .expect_err("immediate mode should stop at the first session diagnostic");
+        let immediate_message = immediate.to_string();
+        assert!(
+            immediate_message.contains("TIMEZONE"),
+            "{immediate_message}"
+        );
+        assert!(
+            !immediate_message.contains("WEEK_START"),
+            "{immediate_message}"
+        );
+    }
+
+    #[test]
+    fn strict_snowflake_clickhouse_allows_session_independent_temporal_semantics() {
+        let output = transpile_with_level(
+            "SELECT DATE_TRUNC('MONTH', TO_DATE('2025-01-05'))",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("non-week truncation should remain supported in strict mode");
+
+        assert_eq!(
+            output,
+            vec!["SELECT dateTrunc('MONTH', CAST('2025-01-05' AS DATE))"]
+        );
+    }
+
+    #[test]
+    fn permissive_clickhouse_transpile_does_not_inject_null_semantics_settings() {
+        let cases = [
+            (
+                "SELECT b.value FROM a LEFT JOIN b ON a.id = b.id",
+                DialectType::Databricks,
+                "SELECT b.value FROM a LEFT JOIN b ON a.id = b.id",
+            ),
+            (
+                "SELECT SUM(value) FILTER (WHERE paid) FROM events",
+                DialectType::PostgreSQL,
+                "SELECT SUM(value) FILTER(WHERE paid) FROM events",
+            ),
+        ];
+
+        for (sql, source, expected) in cases {
+            let default_output = Dialect::get(source)
+                .transpile(sql, DialectType::ClickHouse)
+                .expect("default ClickHouse transpile should remain permissive");
+            assert_eq!(default_output, vec![expected]);
+
+            for level in [UnsupportedLevel::Warn, UnsupportedLevel::Ignore] {
+                let output = transpile_with_level(sql, source, DialectType::ClickHouse, level)
+                    .expect("permissive ClickHouse transpile should preserve the SQL");
+                assert_eq!(output, vec![expected]);
+                assert!(!output[0].contains("SETTINGS"), "{}", output[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn strict_clickhouse_rejects_null_extending_joins_without_known_target_setting() {
+        let cases = [
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id",
+            "SELECT * FROM a RIGHT JOIN b ON a.id = b.id",
+            "SELECT * FROM a FULL JOIN b ON a.id = b.id",
+            "SELECT * FROM a NATURAL LEFT JOIN b",
+            "SELECT * FROM a NATURAL RIGHT JOIN b",
+            "SELECT * FROM a NATURAL FULL JOIN b",
+            "SELECT * FROM (a LEFT JOIN b ON a.id = b.id) AS ab",
+        ];
+
+        for sql in cases {
+            let err = transpile_with_level(
+                sql,
+                DialectType::Generic,
+                DialectType::ClickHouse,
+                UnsupportedLevel::Raise,
+            )
+            .expect_err("strict ClickHouse transpile should reject unknown outer-join semantics");
+            assert!(
+                err.to_string().contains("join_use_nulls = 1"),
+                "expected join_use_nulls diagnostic for {sql:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_clickhouse_rejects_empty_input_sensitive_aggregates() {
+        let cases = [
+            "SELECT SUM(value) FROM events",
+            "SELECT SUM(value) FILTER (WHERE paid) FROM events",
+            "SELECT AVG(value) FROM events",
+            "SELECT SUM(value) OVER () FROM events",
+        ];
+
+        for sql in cases {
+            let err = transpile_with_level(
+                sql,
+                DialectType::PostgreSQL,
+                DialectType::ClickHouse,
+                UnsupportedLevel::Raise,
+            )
+            .expect_err("strict ClickHouse transpile should reject unknown empty-input semantics");
+            assert!(
+                err.to_string()
+                    .contains("aggregate_functions_null_for_empty = 1"),
+                "expected aggregate_functions_null_for_empty diagnostic for {sql:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_clickhouse_allows_count_like_aggregates_and_inner_joins() {
+        let cases = [
+            "SELECT COUNT(*) FROM events",
+            "SELECT COUNT(*) FILTER (WHERE paid) FROM events",
+            "SELECT COUNT_IF(paid) FROM events",
+            "SELECT APPROX_COUNT_DISTINCT(value) FROM events",
+            "SELECT * FROM a INNER JOIN b ON a.id = b.id",
+        ];
+
+        for sql in cases {
+            transpile_with_level(
+                sql,
+                DialectType::Databricks,
+                DialectType::ClickHouse,
+                UnsupportedLevel::Raise,
+            )
+            .unwrap_or_else(|err| panic!("strict ClickHouse transpile rejected {sql:?}: {err}"));
+        }
+    }
+
+    #[test]
+    fn strict_clickhouse_null_semantics_diagnostics_are_deduplicated() {
+        let sql = "SELECT SUM(b.value), AVG(b.value) FROM a LEFT JOIN b ON a.id = b.id LEFT JOIN c ON a.id = c.id";
+        let err = transpile_with_level(
+            sql,
+            DialectType::Databricks,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect_err("strict ClickHouse transpile should report target setting dependencies");
+        let message = err.to_string();
+
+        assert_eq!(
+            message.matches("join_use_nulls = 1").count(),
+            1,
+            "{message}"
+        );
+        assert_eq!(
+            message
+                .matches("aggregate_functions_null_for_empty = 1")
+                .count(),
+            1,
+            "{message}"
+        );
+
+        let immediate = transpile_with_level(
+            sql,
+            DialectType::Databricks,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Immediate,
+        )
+        .expect_err("immediate mode should stop at the first target setting dependency")
+        .to_string();
+        let diagnostic_count = immediate.matches("join_use_nulls = 1").count()
+            + immediate
+                .matches("aggregate_functions_null_for_empty = 1")
+                .count();
+        assert_eq!(diagnostic_count, 1, "{immediate}");
+    }
+
+    #[test]
+    fn strict_clickhouse_identity_preserves_native_null_semantics() {
+        let output = transpile_with_level(
+            "SELECT SUM(b.value) FROM a LEFT JOIN b ON a.id = b.id",
+            DialectType::ClickHouse,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("ClickHouse identity transpilation should preserve native semantics");
+
+        assert_eq!(
+            output,
+            vec!["SELECT SUM(b.value) FROM a LEFT JOIN b ON a.id = b.id"]
+        );
+    }
+
+    #[test]
+    fn strict_snowflake_clickhouse_rejects_lossy_conversions_and_flatten() {
+        let cases = [
+            (
+                "SELECT TO_CHAR(123, '999')",
+                "Snowflake TO_CHAR overload or dynamic format",
+            ),
+            (
+                "SELECT TRY_TO_DOUBLE('1,23', 'TM9')",
+                "Snowflake TRY_TO_DOUBLE with a format model",
+            ),
+            (
+                "SELECT TRY_TO_NUMBER('12.34', 9, 2)",
+                "Snowflake TRY_TO_NUMBER decimal conversion semantics",
+            ),
+            (
+                "SELECT f.VALUE FROM events, LATERAL FLATTEN(INPUT => payload) AS f",
+                "Snowflake FLATTEN table-function semantics",
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let err = transpile_with_level(
+                sql,
+                DialectType::Snowflake,
+                DialectType::ClickHouse,
+                UnsupportedLevel::Raise,
+            )
+            .expect_err("strict ClickHouse transpile should reject lossy Snowflake semantics");
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error for {sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_bigquery_clickhouse_safe_divide_guards_float_overflow() {
+        let output = transpile_with_level(
+            "SELECT SAFE_DIVIDE(CAST(1e308 AS FLOAT64), CAST(1e-308 AS FLOAT64))",
+            DialectType::BigQuery,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("strict ClickHouse transpile should preserve Float64 SAFE_DIVIDE overflow");
+
+        assert_eq!(output.len(), 1);
+        assert!(
+            output[0].contains("isNaN"),
+            "unexpected output: {}",
+            output[0]
+        );
+        assert!(
+            output[0].contains("isFinite"),
+            "unexpected output: {}",
+            output[0]
+        );
+        assert!(
+            output[0].contains("NULL"),
+            "unexpected output: {}",
+            output[0]
+        );
+    }
+
+    #[test]
+    fn clickhouse_preserves_postgres_redshift_and_tsql_integer_division() {
+        for source in [
+            DialectType::PostgreSQL,
+            DialectType::Redshift,
+            DialectType::TSQL,
+        ] {
+            let output = transpile_with_level(
+                "SELECT 5 / 2, (-5) / 2, 1 / 0",
+                source,
+                DialectType::ClickHouse,
+                UnsupportedLevel::Raise,
+            )
+            .expect("statically typed integer division should lower exactly to ClickHouse");
+
+            assert_eq!(output.len(), 1);
+            assert_eq!(
+                output[0].matches("intDiv(").count(),
+                3,
+                "{source:?}: {}",
+                output[0]
+            );
+            assert!(!output[0].contains(" / "), "{source:?}: {}", output[0]);
+            assert!(output[0].contains("Int32"), "{source:?}: {}", output[0]);
+        }
+
+        let mixed_width = transpile_with_level(
+            "SELECT CAST(a AS SMALLINT) / CAST(b AS BIGINT) FROM measurements",
+            DialectType::Redshift,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("explicit mixed-width integer division should use the wider source type");
+        assert!(mixed_width[0].contains("intDiv("), "{}", mixed_width[0]);
+        assert!(
+            mixed_width[0].contains("Nullable(Int16)"),
+            "{}",
+            mixed_width[0]
+        );
+        assert!(
+            mixed_width[0].contains("Nullable(Int64)"),
+            "{}",
+            mixed_width[0]
+        );
+    }
+
+    #[test]
+    fn clickhouse_int_div_expression_uses_native_function_name() {
+        let output = transpile_with_level(
+            "SELECT DIV(5, 2)",
+            DialectType::BigQuery,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("BigQuery DIV should lower to ClickHouse intDiv");
+
+        assert_eq!(output, vec!["SELECT intDiv(5, 2)"]);
+    }
+
+    #[test]
+    fn strict_clickhouse_rejects_throwing_source_float_division() {
+        for source in [
+            DialectType::PostgreSQL,
+            DialectType::Redshift,
+            DialectType::TSQL,
+        ] {
+            for sql in [
+                "SELECT CAST(1 AS DOUBLE PRECISION) / 0",
+                "SELECT CAST(1e308 AS DOUBLE PRECISION) / CAST(1e-308 AS DOUBLE PRECISION)",
+                "SELECT CAST(numerator AS DOUBLE PRECISION) / CAST(denominator AS DOUBLE PRECISION) FROM measurements",
+            ] {
+                let err = transpile_with_level(
+                    sql,
+                    source,
+                    DialectType::ClickHouse,
+                    UnsupportedLevel::Raise,
+                )
+                .expect_err("strict ClickHouse transpilation should reject non-finite results");
+
+                assert!(
+                    err.to_string().contains("floating-point division"),
+                    "{source:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_clickhouse_allows_statically_safe_float_division() {
+        let output = transpile_with_level(
+            "SELECT CAST(5 AS DOUBLE PRECISION) / CAST(2 AS DOUBLE PRECISION)",
+            DialectType::PostgreSQL,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("finite nonzero literal division is safe in ClickHouse");
+
+        assert_eq!(
+            output,
+            vec!["SELECT CAST(5 AS Nullable(Float64)) / CAST(2 AS Nullable(Float64))"]
+        );
+    }
+
+    #[test]
+    fn strict_clickhouse_rejects_decimal_and_unresolved_source_division() {
+        let decimal_err = transpile_with_level(
+            "SELECT CAST(1 AS DECIMAL(18, 4)) / CAST(3 AS DECIMAL(18, 4))",
+            DialectType::Redshift,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect_err("strict ClickHouse transpilation should reject Redshift decimal semantics");
+        assert!(decimal_err.to_string().contains("decimal division"));
+
+        for source in [
+            DialectType::PostgreSQL,
+            DialectType::Redshift,
+            DialectType::TSQL,
+        ] {
+            let unresolved_err = transpile_with_level(
+                "SELECT numerator / denominator FROM measurements",
+                source,
+                DialectType::ClickHouse,
+                UnsupportedLevel::Raise,
+            )
+            .expect_err("strict ClickHouse transpilation should reject unresolved operand types");
+            assert!(
+                unresolved_err
+                    .to_string()
+                    .contains("unresolved operand types"),
+                "{source:?}: {unresolved_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn permissive_clickhouse_keeps_unresolved_and_decimal_division_best_effort() {
+        let unresolved = transpile_with_level(
+            "SELECT numerator / denominator FROM measurements",
+            DialectType::PostgreSQL,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Warn,
+        )
+        .expect("permissive transpilation should keep unresolved division");
+        assert_eq!(
+            unresolved,
+            vec!["SELECT numerator / denominator FROM measurements"]
+        );
+
+        let decimal = transpile_with_level(
+            "SELECT CAST(1 AS DECIMAL(18, 4)) / CAST(3 AS DECIMAL(18, 4))",
+            DialectType::Redshift,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Warn,
+        )
+        .expect("permissive transpilation should keep decimal division best effort");
+        assert_eq!(
+            decimal,
+            vec!["SELECT CAST(1 AS Decimal(18, 4)) / CAST(3 AS Decimal(18, 4))"]
+        );
+    }
+
+    #[test]
+    fn strict_bigquery_clickhouse_rejects_unresolved_safe_divide() {
+        let err = transpile_with_level(
+            "SELECT SAFE_DIVIDE(x, y) FROM t",
+            DialectType::BigQuery,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect_err("strict ClickHouse transpile should reject unresolved SAFE_DIVIDE types");
+
+        assert!(err.to_string().contains("SAFE_DIVIDE"));
+        assert!(err.to_string().contains("unresolved"));
+    }
+
+    #[test]
+    fn strict_bigquery_clickhouse_rejects_float_rounding() {
+        for value in ["2.5", "-2.5"] {
+            let sql = format!("SELECT ROUND(CAST({value} AS FLOAT64))");
+            let err = transpile_with_level(
+                &sql,
+                DialectType::BigQuery,
+                DialectType::ClickHouse,
+                UnsupportedLevel::Raise,
+            )
+            .expect_err("strict ClickHouse transpile should reject BigQuery Float64 ROUND");
+
+            assert!(err.to_string().contains("ROUND over FLOAT64"));
+            assert!(err.to_string().contains("half-away-from-zero"));
+        }
+    }
+
+    #[test]
+    fn strict_bigquery_clickhouse_allows_matching_decimal_rounding() {
+        let output = transpile_with_level(
+            "SELECT ROUND(CAST(2.5 AS NUMERIC))",
+            DialectType::BigQuery,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("ClickHouse Decimal ROUND uses BigQuery's half-away-from-zero rule");
+
+        assert_eq!(output.len(), 1);
+        assert!(output[0].contains("ROUND"));
+        assert!(output[0].contains("Decimal"));
+    }
+
+    #[test]
+    fn strict_snowflake_clickhouse_preserves_full_string_regexp_like() {
+        let output = transpile_with_level(
+            "SELECT REGEXP_LIKE('xprefixy', 'prefix')",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("Snowflake REGEXP_LIKE can be anchored for ClickHouse");
+
+        assert_eq!(output, vec!["SELECT match('xprefixy', '(?-s)^(prefix)$')"]);
+
+        let case_insensitive = transpile_with_level(
+            "SELECT REGEXP_LIKE('Prefix', 'prefix', 'i')",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("literal Snowflake regex flags can be mapped to RE2 modifiers");
+        assert_eq!(
+            case_insensitive,
+            vec!["SELECT match('Prefix', '(?i-s)^(prefix)$')"]
+        );
+    }
+
+    #[test]
+    fn strict_snowflake_clickhouse_rejects_dynamic_regexp_parameters() {
+        let err = transpile_with_level(
+            "SELECT REGEXP_LIKE(value, pattern, parameters) FROM events",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect_err("dynamic Snowflake regex parameters cannot be mapped safely");
+
+        assert!(err.to_string().contains("REGEXP_LIKE"));
+        assert!(err.to_string().contains("dynamic parameters"));
+    }
+
+    #[test]
+    fn snowflake_clickhouse_uses_exact_interpolated_median() {
+        let output = transpile(
+            "SELECT MEDIAN(value) FROM events",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+        );
+        assert_eq!(
+            output,
+            "SELECT medianExactWeightedInterpolatedOrNull(value, 1) FROM events"
+        );
+
+        let decimal = transpile_with_level(
+            "SELECT MEDIAN(CAST(value AS NUMBER(10, 2))) FROM events",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("fixed-point Snowflake MEDIAN has an exact ClickHouse lowering");
+        assert_eq!(
+            decimal,
+            vec!["SELECT medianExactWeightedInterpolatedOrNull(CAST(value AS Decimal(10, 2)), 1) FROM events"]
+        );
+
+        let integer = transpile_with_level(
+            "SELECT MEDIAN(CAST(value AS NUMBER(10, 0))) FROM events",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("integer medians can retain an interpolated half value through Decimal scale");
+        assert_eq!(
+            integer,
+            vec!["SELECT medianExactWeightedInterpolatedOrNull(CAST(CAST(value AS Decimal(10, 0)) AS Decimal(11, 1)), 1) FROM events"]
+        );
+    }
+
+    #[test]
+    fn strict_snowflake_clickhouse_rejects_unresolved_median_type() {
+        let err = transpile_with_level(
+            "SELECT MEDIAN(value) FROM events",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect_err("strict mode must not guess the Snowflake MEDIAN input type");
+
+        assert!(err.to_string().contains("MEDIAN"));
+        assert!(err.to_string().contains("unresolved input type"));
+    }
+
+    #[test]
+    fn strict_snowflake_clickhouse_preserves_greatest_least_nulls() {
+        let output = transpile_with_level(
+            "SELECT GREATEST(1, NULL), LEAST(1, NULL)",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("Snowflake NULL propagation can be expressed with CASE");
+
+        assert_eq!(
+            output,
+            vec!["SELECT CASE WHEN 1 IS NULL OR NULL IS NULL THEN NULL ELSE GREATEST(1, NULL) END, CASE WHEN 1 IS NULL OR NULL IS NULL THEN NULL ELSE LEAST(1, NULL) END"]
+        );
+    }
+
+    #[test]
+    fn strict_snowflake_clickhouse_handles_rounding_semantics() {
+        let err = transpile_with_level(
+            "SELECT ROUND(CAST(2.5 AS DOUBLE))",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect_err("ClickHouse Float ROUND uses banker's rounding");
+        assert!(err.to_string().contains("Snowflake ROUND"));
+        assert!(err.to_string().contains("half-away-from-zero"));
+
+        let decimal = transpile_with_level(
+            "SELECT ROUND(CAST(2.5 AS NUMBER(10, 1)))",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("ClickHouse Decimal ROUND matches Snowflake's default mode");
+        assert_eq!(decimal, vec!["SELECT ROUND(CAST(2.5 AS Decimal(10, 1)))"]);
+
+        let half_even = transpile_with_level(
+            "SELECT ROUND(CAST(2.5 AS NUMBER(10, 1)), 0, 'HALF_TO_EVEN')",
+            DialectType::Snowflake,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect("Snowflake HALF_TO_EVEN can use ClickHouse roundBankers");
+        assert_eq!(
+            half_even,
+            vec!["SELECT roundBankers(CAST(2.5 AS Decimal(10, 1)), 0)"]
+        );
+    }
+
+    #[test]
+    fn strict_bigquery_clickhouse_rejects_unrepresentable_timestamp_cases() {
+        let out_of_range = transpile_with_level(
+            "SELECT TIMESTAMP('1800-01-01 00:00:00')",
+            DialectType::BigQuery,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect_err("strict ClickHouse transpile should reject an out-of-range timestamp");
+        assert!(out_of_range.to_string().contains("1900-2299"));
+
+        let dynamic_zone = transpile_with_level(
+            "SELECT TIMESTAMP(event_time, timezone_name) FROM events",
+            DialectType::BigQuery,
+            DialectType::ClickHouse,
+            UnsupportedLevel::Raise,
+        )
+        .expect_err("strict ClickHouse transpile should reject a dynamic time zone");
+        assert!(dynamic_zone.to_string().contains("non-constant time zone"));
+    }
+
+    #[test]
     fn transpile_options_deserialize_unsupported_level_from_json() {
         let opts: TranspileOptions =
             serde_json::from_str(r#"{"unsupportedLevel":"raise","maxUnsupported":2}"#)
@@ -1655,7 +2532,7 @@ mod tsql_fabric_regressions {
             ),
             (
                 "SELECT SUM(DISTINCT x ORDER BY x) FILTER (WHERE keep) FROM t",
-                "SELECT SUM(DISTINCT CASE WHEN keep THEN x END) FROM t",
+                "SELECT SUM(DISTINCT CASE WHEN keep <> 0 THEN x END) FROM t",
             ),
             (
                 "SELECT SUM(x) OVER (ORDER BY y) FROM t",
@@ -3217,6 +4094,36 @@ mod aggregate_functions {
                 dialect,
                 result
             );
+        }
+    }
+
+    #[test]
+    fn duckdb_quantile_aggregates_preserve_existing_target_lowerings() {
+        let cases = [
+            (
+                "SELECT QUANTILE(a, 0.5) FROM t",
+                DialectType::Spark,
+                "SELECT PERCENTILE(a, 0.5) FROM t",
+            ),
+            (
+                "SELECT QUANTILE_CONT(a, 0.5) FROM t",
+                DialectType::PostgreSQL,
+                "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a) FROM t",
+            ),
+            (
+                "SELECT QUANTILE_DISC(a, 0.5) FROM t",
+                DialectType::PostgreSQL,
+                "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY a) FROM t",
+            ),
+            (
+                "SELECT APPROX_QUANTILE(a, 0.5) FROM t",
+                DialectType::Snowflake,
+                "SELECT APPROX_PERCENTILE(a, 0.5) FROM t",
+            ),
+        ];
+
+        for (sql, target, expected) in cases {
+            assert_eq!(transpile(sql, DialectType::DuckDB, target), expected);
         }
     }
 
