@@ -813,3 +813,88 @@ fn test_snowflake_put_long_path_stage_uuid() {
         result.err()
     );
 }
+
+/// TO_NUMBER's default type is Snowflake's NUMBER(38,0); for the DataFusion
+/// target it must lower to DECIMAL(38,0) (so TO_NUMBER('3.5') rounds to 4),
+/// but only for a Snowflake source — Oracle/Teradata TO_NUMBER keep the
+/// fraction, and every other target keeps the historical DOUBLE lowering.
+#[test]
+fn to_number_decimal_only_for_snowflake_to_datafusion() {
+    let sf_df = transpile(
+        "SELECT TO_NUMBER('3.5') AS v",
+        DialectType::Snowflake,
+        DialectType::DataFusion,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        sf_df.contains("DECIMAL(38, 0)") || sf_df.contains("DECIMAL(38,0)"),
+        "snowflake->datafusion should cast to DECIMAL(38,0), got: {sf_df}"
+    );
+
+    // Snowflake -> non-DataFusion target keeps DOUBLE.
+    let sf_duck = transpile(
+        "SELECT TO_NUMBER('3.5') AS v",
+        DialectType::Snowflake,
+        DialectType::DuckDB,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        sf_duck.to_uppercase().contains("DOUBLE"),
+        "snowflake->duckdb should keep DOUBLE, got: {sf_duck}"
+    );
+
+    // Non-Snowflake source -> DataFusion keeps DOUBLE (no NUMBER(38,0) rounding).
+    let oracle_df = transpile(
+        "SELECT TO_NUMBER('3.5') AS v",
+        DialectType::Oracle,
+        DialectType::DataFusion,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        oracle_df.to_uppercase().contains("DOUBLE"),
+        "oracle->datafusion should keep DOUBLE, got: {oracle_df}"
+    );
+}
+
+/// The safe variant TRY_TO_NUMBER(x) must also lower for the DataFusion target —
+/// DataFusion has no TRY_TO_NUMBER function, so passing it through is a runtime
+/// error. It lowers to TRY_CAST(x AS DECIMAL(38,0)) for a Snowflake source
+/// (matching NUMBER(38,0)), TRY_CAST(x AS DOUBLE) otherwise. Native TO_NUMBER
+/// targets (Snowflake) keep it. Regression guard: the ToNumber dispatch
+/// previously normalized only the non-safe form, leaving TRY_TO_NUMBER intact.
+#[test]
+fn try_to_number_lowers_to_try_cast_for_datafusion() {
+    let sf_df = transpile(
+        "SELECT TRY_TO_NUMBER('x') AS v",
+        DialectType::Snowflake,
+        DialectType::DataFusion,
+    )
+    .unwrap()
+    .join(";\n");
+    let up = sf_df.to_uppercase();
+    assert!(
+        up.contains("TRY_CAST")
+            && (up.contains("DECIMAL(38, 0)") || up.contains("DECIMAL(38,0)")),
+        "snowflake->datafusion TRY_TO_NUMBER should be TRY_CAST(... AS DECIMAL(38,0)), got: {sf_df}"
+    );
+    assert!(
+        !up.contains("TRY_TO_NUMBER"),
+        "TRY_TO_NUMBER must not survive into DataFusion output, got: {sf_df}"
+    );
+
+    // Snowflake target keeps the native safe function.
+    let sf_sf = transpile(
+        "SELECT TRY_TO_NUMBER('x') AS v",
+        DialectType::Snowflake,
+        DialectType::Snowflake,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        sf_sf.to_uppercase().contains("TRY_TO_NUMBER"),
+        "snowflake->snowflake should keep TRY_TO_NUMBER, got: {sf_sf}"
+    );
+}

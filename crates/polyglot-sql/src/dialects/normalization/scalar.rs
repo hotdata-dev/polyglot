@@ -7610,6 +7610,31 @@ pub(super) fn rewrite(
                                         inferred_type: None,
                                     })))
                                 }
+                                DialectType::DataFusion
+                                    if source == DialectType::Snowflake
+                                        && f.name.eq_ignore_ascii_case("ARRAY_CONTAINS") =>
+                                {
+                                    // Snowflake ARRAY_CONTAINS(value, array) has the
+                                    // opposite arg order to DataFusion's
+                                    // array_contains(array, element). Swap, and drop a
+                                    // `value::VARIANT` cast (no VARIANT type in DataFusion).
+                                    let mut args = f.args;
+                                    let array = args.pop().unwrap();
+                                    let value = match args.pop().unwrap() {
+                                        Expression::Cast(c)
+                                            if matches!(&c.to,
+                                                crate::expressions::DataType::Custom { name }
+                                                if name.eq_ignore_ascii_case("VARIANT")) =>
+                                        {
+                                            (*c).this
+                                        }
+                                        other => other,
+                                    };
+                                    Ok(Expression::Function(Box::new(Function::new(
+                                        "array_contains".to_string(),
+                                        vec![array, value],
+                                    ))))
+                                }
                                 _ => Ok(Expression::Function(Box::new(Function::new(
                                     "ARRAY_CONTAINS".to_string(),
                                     f.args,
@@ -11135,20 +11160,45 @@ pub(super) fn rewrite(
                         _ => Ok(Expression::CombinedParameterizedAgg(cpa)),
                     }
                 } else if let Expression::ToNumber(tn) = e {
-                    // TO_NUMBER(x) with no format/precision/scale -> CAST(x AS DOUBLE)
+                    // TO_NUMBER(x) -> CAST(x AS <numeric>); TRY_TO_NUMBER(x) ->
+                    // TRY_CAST (safe form returns NULL on bad input instead of erroring).
+                    //
+                    // Snowflake's default TO_NUMBER type is NUMBER(38,0) — an integer,
+                    // so e.g. TO_NUMBER('3.5') = 4. Match that with DECIMAL(38,0) only
+                    // for `snowflake -> datafusion`: the rounding is a Snowflake *source*
+                    // semantic (Oracle/Teradata TO_NUMBER keep the fraction), and this
+                    // arm only runs for the no-precision/scale form (see the
+                    // GenericFunctionNormalize dispatch in normalization/mod.rs), so the
+                    // default (38,0) is the only case. Every other source/target pairing
+                    // keeps the historical DOUBLE lowering.
+                    let is_safe = tn.safe.is_some();
+                    let to =
+                        if source == DialectType::Snowflake && target == DialectType::DataFusion {
+                            crate::expressions::DataType::Decimal {
+                                precision: Some(38),
+                                scale: Some(0),
+                            }
+                        } else {
+                            crate::expressions::DataType::Double {
+                                precision: None,
+                                scale: None,
+                            }
+                        };
                     let arg = *tn.this;
-                    Ok(Expression::Cast(Box::new(crate::expressions::Cast {
+                    let cast = crate::expressions::Cast {
                         this: arg,
-                        to: crate::expressions::DataType::Double {
-                            precision: None,
-                            scale: None,
-                        },
+                        to,
                         double_colon_syntax: false,
                         trailing_comments: Vec::new(),
                         format: None,
                         default: None,
                         inferred_type: None,
-                    })))
+                    };
+                    if is_safe {
+                        Ok(Expression::TryCast(Box::new(cast)))
+                    } else {
+                        Ok(Expression::Cast(Box::new(cast)))
+                    }
                 } else {
                     Ok(e)
                 }

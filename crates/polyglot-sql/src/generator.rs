@@ -19095,6 +19095,7 @@ impl Generator {
                 | Some(DialectType::Athena)
                 | Some(DialectType::TSQL)
                 | Some(DialectType::Fabric)
+                | Some(DialectType::DataFusion)
         );
 
         if use_percent_operator {
@@ -19111,6 +19112,16 @@ impl Generator {
                         | Expression::ModFunc(_)
                 )
             };
+            // The generator inserts no precedence parens, so an infix `a % b`
+            // re-associates when this call is itself an operand of a same- or
+            // higher-precedence op (`2 * MOD(5, 3)` would become `2 * 5 % 3`).
+            // DataFusion has no MOD() fallback, so self-delimit the whole result
+            // there. The other dialects keep their established output (and can
+            // fall back to the function form), so they are left unchanged.
+            let wrap_result = matches!(self.config.dialect, Some(DialectType::DataFusion));
+            if wrap_result {
+                self.write("(");
+            }
             if needs_paren(&f.this) {
                 self.write("(");
                 self.generate_expression(&f.this)?;
@@ -19125,6 +19136,9 @@ impl Generator {
                 self.write(")");
             } else {
                 self.generate_expression(&f.expression)?;
+            }
+            if wrap_result {
+                self.write(")");
             }
             Ok(())
         } else {
@@ -25031,6 +25045,9 @@ impl Generator {
             Some(DialectType::PostgreSQL) => true,
             Some(DialectType::MySQL) => true,
             Some(DialectType::DuckDB) => true,
+            // DataFusion supports -> / ->> via the datafusion-functions-json
+            // extension.
+            Some(DialectType::DataFusion) => true,
             Some(DialectType::CockroachDB) => true,
             Some(DialectType::StarRocks) => true,
             Some(DialectType::SQLite) => true,
