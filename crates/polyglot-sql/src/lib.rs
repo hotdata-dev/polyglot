@@ -834,10 +834,10 @@ pub fn transpile_with_by_name(
 
 /// Transpile SQL **schema-aware**, using string dialect names: column types from
 /// `schema` are inferred onto the AST before the target transform, so
-/// type-dependent rewrites are disambiguated (e.g. `len(list_col)` ->
-/// `array_length` rather than the string `length`). See
-/// [`crate::schema::MappingSchema`] for building a schema. Requires the
-/// `semantic` feature (type inference).
+/// type-dependent rewrites apply to bare column references (e.g. PostgreSQL ->
+/// T-SQL `CAST(float_col AS INT)` gains the `ROUND(.., 0)` PostgreSQL semantics
+/// require). See [`crate::schema::MappingSchema`] for building a schema.
+/// Requires the `semantic` feature (type inference).
 #[cfg(all(feature = "transpile", feature = "semantic"))]
 pub fn transpile_with_schema_by_name(
     sql: &str,

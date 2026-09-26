@@ -3469,11 +3469,13 @@ impl Dialect {
         target.with_dialect(|td| self.transpile_inner(sql, td, &opts, None))
     }
 
-    /// Transpile with a schema for **type-aware disambiguation**. Column types
-    /// from `schema` are inferred onto the AST (via `annotate_types`) before the
-    /// target transform, so dialect rewrites can consult `inferred_type` — e.g.
-    /// `len(list_col)` lowers to `array_length` rather than the string `length`.
-    /// Requires the `semantic` feature (type inference lives there).
+    /// Transpile with a schema for **type-aware rewrites**. Column types from
+    /// `schema` are inferred onto the AST (via `annotate_types`) before the
+    /// target transform, so rewrites that depend on a column's type can fire on
+    /// bare column references, not only on literals and explicit casts. For
+    /// example, PostgreSQL -> T-SQL `CAST(float_col AS INT)` needs a `ROUND(.., 0)`
+    /// to keep PostgreSQL's rounding semantics, which is only known to apply when
+    /// `float_col` is a float. Requires the `semantic` feature.
     #[cfg(all(feature = "transpile", feature = "semantic"))]
     pub fn transpile_with_schema<T: TranspileTarget>(
         &self,
@@ -3540,8 +3542,8 @@ impl Dialect {
                 normalization::vertica::validate_conversion(&expr, self.dialect_type, target)?;
 
                 // Schema-aware transpilation: apply the optional annotation pass
-                // (type inference) so target rewrites can disambiguate
-                // type-dependent forms (e.g. `len(list_col)` -> `array_length`).
+                // (type inference) so type-dependent target rewrites see column
+                // types (e.g. the PostgreSQL float-to-integer CAST rounding).
                 let expr = if let Some(annotate) = annotate {
                     let mut e = expr;
                     annotate(&mut e);
