@@ -11135,20 +11135,44 @@ pub(super) fn rewrite(
                         _ => Ok(Expression::CombinedParameterizedAgg(cpa)),
                     }
                 } else if let Expression::ToNumber(tn) = e {
-                    // TO_NUMBER(x) with no format/precision/scale -> CAST(x AS DOUBLE)
-                    let arg = *tn.this;
-                    Ok(Expression::Cast(Box::new(crate::expressions::Cast {
-                        this: arg,
-                        to: crate::expressions::DataType::Double {
+                    // TO_NUMBER(x) -> CAST(x AS <numeric>); TRY_TO_NUMBER(x) ->
+                    // TRY_CAST (safe form returns NULL on bad input instead of erroring).
+                    //
+                    // Snowflake's default TO_NUMBER type is NUMBER(38,0) — an integer,
+                    // so e.g. TO_NUMBER('3.5') = 4. That rounding is a property of the
+                    // Snowflake *source*, so a Snowflake TO_NUMBER lowers to
+                    // DECIMAL(38,0) for every target; Oracle/Teradata TO_NUMBER keep the
+                    // fraction and stay on the DOUBLE lowering. This arm only runs for
+                    // the no-precision/scale form (see the GenericFunctionNormalize
+                    // dispatch in normalization/mod.rs), so the default (38,0) is the
+                    // only case.
+                    let is_safe = tn.safe.is_some();
+                    let to = if source == DialectType::Snowflake {
+                        crate::expressions::DataType::Decimal {
+                            precision: Some(38),
+                            scale: Some(0),
+                        }
+                    } else {
+                        crate::expressions::DataType::Double {
                             precision: None,
                             scale: None,
-                        },
+                        }
+                    };
+                    let arg = *tn.this;
+                    let cast = crate::expressions::Cast {
+                        this: arg,
+                        to,
                         double_colon_syntax: false,
                         trailing_comments: Vec::new(),
                         format: None,
                         default: None,
                         inferred_type: None,
-                    })))
+                    };
+                    if is_safe {
+                        Ok(Expression::TryCast(Box::new(cast)))
+                    } else {
+                        Ok(Expression::Cast(Box::new(cast)))
+                    }
                 } else {
                     Ok(e)
                 }
