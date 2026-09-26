@@ -813,3 +813,88 @@ fn test_snowflake_put_long_path_stage_uuid() {
         result.err()
     );
 }
+
+/// TO_NUMBER's default type is Snowflake's NUMBER(38,0), so TO_NUMBER('3.5')
+/// is 4. A Snowflake source lowers to DECIMAL(38,0) on every target; Oracle and
+/// Teradata TO_NUMBER keep the fraction and stay on the DOUBLE lowering.
+#[test]
+fn snowflake_to_number_rounds_to_decimal_38_0_on_every_target() {
+    let sf_df = transpile(
+        "SELECT TO_NUMBER('3.5') AS v",
+        DialectType::Snowflake,
+        DialectType::DataFusion,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        sf_df.contains("DECIMAL(38, 0)") || sf_df.contains("DECIMAL(38,0)"),
+        "snowflake->datafusion should cast to DECIMAL(38,0), got: {sf_df}"
+    );
+
+    // The same Snowflake source semantics hold for other targets.
+    for target in [DialectType::DuckDB, DialectType::PostgreSQL] {
+        let out = transpile(
+            "SELECT TO_NUMBER('3.5') AS v",
+            DialectType::Snowflake,
+            target,
+        )
+        .unwrap()
+        .join(";\n");
+        assert!(
+            out.contains("DECIMAL(38, 0)") || out.contains("DECIMAL(38,0)"),
+            "snowflake->{target:?} should cast to DECIMAL(38,0), got: {out}"
+        );
+    }
+
+    // Non-Snowflake source -> DataFusion keeps DOUBLE (no NUMBER(38,0) rounding).
+    let oracle_df = transpile(
+        "SELECT TO_NUMBER('3.5') AS v",
+        DialectType::Oracle,
+        DialectType::DataFusion,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        oracle_df.to_uppercase().contains("DOUBLE"),
+        "oracle->datafusion should keep DOUBLE, got: {oracle_df}"
+    );
+}
+
+/// The safe variant TRY_TO_NUMBER(x) exists only in Snowflake, so passing it
+/// through to any other target is a runtime error there. It lowers to
+/// TRY_CAST(x AS DECIMAL(38,0)) for a Snowflake source (matching NUMBER(38,0))
+/// and TRY_CAST(x AS DOUBLE) otherwise; a Snowflake target keeps it. Regression
+/// guard: the ToNumber dispatch previously normalized only the non-safe form.
+#[test]
+fn try_to_number_lowers_to_try_cast_outside_snowflake() {
+    let sf_df = transpile(
+        "SELECT TRY_TO_NUMBER('x') AS v",
+        DialectType::Snowflake,
+        DialectType::DataFusion,
+    )
+    .unwrap()
+    .join(";\n");
+    let up = sf_df.to_uppercase();
+    assert!(
+        up.contains("TRY_CAST")
+            && (up.contains("DECIMAL(38, 0)") || up.contains("DECIMAL(38,0)")),
+        "snowflake->datafusion TRY_TO_NUMBER should be TRY_CAST(... AS DECIMAL(38,0)), got: {sf_df}"
+    );
+    assert!(
+        !up.contains("TRY_TO_NUMBER"),
+        "TRY_TO_NUMBER must not survive into DataFusion output, got: {sf_df}"
+    );
+
+    // Snowflake target keeps the native safe function.
+    let sf_sf = transpile(
+        "SELECT TRY_TO_NUMBER('x') AS v",
+        DialectType::Snowflake,
+        DialectType::Snowflake,
+    )
+    .unwrap()
+    .join(";\n");
+    assert!(
+        sf_sf.to_uppercase().contains("TRY_TO_NUMBER"),
+        "snowflake->snowflake should keep TRY_TO_NUMBER, got: {sf_sf}"
+    );
+}

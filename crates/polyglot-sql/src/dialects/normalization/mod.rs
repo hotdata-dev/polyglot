@@ -2382,6 +2382,17 @@ pub(super) fn normalize(
                             | DialectType::Teradata => Action::None,
                             _ => Action::Scalar(scalar::Action::GenericFunctionNormalize),
                         }
+                    } else if tn.safe.is_some()
+                        && tn.format.is_none()
+                        && tn.precision.is_none()
+                        && tn.scale.is_none()
+                        && !matches!(target, DialectType::Snowflake)
+                    {
+                        // TRY_TO_NUMBER(x) single-arg: only Snowflake has the safe form,
+                        // so lower it like the non-safe form for every other target. The
+                        // scalar rewrite emits TRY_CAST(x AS DECIMAL(38,0)) for a Snowflake
+                        // source and TRY_CAST(x AS DOUBLE) otherwise.
+                        Action::Scalar(scalar::Action::GenericFunctionNormalize)
                     } else {
                         Action::None
                     }
