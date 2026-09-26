@@ -4439,7 +4439,28 @@ impl Dialect {
         target: T,
         opts: TranspileOptions,
     ) -> Result<Vec<String>> {
-        target.with_dialect(|td| self.transpile_inner(sql, td, &opts))
+        target.with_dialect(|td| self.transpile_inner(sql, td, &opts, None))
+    }
+
+    /// Transpile with a schema for **type-aware rewrites**. Column types from
+    /// `schema` are inferred onto the AST (via `annotate_types`) before the
+    /// target transform, so rewrites that depend on a column's type can fire on
+    /// bare column references, not only on literals and explicit casts. For
+    /// example, PostgreSQL -> T-SQL `CAST(float_col AS INT)` needs a `ROUND(.., 0)`
+    /// to keep PostgreSQL's rounding semantics, which is only known to apply when
+    /// `float_col` is a float. Requires the `semantic` feature.
+    #[cfg(all(feature = "transpile", feature = "semantic"))]
+    pub fn transpile_with_schema<T: TranspileTarget>(
+        &self,
+        sql: &str,
+        target: T,
+        opts: TranspileOptions,
+        schema: &dyn crate::schema::Schema,
+    ) -> Result<Vec<String>> {
+        let source = self.dialect_type;
+        let annotate =
+            |e: &mut Expression| crate::optimizer::annotate_types(e, Some(schema), Some(source));
+        target.with_dialect(|td| self.transpile_inner(sql, td, &opts, Some(&annotate)))
     }
 
     #[cfg(feature = "transpile")]
@@ -4448,6 +4469,10 @@ impl Dialect {
         sql: &str,
         target_dialect: &Dialect,
         opts: &TranspileOptions,
+        // Optional per-statement annotation applied before the target transform
+        // (used for schema-aware type inference). Kept as a closure so this
+        // signature does not reference the `semantic`-gated schema/optimizer types.
+        annotate: Option<&dyn Fn(&mut Expression)>,
     ) -> Result<Vec<String>> {
         let mut effective_opts = opts.clone();
         effective_opts.complexity_guard =
@@ -4488,6 +4513,17 @@ impl Dialect {
                 let expr =
                     normalization::vertica::prepare_conversion(expr, self.dialect_type, target)?;
                 normalization::vertica::validate_conversion(&expr, self.dialect_type, target)?;
+
+                // Schema-aware transpilation: apply the optional annotation pass
+                // (type inference) so type-dependent target rewrites see column
+                // types (e.g. the PostgreSQL float-to-integer CAST rounding).
+                let expr = if let Some(annotate) = annotate {
+                    let mut e = expr;
+                    annotate(&mut e);
+                    e
+                } else {
+                    expr
+                };
                 // DuckDB source: normalize VARCHAR/CHAR to TEXT (DuckDB doesn't support
                 // VARCHAR length constraints). This emulates Python sqlglot's DuckDB parser
                 // where VARCHAR_LENGTH = None and VARCHAR maps to TEXT.

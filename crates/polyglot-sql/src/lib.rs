@@ -832,6 +832,27 @@ pub fn transpile_with_by_name(
     read_dialect.transpile_with(sql, &write_dialect, opts.clone())
 }
 
+/// Transpile SQL **schema-aware**, using string dialect names: column types from
+/// `schema` are inferred onto the AST before the target transform, so
+/// type-dependent rewrites apply to bare column references (e.g. PostgreSQL ->
+/// T-SQL `CAST(float_col AS INT)` gains the `ROUND(.., 0)` PostgreSQL semantics
+/// require). See [`crate::schema::MappingSchema`] for building a schema.
+/// Requires the `semantic` feature (type inference).
+#[cfg(all(feature = "transpile", feature = "semantic"))]
+pub fn transpile_with_schema_by_name(
+    sql: &str,
+    read: &str,
+    write: &str,
+    schema: &dyn crate::schema::Schema,
+    opts: &TranspileOptions,
+) -> Result<Vec<String>> {
+    let read_dialect = Dialect::get_by_name(read)
+        .ok_or_else(|| Error::parse(format!("Unknown dialect: {}", read), 0, 0, 0, 0))?;
+    let write_dialect = Dialect::get_by_name(write)
+        .ok_or_else(|| Error::parse(format!("Unknown dialect: {}", write), 0, 0, 0, 0))?;
+    read_dialect.transpile_with_schema(sql, &write_dialect, opts.clone(), schema)
+}
+
 /// Parse SQL into an AST using a string dialect name.
 ///
 /// Supports both built-in and custom dialect names.
