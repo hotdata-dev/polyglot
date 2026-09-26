@@ -648,6 +648,49 @@ fn is_default_presto_date_format(fmt: &str) -> bool {
     fmt == "%Y-%m-%d" || fmt == "%F"
 }
 
+/// Whether `e` is a lone, unquoted, unqualified `ALL` — how DuckDB's
+/// `ORDER BY ALL` keyword is parsed (as a column/identifier/var, not a keyword).
+#[cfg(feature = "transpile")]
+fn is_order_by_all_marker(e: &Expression) -> bool {
+    match e {
+        Expression::Column(c) => {
+            c.table.is_none() && !c.name.quoted && c.name.name.eq_ignore_ascii_case("all")
+        }
+        Expression::Identifier(i) => !i.quoted && i.name.eq_ignore_ascii_case("all"),
+        Expression::Var(v) => v.this.eq_ignore_ascii_case("all"),
+        _ => false,
+    }
+}
+
+/// Expand DuckDB `ORDER BY ALL` into positional `ORDER BY 1..n` over the
+/// projection list (universally supported), preserving the sort direction.
+/// Left untouched when the projection has a star — the column count is unknown.
+#[cfg(feature = "transpile")]
+fn expand_duckdb_order_by_all(
+    mut sel: Box<crate::expressions::Select>,
+) -> Box<crate::expressions::Select> {
+    use crate::expressions::{Expression as E, Ordered};
+    let matches = sel.order_by.as_ref().is_some_and(|ob| {
+        ob.expressions.len() == 1 && is_order_by_all_marker(&ob.expressions[0].this)
+    });
+    let expandable =
+        !sel.expressions.is_empty() && !sel.expressions.iter().any(|e| matches!(e, E::Star(_)));
+    if matches && expandable {
+        let n = sel.expressions.len() as i64;
+        let ob = sel.order_by.as_mut().unwrap();
+        let (desc, nulls_first) = (ob.expressions[0].desc, ob.expressions[0].nulls_first);
+        ob.expressions = (1..=n)
+            .map(|i| {
+                let mut o = Ordered::asc(E::number(i));
+                o.desc = desc;
+                o.nulls_first = nulls_first;
+                o
+            })
+            .collect();
+    }
+    sel
+}
+
 /// Applies a dialect transform bottom-up through selected syntax children.
 ///
 /// The public entrypoint uses an explicit task stack for the recursion-heavy shapes
@@ -3541,6 +3584,11 @@ impl Dialect {
                             Ok(Expression::DataType(DT::Text))
                         }
                         Expression::DataType(DT::Char { .. }) => Ok(Expression::DataType(DT::Text)),
+                        // DuckDB `ORDER BY ALL` -> positional `ORDER BY 1..n` for
+                        // targets without native `ORDER BY ALL` support.
+                        Expression::Select(sel) if target != DialectType::DuckDB => {
+                            Ok(Expression::Select(expand_duckdb_order_by_all(sel)))
+                        }
                         _ => Ok(e),
                     })?
                 } else {
