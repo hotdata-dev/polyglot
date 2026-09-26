@@ -2301,6 +2301,22 @@ where
             Expression::ArrayPosition(f)
         }
 
+        // Single-child typed variants a dialect arm may restructure: descend into
+        // `this` so the child is fully transformed (and normalized) first — e.g.
+        // `array_size(array_construct(1,2,3))` needs its inner `array_construct`
+        // lowered to `[1,2,3]` before the outer node is rewritten. (`Dot` is
+        // deliberately not here: descending into it generically regresses
+        // qualified references and CAST-to-struct types on other targets, so a
+        // dialect arm that needs it descends explicitly.)
+        Expression::ArraySize(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::ArraySize(f)
+        }
+        Expression::LastDay(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::LastDay(f)
+        }
+
         // Pass through leaf nodes unchanged
         other => other,
     };
