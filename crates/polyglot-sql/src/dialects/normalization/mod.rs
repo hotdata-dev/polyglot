@@ -2196,9 +2196,11 @@ pub(super) fn normalize(
                             "TIMESTAMP_TRUNC" if f.args.len() >= 2
                                 && matches!(source, DialectType::Generic) => Action::Temporal(temporal::Action::TimestampTruncConvert),
                             "UNIFORM" if matches!(target, DialectType::Snowflake) => Action::Scalar(scalar::Action::GenericFunctionNormalize),
-                            // GENERATE_SERIES -> SEQUENCE/UNNEST/EXPLODE for target dialects
+                            // GENERATE_SERIES -> SEQUENCE/UNNEST/EXPLODE for target dialects.
+                            // DataFusion supports GENERATE_SERIES natively, so leave
+                            // it as-is (don't rename to the unsupported `sequence`).
                             "GENERATE_SERIES" if matches!(source, DialectType::PostgreSQL | DialectType::Redshift)
-                                && !matches!(target, DialectType::PostgreSQL | DialectType::Redshift | DialectType::TSQL | DialectType::Fabric) => Action::Collections(collections::Action::GenerateSeriesConvert),
+                                && !matches!(target, DialectType::PostgreSQL | DialectType::Redshift | DialectType::TSQL | DialectType::Fabric | DialectType::DataFusion) => Action::Collections(collections::Action::GenerateSeriesConvert),
                             // GENERATE_SERIES with interval normalization for PG target
                             "GENERATE_SERIES" if f.args.len() >= 3
                                 && matches!(source, DialectType::PostgreSQL | DialectType::Redshift)

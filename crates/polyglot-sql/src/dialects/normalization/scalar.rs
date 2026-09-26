@@ -7610,6 +7610,31 @@ pub(super) fn rewrite(
                                         inferred_type: None,
                                     })))
                                 }
+                                DialectType::DataFusion
+                                    if source == DialectType::Snowflake
+                                        && f.name.eq_ignore_ascii_case("ARRAY_CONTAINS") =>
+                                {
+                                    // Snowflake ARRAY_CONTAINS(value, array) has the
+                                    // opposite arg order to DataFusion's
+                                    // array_contains(array, element). Swap, and drop a
+                                    // `value::VARIANT` cast (no VARIANT type in DataFusion).
+                                    let mut args = f.args;
+                                    let array = args.pop().unwrap();
+                                    let value = match args.pop().unwrap() {
+                                        Expression::Cast(c)
+                                            if matches!(&c.to,
+                                                crate::expressions::DataType::Custom { name }
+                                                if name.eq_ignore_ascii_case("VARIANT")) =>
+                                        {
+                                            (*c).this
+                                        }
+                                        other => other,
+                                    };
+                                    Ok(Expression::Function(Box::new(Function::new(
+                                        "array_contains".to_string(),
+                                        vec![array, value],
+                                    ))))
+                                }
                                 _ => Ok(Expression::Function(Box::new(Function::new(
                                     "ARRAY_CONTAINS".to_string(),
                                     f.args,

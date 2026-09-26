@@ -25031,6 +25031,9 @@ impl Generator {
             Some(DialectType::PostgreSQL) => true,
             Some(DialectType::MySQL) => true,
             Some(DialectType::DuckDB) => true,
+            // DataFusion supports -> / ->> via the datafusion-functions-json
+            // extension.
+            Some(DialectType::DataFusion) => true,
             Some(DialectType::CockroachDB) => true,
             Some(DialectType::StarRocks) => true,
             Some(DialectType::SQLite) => true,
