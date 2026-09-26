@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- `MOD(a, b)` lowered to the infix `%` operator keeps the call's grouping
+  when it is an operand of another operator (`2 * MOD(5, 3)` is now
+  `2 * (5 % 3)`, not `2 * 5 % 3`). DataFusion, which has no `MOD` function,
+  renders `%` as well.
+
 ## [0.13.2] - 2026-10-08
 
 ### Changed
