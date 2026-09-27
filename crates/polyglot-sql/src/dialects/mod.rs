@@ -2301,6 +2301,927 @@ where
             Expression::ArrayPosition(f)
         }
 
+        // Single-child typed variants a dialect arm may restructure: descend into
+        // `this` so the child is fully transformed (and normalized) first — e.g.
+        // `array_size(array_construct(1,2,3))` needs its inner `array_construct`
+        // lowered to `[1,2,3]` before the outer node is rewritten. (`Dot` is
+        // deliberately not here: descending into it generically regresses
+        // qualified references and CAST-to-struct types on other targets, so a
+        // dialect arm that needs it descends explicitly.)
+        Expression::ArraySize(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::ArraySize(f)
+        }
+        Expression::LastDay(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::LastDay(f)
+        }
+
+        // Typed function nodes: descend into every child expression so the
+        // inner expressions are transformed for the target before a dialect arm
+        // sees the outer node. Generated from the *Func struct shapes; each arm
+        // lists the struct's Expression-typed fields.
+        Expression::RegexpLike(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.pattern = transform_recursive(f.pattern, transform_fn)?;
+            f.flags = f
+                .flags
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::RegexpLike(f)
+        }
+        Expression::RegexpReplace(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.pattern = transform_recursive(f.pattern, transform_fn)?;
+            f.replacement = transform_recursive(f.replacement, transform_fn)?;
+            f.flags = f
+                .flags
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::RegexpReplace(f)
+        }
+        Expression::RegexpExtract(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.pattern = transform_recursive(f.pattern, transform_fn)?;
+            f.group = f
+                .group
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::RegexpExtract(f)
+        }
+        Expression::Overlay(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.replacement = transform_recursive(f.replacement, transform_fn)?;
+            f.from = transform_recursive(f.from, transform_fn)?;
+            f.length = f
+                .length
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::Overlay(f)
+        }
+        Expression::Round(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.decimals = f
+                .decimals
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::Round(f)
+        }
+        Expression::Greatest(mut f) => {
+            f.expressions = f
+                .expressions
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::Greatest(f)
+        }
+        Expression::Least(mut f) => {
+            f.expressions = f
+                .expressions
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::Least(f)
+        }
+        Expression::ToDate(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.format = f
+                .format
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::ToDate(f)
+        }
+        Expression::ToTimestamp(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.format = f
+                .format
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::ToTimestamp(f)
+        }
+        Expression::Time(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Time(f)
+        }
+        Expression::DateFromUnixDate(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::DateFromUnixDate(f)
+        }
+        Expression::UnixDate(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::UnixDate(f)
+        }
+        Expression::UnixSeconds(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::UnixSeconds(f)
+        }
+        Expression::UnixMillis(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::UnixMillis(f)
+        }
+        Expression::UnixMicros(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::UnixMicros(f)
+        }
+        Expression::UnixToTimeStr(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::UnixToTimeStr(f)
+        }
+        Expression::TimeStrToDate(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::TimeStrToDate(f)
+        }
+        Expression::DateToDi(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::DateToDi(f)
+        }
+        Expression::DiToDate(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::DiToDate(f)
+        }
+        Expression::TsOrDiToDi(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::TsOrDiToDi(f)
+        }
+        Expression::TsOrDsToDatetime(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::TsOrDsToDatetime(f)
+        }
+        Expression::TsOrDsToTimestamp(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::TsOrDsToTimestamp(f)
+        }
+        Expression::YearOfWeek(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::YearOfWeek(f)
+        }
+        Expression::YearOfWeekIso(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::YearOfWeekIso(f)
+        }
+        Expression::NullIf(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::NullIf(f)
+        }
+        Expression::Nvl2(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.true_value = transform_recursive(f.true_value, transform_fn)?;
+            f.false_value = transform_recursive(f.false_value, transform_fn)?;
+            Expression::Nvl2(f)
+        }
+        Expression::SumIf(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.condition = transform_recursive(f.condition, transform_fn)?;
+            f.filter = f
+                .filter
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::SumIf(f)
+        }
+        Expression::ApproxPercentile(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.percentile = transform_recursive(f.percentile, transform_fn)?;
+            f.accuracy = f
+                .accuracy
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            f.filter = f
+                .filter
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::ApproxPercentile(f)
+        }
+        Expression::Percentile(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.percentile = transform_recursive(f.percentile, transform_fn)?;
+            f.filter = f
+                .filter
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::Percentile(f)
+        }
+        Expression::BitwiseCount(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::BitwiseCount(f)
+        }
+        Expression::NTile(mut f) => {
+            f.num_buckets = f
+                .num_buckets
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::NTile(f)
+        }
+        Expression::Lead(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.offset = f
+                .offset
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            f.default = f
+                .default
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::Lead(f)
+        }
+        Expression::Lag(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.offset = f
+                .offset
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            f.default = f
+                .default
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::Lag(f)
+        }
+        Expression::FirstValue(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::FirstValue(f)
+        }
+        Expression::LastValue(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::LastValue(f)
+        }
+        Expression::NthValue(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.offset = transform_recursive(f.offset, transform_fn)?;
+            Expression::NthValue(f)
+        }
+        Expression::PercentileCont(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.percentile = transform_recursive(f.percentile, transform_fn)?;
+            f.filter = f
+                .filter
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::PercentileCont(f)
+        }
+        Expression::PercentileDisc(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.percentile = transform_recursive(f.percentile, transform_fn)?;
+            f.filter = f
+                .filter
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::PercentileDisc(f)
+        }
+        Expression::Contains(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::Contains(f)
+        }
+        Expression::StartsWith(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::StartsWith(f)
+        }
+        Expression::EndsWith(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::EndsWith(f)
+        }
+        Expression::Position(mut f) => {
+            f.substring = transform_recursive(f.substring, transform_fn)?;
+            f.string = transform_recursive(f.string, transform_fn)?;
+            f.start = f
+                .start
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::Position(f)
+        }
+        Expression::Initcap(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Initcap(f)
+        }
+        Expression::Ascii(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Ascii(f)
+        }
+        Expression::Chr(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Chr(f)
+        }
+        Expression::CharFunc(mut f) => {
+            f.args = f
+                .args
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::CharFunc(f)
+        }
+        Expression::Soundex(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Soundex(f)
+        }
+        Expression::Levenshtein(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::Levenshtein(f)
+        }
+        Expression::ByteLength(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::ByteLength(f)
+        }
+        Expression::Hex(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Hex(f)
+        }
+        Expression::LowerHex(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::LowerHex(f)
+        }
+        Expression::Unicode(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Unicode(f)
+        }
+        Expression::TruncFunc(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.decimals = f
+                .decimals
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::TruncFunc(f)
+        }
+        Expression::Radians(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Radians(f)
+        }
+        Expression::Degrees(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Degrees(f)
+        }
+        Expression::Sin(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Sin(f)
+        }
+        Expression::Cos(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Cos(f)
+        }
+        Expression::Tan(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Tan(f)
+        }
+        Expression::Asin(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Asin(f)
+        }
+        Expression::Acos(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Acos(f)
+        }
+        Expression::Atan(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Atan(f)
+        }
+        Expression::Atan2(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::Atan2(f)
+        }
+        Expression::IsNan(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::IsNan(f)
+        }
+        Expression::IsInf(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::IsInf(f)
+        }
+        Expression::IntDiv(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::IntDiv(f)
+        }
+        Expression::DateFormat(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.format = transform_recursive(f.format, transform_fn)?;
+            Expression::DateFormat(f)
+        }
+        Expression::FormatDate(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.format = transform_recursive(f.format, transform_fn)?;
+            Expression::FormatDate(f)
+        }
+        Expression::Year(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Year(f)
+        }
+        Expression::Month(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Month(f)
+        }
+        Expression::Day(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Day(f)
+        }
+        Expression::Hour(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Hour(f)
+        }
+        Expression::Minute(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Minute(f)
+        }
+        Expression::Second(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Second(f)
+        }
+        Expression::DayOfWeek(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::DayOfWeek(f)
+        }
+        Expression::DayOfWeekIso(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::DayOfWeekIso(f)
+        }
+        Expression::DayOfMonth(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::DayOfMonth(f)
+        }
+        Expression::DayOfYear(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::DayOfYear(f)
+        }
+        Expression::WeekOfYear(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::WeekOfYear(f)
+        }
+        Expression::Quarter(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Quarter(f)
+        }
+        Expression::AddMonths(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::AddMonths(f)
+        }
+        Expression::MonthsBetween(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::MonthsBetween(f)
+        }
+        Expression::NextDay(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::NextDay(f)
+        }
+        Expression::Epoch(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Epoch(f)
+        }
+        Expression::EpochMs(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::EpochMs(f)
+        }
+        Expression::FromUnixtime(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.format = f
+                .format
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::FromUnixtime(f)
+        }
+        Expression::UnixTimestamp(mut f) => {
+            f.this = f
+                .this
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            f.format = f
+                .format
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::UnixTimestamp(f)
+        }
+        Expression::MakeDate(mut f) => {
+            f.year = transform_recursive(f.year, transform_fn)?;
+            f.month = transform_recursive(f.month, transform_fn)?;
+            f.day = transform_recursive(f.day, transform_fn)?;
+            Expression::MakeDate(f)
+        }
+        Expression::MakeTimestamp(mut f) => {
+            f.year = transform_recursive(f.year, transform_fn)?;
+            f.month = transform_recursive(f.month, transform_fn)?;
+            f.day = transform_recursive(f.day, transform_fn)?;
+            f.hour = transform_recursive(f.hour, transform_fn)?;
+            f.minute = transform_recursive(f.minute, transform_fn)?;
+            f.second = transform_recursive(f.second, transform_fn)?;
+            f.timezone = f
+                .timezone
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::MakeTimestamp(f)
+        }
+        Expression::TimestampTrunc(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::TimestampTrunc(f)
+        }
+        Expression::TimeStrToUnix(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::TimeStrToUnix(f)
+        }
+        Expression::SHA(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::SHA(f)
+        }
+        Expression::SHA1Digest(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::SHA1Digest(f)
+        }
+        Expression::TimeToUnix(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::TimeToUnix(f)
+        }
+        Expression::ArrayLength(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::ArrayLength(f)
+        }
+        Expression::Cardinality(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Cardinality(f)
+        }
+        Expression::ArrayAppend(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::ArrayAppend(f)
+        }
+        Expression::ArrayPrepend(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::ArrayPrepend(f)
+        }
+        Expression::ArrayConcat(mut f) => {
+            f.expressions = f
+                .expressions
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::ArrayConcat(f)
+        }
+        Expression::ArraySort(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.comparator = f
+                .comparator
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::ArraySort(f)
+        }
+        Expression::ArrayReverse(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::ArrayReverse(f)
+        }
+        Expression::ArrayJoin(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.separator = transform_recursive(f.separator, transform_fn)?;
+            f.null_replacement = f
+                .null_replacement
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::ArrayJoin(f)
+        }
+        Expression::ArrayToString(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.separator = transform_recursive(f.separator, transform_fn)?;
+            f.null_replacement = f
+                .null_replacement
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::ArrayToString(f)
+        }
+        Expression::ExplodeOuter(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::ExplodeOuter(f)
+        }
+        Expression::ArrayFilter(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.filter = transform_recursive(f.filter, transform_fn)?;
+            Expression::ArrayFilter(f)
+        }
+        Expression::ArrayTransform(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.transform = transform_recursive(f.transform, transform_fn)?;
+            Expression::ArrayTransform(f)
+        }
+        Expression::ArrayFlatten(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::ArrayFlatten(f)
+        }
+        Expression::ArrayCompact(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::ArrayCompact(f)
+        }
+        Expression::ArrayIntersect(mut f) => {
+            f.expressions = f
+                .expressions
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::ArrayIntersect(f)
+        }
+        Expression::ArrayUnion(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::ArrayUnion(f)
+        }
+        Expression::ArrayRemove(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::ArrayRemove(f)
+        }
+        Expression::ArrayZip(mut f) => {
+            f.expressions = f
+                .expressions
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::ArrayZip(f)
+        }
+        Expression::Sequence(mut f) => {
+            f.start = transform_recursive(f.start, transform_fn)?;
+            f.stop = transform_recursive(f.stop, transform_fn)?;
+            f.step = f
+                .step
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::Sequence(f)
+        }
+        Expression::Generate(mut f) => {
+            f.start = transform_recursive(f.start, transform_fn)?;
+            f.stop = transform_recursive(f.stop, transform_fn)?;
+            f.step = f
+                .step
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::Generate(f)
+        }
+        Expression::ExplodingGenerateSeries(mut f) => {
+            f.start = transform_recursive(f.start, transform_fn)?;
+            f.stop = transform_recursive(f.stop, transform_fn)?;
+            f.step = f
+                .step
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::ExplodingGenerateSeries(f)
+        }
+        Expression::ToArray(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::ToArray(f)
+        }
+        Expression::StarMap(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::StarMap(f)
+        }
+        Expression::StructExtract(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::StructExtract(f)
+        }
+        Expression::MapFromEntries(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::MapFromEntries(f)
+        }
+        Expression::MapKeys(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::MapKeys(f)
+        }
+        Expression::MapValues(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::MapValues(f)
+        }
+        Expression::MapConcat(mut f) => {
+            f.expressions = f
+                .expressions
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::MapConcat(f)
+        }
+        Expression::TransformKeys(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.transform = transform_recursive(f.transform, transform_fn)?;
+            Expression::TransformKeys(f)
+        }
+        Expression::TransformValues(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.transform = transform_recursive(f.transform, transform_fn)?;
+            Expression::TransformValues(f)
+        }
+        Expression::JsonExtractPath(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.paths = f
+                .paths
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::JsonExtractPath(f)
+        }
+        Expression::JsonArray(mut f) => {
+            f.expressions = f
+                .expressions
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::JsonArray(f)
+        }
+        Expression::JsonQuery(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.path = transform_recursive(f.path, transform_fn)?;
+            Expression::JsonQuery(f)
+        }
+        Expression::JsonValue(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.path = transform_recursive(f.path, transform_fn)?;
+            Expression::JsonValue(f)
+        }
+        Expression::JsonArrayLength(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::JsonArrayLength(f)
+        }
+        Expression::JsonKeys(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::JsonKeys(f)
+        }
+        Expression::JsonType(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::JsonType(f)
+        }
+        Expression::JsonRemove(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.paths = f
+                .paths
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::JsonRemove(f)
+        }
+        Expression::JsonMergePatch(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::JsonMergePatch(f)
+        }
+        Expression::JsonArrayAgg(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.filter = f
+                .filter
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::JsonArrayAgg(f)
+        }
+        Expression::JsonObjectAgg(mut f) => {
+            f.key = transform_recursive(f.key, transform_fn)?;
+            f.value = transform_recursive(f.value, transform_fn)?;
+            f.filter = f
+                .filter
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::JsonObjectAgg(f)
+        }
+        Expression::Convert(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.style = f
+                .style
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::Convert(f)
+        }
+        Expression::Typeof(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Typeof(f)
+        }
+        Expression::AnonymousAggFunc(mut f) => {
+            f.this = Box::new(transform_recursive(*f.this, transform_fn)?);
+            f.expressions = f
+                .expressions
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::AnonymousAggFunc(f)
+        }
+        Expression::CombinedAggFunc(mut f) => {
+            f.this = Box::new(transform_recursive(*f.this, transform_fn)?);
+            f.expressions = f
+                .expressions
+                .into_iter()
+                .map(|e| transform_recursive(e, transform_fn))
+                .collect::<Result<Vec<_>>>()?;
+            Expression::CombinedAggFunc(f)
+        }
+        Expression::Int64(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::Int64(f)
+        }
+        Expression::StringFunc(mut f) => {
+            f.this = Box::new(transform_recursive(*f.this, transform_fn)?);
+            f.zone = f
+                .zone
+                .map(|e| transform_recursive(*e, transform_fn).map(Box::new))
+                .transpose()?;
+            Expression::StringFunc(f)
+        }
+        Expression::Timestamp(mut f) => {
+            f.this = f
+                .this
+                .map(|e| transform_recursive(*e, transform_fn).map(Box::new))
+                .transpose()?;
+            f.zone = f
+                .zone
+                .map(|e| transform_recursive(*e, transform_fn).map(Box::new))
+                .transpose()?;
+            Expression::Timestamp(f)
+        }
+        Expression::JSONBContains(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::JSONBContains(f)
+        }
+        Expression::JSONBExtract(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.expression = transform_recursive(f.expression, transform_fn)?;
+            Expression::JSONBExtract(f)
+        }
+        Expression::JSONBool(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::JSONBool(f)
+        }
+        Expression::MD5NumberLower64(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::MD5NumberLower64(f)
+        }
+        Expression::MD5NumberUpper64(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::MD5NumberUpper64(f)
+        }
+        Expression::DateStrToDate(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::DateStrToDate(f)
+        }
+        Expression::DateToDateStr(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            Expression::DateToDateStr(f)
+        }
+
+        Expression::Decode(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.search_results = f
+                .search_results
+                .into_iter()
+                .map(|(a, b)| {
+                    Ok((
+                        transform_recursive(a, transform_fn)?,
+                        transform_recursive(b, transform_fn)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            f.default = f
+                .default
+                .map(|e| transform_recursive(e, transform_fn))
+                .transpose()?;
+            Expression::Decode(f)
+        }
+        Expression::NamedStruct(mut f) => {
+            f.pairs = f
+                .pairs
+                .into_iter()
+                .map(|(a, b)| {
+                    Ok((
+                        transform_recursive(a, transform_fn)?,
+                        transform_recursive(b, transform_fn)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Expression::NamedStruct(f)
+        }
+        Expression::JsonSet(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.path_values = f
+                .path_values
+                .into_iter()
+                .map(|(a, b)| {
+                    Ok((
+                        transform_recursive(a, transform_fn)?,
+                        transform_recursive(b, transform_fn)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Expression::JsonSet(f)
+        }
+        Expression::JsonInsert(mut f) => {
+            f.this = transform_recursive(f.this, transform_fn)?;
+            f.path_values = f
+                .path_values
+                .into_iter()
+                .map(|(a, b)| {
+                    Ok((
+                        transform_recursive(a, transform_fn)?,
+                        transform_recursive(b, transform_fn)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Expression::JsonInsert(f)
+        }
+
         // Pass through leaf nodes unchanged
         other => other,
     };
