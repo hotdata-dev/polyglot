@@ -5753,3 +5753,192 @@ mod hana_regressions {
         }
     }
 }
+
+mod oracle_row_limit_regressions {
+    use super::*;
+    use DialectType::*;
+
+    #[test]
+    fn postgres_limits_render_as_fetch_first_in_nested_queries() {
+        let cases = [
+            (
+                "SELECT a FROM t LIMIT 5",
+                "SELECT a FROM t FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10",
+                "SELECT a FROM t ORDER BY a OFFSET 10 ROWS FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT a FROM t OFFSET 10",
+                "SELECT a FROM t OFFSET 10 ROWS",
+            ),
+            ("SELECT a FROM t LIMIT ALL", "SELECT a FROM t"),
+            ("SELECT a FROM t LIMIT NULL", "SELECT a FROM t"),
+            (
+                "SELECT * FROM (SELECT a FROM t LIMIT 5) AS s",
+                "SELECT * FROM (SELECT a FROM t FETCH FIRST 5 ROWS ONLY) s",
+            ),
+            (
+                "SELECT a FROM t WHERE a IN (SELECT b FROM u LIMIT 3)",
+                "SELECT a FROM t WHERE a IN (SELECT b FROM u FETCH FIRST 3 ROWS ONLY)",
+            ),
+            (
+                "WITH c AS (SELECT a FROM t LIMIT 2) SELECT * FROM c",
+                "WITH c AS (SELECT a FROM t FETCH FIRST 2 ROWS ONLY) SELECT * FROM c",
+            ),
+            (
+                "INSERT INTO x SELECT a FROM t LIMIT 5",
+                "INSERT INTO x SELECT a FROM t FETCH FIRST 5 ROWS ONLY",
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(transpile(sql, PostgreSQL, Oracle), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn set_operation_limits_apply_to_the_whole_set_operation() {
+        let cases = [
+            (
+                "SELECT a FROM t UNION ALL SELECT b FROM u LIMIT 5",
+                "SELECT a FROM t UNION ALL SELECT b FROM u FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY 1 LIMIT 5 OFFSET 2",
+                "SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY 1 OFFSET 2 ROWS FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT a FROM t INTERSECT SELECT b FROM u LIMIT 5",
+                "SELECT a FROM t INTERSECT SELECT b FROM u FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT a FROM t EXCEPT SELECT b FROM u LIMIT 5",
+                "SELECT a FROM t MINUS SELECT b FROM u FETCH FIRST 5 ROWS ONLY",
+            ),
+            // Parenthesized branch limits stay on their branch.
+            (
+                "(SELECT a FROM t LIMIT 5) UNION ALL SELECT a FROM u ORDER BY 1 LIMIT 3",
+                "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) UNION ALL SELECT a FROM u ORDER BY 1 FETCH FIRST 3 ROWS ONLY",
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(transpile(sql, PostgreSQL, Oracle), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn tsql_top_maps_to_fetch_first() {
+        let cases = [
+            (
+                "SELECT TOP 5 a FROM t",
+                "SELECT a FROM t FETCH FIRST 5 ROWS ONLY",
+            ),
+            (
+                "SELECT TOP 10 PERCENT a FROM t",
+                "SELECT a FROM t FETCH FIRST 10 PERCENT ROWS ONLY",
+            ),
+            (
+                "SELECT TOP 5 WITH TIES a FROM t ORDER BY a",
+                "SELECT a FROM t ORDER BY a NULLS FIRST FETCH FIRST 5 ROWS WITH TIES",
+            ),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(transpile(sql, TSQL, Oracle), expected, "{sql}");
+        }
+    }
+
+    /// `SELECT TOP n` limits only its own branch; the converted trailing limit must not
+    /// bind to the whole set operation.
+    #[test]
+    fn tsql_top_in_set_operation_branch_stays_branch_local() {
+        let cases = [
+            (
+                "SELECT a FROM t UNION ALL SELECT TOP 5 a FROM u",
+                "SELECT a FROM t UNION ALL (SELECT a FROM u FETCH FIRST 5 ROWS ONLY)",
+                "SELECT a FROM t UNION ALL (SELECT a FROM u LIMIT 5)",
+            ),
+            (
+                "SELECT TOP 5 a FROM t UNION ALL SELECT a FROM u",
+                "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) UNION ALL SELECT a FROM u",
+                "(SELECT a FROM t LIMIT 5) UNION ALL SELECT a FROM u",
+            ),
+            (
+                "SELECT TOP 5 a FROM t INTERSECT SELECT TOP 2 a FROM u",
+                "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) INTERSECT (SELECT a FROM u FETCH FIRST 2 ROWS ONLY)",
+                "(SELECT a FROM t LIMIT 5) INTERSECT (SELECT a FROM u LIMIT 2)",
+            ),
+            (
+                "SELECT TOP 5 a FROM t EXCEPT SELECT a FROM u ORDER BY a",
+                "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) MINUS SELECT a FROM u ORDER BY a NULLS FIRST",
+                "(SELECT a FROM t LIMIT 5) EXCEPT SELECT a FROM u ORDER BY a NULLS FIRST",
+            ),
+        ];
+        for (sql, oracle, duckdb) in cases {
+            assert_eq!(transpile(sql, TSQL, Oracle), oracle, "{sql}");
+            assert_eq!(transpile(sql, TSQL, DuckDB), duckdb, "{sql}");
+            assert_eq!(transpile(sql, TSQL, TSQL), sql, "{sql}");
+        }
+        // SQLite rejects parenthesized compound operands; use a derived table instead.
+        assert_eq!(
+            transpile(
+                "SELECT a FROM t UNION ALL SELECT TOP 5 a FROM u",
+                TSQL,
+                SQLite
+            ),
+            "SELECT a FROM t UNION ALL SELECT * FROM (SELECT a FROM u LIMIT 5)"
+        );
+    }
+
+    /// A comment between an operand and the set operator wraps the operand in
+    /// `Annotated`; its branch limit must still be grouped, with the comment kept
+    /// outside the parentheses.
+    #[test]
+    fn commented_tsql_top_set_operand_stays_branch_local() {
+        for op in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            for comment in ["/* branch note */", "-- branch note"] {
+                let sql = format!("SELECT TOP 5 a FROM t\n{comment}\n{op} SELECT a FROM u");
+                assert_eq!(
+                    transpile(&sql, TSQL, DuckDB),
+                    format!("(SELECT a FROM t LIMIT 5) /* branch note */ {op} SELECT a FROM u"),
+                    "{sql}"
+                );
+                assert_eq!(
+                    transpile(&sql, TSQL, SQLite),
+                    format!("SELECT * FROM (SELECT a FROM t LIMIT 5) /* branch note */ {op} SELECT a FROM u"),
+                    "{sql}"
+                );
+                assert_eq!(
+                    transpile(&sql, TSQL, Oracle),
+                    format!(
+                        "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) /* branch note */ {} SELECT a FROM u",
+                        if op == "EXCEPT" { "MINUS" } else { op }
+                    ),
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_fetch_identity_is_preserved() {
+        for sql in [
+            "SELECT a FROM t FETCH FIRST 5 ROWS ONLY",
+            "SELECT a FROM t OFFSET 1 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT a FROM t ORDER BY a FETCH FIRST 5 ROWS WITH TIES",
+        ] {
+            assert_eq!(transpile(sql, Oracle, Oracle), sql);
+        }
+    }
+
+    #[test]
+    fn limit_dialects_still_emit_limit() {
+        for target in [PostgreSQL, DuckDB, MySQL] {
+            assert_eq!(
+                transpile("SELECT a FROM t LIMIT 5 OFFSET 2", Generic, target),
+                "SELECT a FROM t LIMIT 5 OFFSET 2",
+                "{target:?}"
+            );
+        }
+    }
+}

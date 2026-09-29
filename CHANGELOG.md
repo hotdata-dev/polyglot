@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- Oracle: `LIMIT` is now rendered as `[OFFSET n ROWS] FETCH FIRST m ROWS ONLY`
+  by the generator itself, driven by `GeneratorConfig::limit_fetch_style`
+  (Oracle now defaults to `LimitFetchStyle::FetchFirst`). This covers ASTs built
+  with the builder or generated without `transpile`, as well as subqueries, CTEs,
+  `INSERT ... SELECT`, and set operations that previously kept `LIMIT`.
+  `LIMIT ALL` / `LIMIT NULL` are dropped instead of becoming `FETCH FIRST ALL`,
+  and T-SQL `TOP n [PERCENT] [WITH TIES]` maps to the equivalent `FETCH FIRST`.
+  T-SQL's `limit_fetch_style` is now `Top`, matching its existing output.
+  An explicit `FetchFirst` config takes precedence over dialect-specific
+  LIMIT/OFFSET rendering (e.g. Presto/Trino `OFFSET n LIMIT m`), except on
+  T-SQL/Fabric, which keep their TOP / `OFFSET ... FETCH NEXT` output.
+  ([#480](https://github.com/tobilg/polyglot/issues/480))
+- Set operations: a branch-local row limit that renders as a trailing clause
+  (e.g. T-SQL `SELECT TOP 5 ...` in a `UNION` branch transpiled to `LIMIT` or
+  `FETCH FIRST`) is now parenthesized, so it no longer limits the whole set
+  operation. SQLite, which rejects parenthesized operands, gets
+  `SELECT * FROM (...)` instead. Operands wrapped in comments (e.g. a comment
+  before `UNION ALL`) are grouped the same way, with the comment kept outside
+  the parentheses.
+
 ## [0.13.0] - 2026-09-24
 
 ### Added
