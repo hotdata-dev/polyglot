@@ -4,9 +4,17 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [Unreleased]
+## [0.13.1] - 2026-09-30
 
 ### Fixed
+
+- Compound queries now attach trailing `FETCH FIRST/NEXT` to the complete
+  `UNION`, `INTERSECT`, or `EXCEPT` result and preserve `PERCENT`, `WITH TIES`,
+  offsets, and branch-local limits through parsing and generation. Percentage
+  limits also survive set-operation wrapping for T-SQL. Existing bare-count
+  AST fields and JSON remain unchanged; metadata-bearing compound limits use
+  the existing `Limit` and `Fetch` expression variants. Unsupported percentage
+  and ties conversions are reported through the configured unsupported policy.
 
 - Oracle: `LIMIT` is now rendered as `[OFFSET n ROWS] FETCH FIRST m ROWS ONLY`
   by the generator itself, driven by `GeneratorConfig::limit_fetch_style`

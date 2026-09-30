@@ -4922,11 +4922,7 @@ impl Generator {
                 }
                 outer.with = $set.with.take();
                 outer.order_by = $set.order_by.take();
-                outer.limit = $set.limit.take().map(|l| Limit {
-                    this: *l,
-                    percent: false,
-                    comments: Vec::new(),
-                });
+                (outer.limit, outer.fetch) = split_set_limit($set.limit.take());
                 outer.offset = $set.offset.take().map(|o| Offset {
                     this: *o,
                     rows: None,
@@ -5156,6 +5152,35 @@ impl Generator {
 
         // For SQL Server, convert LIMIT to TOP (structural transformation)
         // But only when there's no OFFSET (otherwise use OFFSET/FETCH syntax)
+        let tsql_like = matches!(
+            self.config.dialect,
+            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+        );
+        let fetch_as_top = tsql_like
+            && select.offset.is_none()
+            && select
+                .fetch
+                .as_ref()
+                .is_some_and(|fetch| fetch.percent || fetch.with_ties);
+        if fetch_as_top
+            && select.order_by.is_none()
+            && select.fetch.as_ref().is_some_and(|fetch| fetch.with_ties)
+        {
+            self.unsupported("T-SQL TOP WITH TIES requires ORDER BY")?;
+        }
+        if let Some(limit) = &select.limit {
+            self.check_limit_percent(limit.percent)?;
+        }
+        if tsql_like
+            && select.offset.is_some()
+            && (select.limit.as_ref().is_some_and(|limit| limit.percent)
+                || select
+                    .fetch
+                    .as_ref()
+                    .is_some_and(|fetch| fetch.percent || fetch.with_ties))
+        {
+            self.unsupported("T-SQL OFFSET/FETCH cannot preserve PERCENT or WITH TIES")?;
+        }
         // TOP clause (SQL Server style - before DISTINCT)
         let use_top_from_limit = matches!(
             self.config.dialect,
@@ -5211,6 +5236,17 @@ impl Generator {
                     self.write_space();
                     self.write_keyword("WITH TIES");
                 }
+            } else if fetch_as_top {
+                let fetch = select.fetch.as_ref().unwrap();
+                self.write_keyword(" TOP (");
+                self.write_fetch_count(fetch)?;
+                self.write(")");
+                if fetch.percent {
+                    self.write_keyword(" PERCENT");
+                }
+                if fetch.with_ties {
+                    self.write_keyword(" WITH TIES");
+                }
             } else if use_top_from_limit {
                 // Convert LIMIT to TOP for SQL Server (only when no OFFSET)
                 if let Some(limit) = &select.limit {
@@ -5225,6 +5261,13 @@ impl Generator {
                         self.write(" (");
                         self.generate_expression(&limit.this)?;
                         self.write(")");
+                    }
+                    if limit.percent {
+                        self.write_keyword(" PERCENT");
+                    }
+                    for comment in &limit.comments {
+                        self.write(" ");
+                        self.write_formatted_comment(comment);
                     }
                 }
             }
@@ -5709,6 +5752,7 @@ impl Generator {
         // TSQL: FETCH requires ORDER BY. If there's a FETCH but no ORDER BY, add ORDER BY (SELECT NULL) OFFSET 0 ROWS
         if select.order_by.is_none()
             && select.fetch.is_some()
+            && !fetch_as_top
             && matches!(
                 self.config.dialect,
                 Some(DialectType::TSQL) | Some(DialectType::Fabric)
@@ -5771,26 +5815,10 @@ impl Generator {
             }
         } else {
             // Check if FETCH will be converted to LIMIT (used for ordering)
-            let fetch_as_limit = select.fetch.as_ref().map_or(false, |fetch| {
-                !fetch.percent
-                    && !fetch.with_ties
-                    && fetch.count.is_some()
-                    && matches!(
-                        self.config.dialect,
-                        Some(DialectType::Spark)
-                            | Some(DialectType::Hive)
-                            | Some(DialectType::DuckDB)
-                            | Some(DialectType::SQLite)
-                            | Some(DialectType::MySQL)
-                            | Some(DialectType::BigQuery)
-                            | Some(DialectType::Databricks)
-                            | Some(DialectType::StarRocks)
-                            | Some(DialectType::Doris)
-                            | Some(DialectType::Athena)
-                            | Some(DialectType::ClickHouse)
-                            | Some(DialectType::Redshift)
-                    )
-            });
+            let fetch_as_limit = select
+                .fetch
+                .as_ref()
+                .is_some_and(|fetch| self.fetch_uses_limit(fetch));
 
             // FETCH FIRST dialects (Oracle) render LIMIT/TOP as a row-limiting clause
             // after OFFSET. An explicit FETCH on the same SELECT keeps the LIMIT as-is.
@@ -5860,7 +5888,10 @@ impl Generator {
                     }
                     self.write_keyword("LIMIT");
                     self.write_space();
-                    self.generate_expression(fetch.count.as_ref().unwrap())?;
+                    self.write_fetch_count(fetch)?;
+                    if fetch.percent {
+                        self.write_keyword(" PERCENT");
+                    }
                 }
             }
 
@@ -5893,6 +5924,9 @@ impl Generator {
                             self.write_keyword("FETCH NEXT");
                             self.write_space();
                             self.write_limit_expr(&limit.this)?;
+                            if limit.percent {
+                                self.write_keyword(" PERCENT");
+                            }
                             self.write_space();
                             self.write_keyword("ROWS ONLY");
                         }
@@ -5986,91 +6020,21 @@ impl Generator {
             }
         }
 
-        // FETCH FIRST/NEXT
+        // FETCH is rendered once, after OFFSET unless the dialect needs LIMIT first.
         if let Some(fetch) = &select.fetch {
-            // Check if we already emitted LIMIT from FETCH before OFFSET
-            let fetch_already_as_limit = select.offset.is_some()
-                && !fetch.percent
-                && !fetch.with_ties
-                && fetch.count.is_some()
-                && matches!(
-                    self.config.dialect,
-                    Some(DialectType::Spark)
-                        | Some(DialectType::Hive)
-                        | Some(DialectType::DuckDB)
-                        | Some(DialectType::SQLite)
-                        | Some(DialectType::MySQL)
-                        | Some(DialectType::BigQuery)
-                        | Some(DialectType::Databricks)
-                        | Some(DialectType::StarRocks)
-                        | Some(DialectType::Doris)
-                        | Some(DialectType::Athena)
-                        | Some(DialectType::ClickHouse)
-                        | Some(DialectType::Redshift)
-                );
-
-            if fetch_already_as_limit {
-                // Already emitted as LIMIT before OFFSET, skip
-            } else {
+            if !fetch_as_top && !(select.offset.is_some() && self.fetch_uses_limit(fetch)) {
                 if self.config.pretty {
                     self.write_newline();
                     self.write_indent();
                 } else {
                     self.write_space();
                 }
-
-                // Convert FETCH to LIMIT for dialects that prefer LIMIT syntax
-                let use_limit = !fetch.percent
-                    && !fetch.with_ties
-                    && matches!(
-                        self.config.dialect,
-                        Some(DialectType::Spark)
-                            | Some(DialectType::Hive)
-                            | Some(DialectType::DuckDB)
-                            | Some(DialectType::SQLite)
-                            | Some(DialectType::MySQL)
-                            | Some(DialectType::BigQuery)
-                            | Some(DialectType::Databricks)
-                            | Some(DialectType::StarRocks)
-                            | Some(DialectType::Doris)
-                            | Some(DialectType::Athena)
-                            | Some(DialectType::ClickHouse)
-                            | Some(DialectType::Redshift)
-                    );
-
-                if use_limit {
-                    self.write_keyword("LIMIT");
+                if tsql_like && select.offset.is_none() && select.order_by.is_some() {
+                    self.write_keyword("OFFSET 0 ROWS");
                     self.write_space();
-                    if let Some(count) = &fetch.count {
-                        self.generate_expression(count)?;
-                    } else {
-                        self.write("1");
-                    }
-                } else {
-                    self.write_keyword("FETCH");
-                    self.write_space();
-                    self.write_keyword(&fetch.direction);
-                    if let Some(ref count) = fetch.count {
-                        self.write_space();
-                        self.generate_expression(count)?;
-                    }
-                    if fetch.percent {
-                        self.write_space();
-                        self.write_keyword("PERCENT");
-                    }
-                    if fetch.rows {
-                        self.write_space();
-                        self.write_keyword("ROWS");
-                    }
-                    if fetch.with_ties {
-                        self.write_space();
-                        self.write_keyword("WITH TIES");
-                    } else {
-                        self.write_space();
-                        self.write_keyword("ONLY");
-                    }
                 }
-            } // close fetch_already_as_limit else
+                self.generate_fetch(fetch)?;
+            }
         }
 
         // SAMPLE / TABLESAMPLE
@@ -7592,6 +7556,7 @@ impl Generator {
             inferred_type: None,
         };
 
+        let (limit, fetch) = split_set_limit(limit);
         let mut outer_select = Select {
             vertica: None,
             expressions: vec![Expression::Star(Star {
@@ -7607,11 +7572,8 @@ impl Generator {
             }),
             with,
             order_by,
-            limit: limit.map(|limit| Limit {
-                this: *limit,
-                percent: false,
-                comments: Vec::new(),
-            }),
+            limit,
+            fetch,
             offset: offset.map(|offset| Offset {
                 this: *offset,
                 rows: Some(true),
@@ -29903,6 +29865,27 @@ impl Generator {
             }
             return Ok(());
         }
+        if self.config.dialect == Some(DialectType::SQLite) {
+            if let Expression::Subquery(subquery) = expr {
+                // SQLite requires a SELECT operand, even when the source already
+                // parenthesized its branch. Keep any outer modifiers local too.
+                let outer_modifiers = !subquery.modifiers_inside
+                    && (subquery.order_by.is_some()
+                        || subquery.limit.is_some()
+                        || subquery.offset.is_some());
+                if outer_modifiers {
+                    self.write_keyword("SELECT * FROM");
+                    self.write(" (");
+                }
+                self.write_keyword("SELECT * FROM");
+                self.write_space();
+                self.generate_expression(expr)?;
+                if outer_modifiers {
+                    self.write(")");
+                }
+                return Ok(());
+            }
+        }
         let Expression::Select(select) = expr else {
             return self.generate_expression(expr);
         };
@@ -29918,6 +29901,7 @@ impl Generator {
             !is_top_dialect && (self.uses_fetch_first_limit() || !(top.percent || top.with_ties))
         });
         let trailing_limit = select.offset.is_some()
+            || select.fetch.is_some()
             || (select.limit.is_some() && !tsql_like)
             || (select.limit.is_none() && trailing_top);
         if !trailing_limit {
@@ -33657,11 +33641,9 @@ impl Generator {
         Ok(())
     }
 
-    fn generate_fetch(&mut self, e: &Fetch) -> Result<()> {
-        // For dialects that prefer LIMIT, convert simple FETCH to LIMIT
-        let use_limit = !e.percent
-            && !e.with_ties
-            && e.count.is_some()
+    fn fetch_uses_limit(&self, fetch: &Fetch) -> bool {
+        !fetch.with_ties
+            && (!fetch.percent || self.config.dialect == Some(DialectType::DuckDB))
             && matches!(
                 self.config.dialect,
                 Some(DialectType::Spark)
@@ -33675,13 +33657,62 @@ impl Generator {
                     | Some(DialectType::Doris)
                     | Some(DialectType::Athena)
                     | Some(DialectType::ClickHouse)
-            );
+                    | Some(DialectType::Redshift)
+            )
+    }
 
-        if use_limit {
+    fn write_fetch_count(&mut self, fetch: &Fetch) -> Result<()> {
+        if let Some(count) = &fetch.count {
+            self.write_limit_expr(count)
+        } else {
+            self.write("1");
+            Ok(())
+        }
+    }
+
+    fn check_limit_percent(&mut self, percent: bool) -> Result<()> {
+        if percent
+            && !matches!(
+                self.config.dialect,
+                None | Some(DialectType::Generic)
+                    | Some(DialectType::Oracle)
+                    | Some(DialectType::DuckDB)
+                    | Some(DialectType::TSQL)
+                    | Some(DialectType::Fabric)
+                    | Some(DialectType::Teradata)
+            )
+        {
+            self.unsupported("Target dialect does not support percentage row limits")?;
+        }
+        Ok(())
+    }
+
+    fn generate_fetch(&mut self, e: &Fetch) -> Result<()> {
+        self.check_limit_percent(e.percent)?;
+        if self.fetch_uses_limit(e) {
             self.write_keyword("LIMIT");
             self.write_space();
-            self.generate_expression(e.count.as_ref().unwrap())?;
+            self.write_fetch_count(e)?;
+            if e.percent {
+                self.write_keyword(" PERCENT");
+            }
             return Ok(());
+        }
+        if e.with_ties
+            && matches!(
+                self.config.dialect,
+                Some(DialectType::DuckDB)
+                    | Some(DialectType::SQLite)
+                    | Some(DialectType::MySQL)
+                    | Some(DialectType::BigQuery)
+                    | Some(DialectType::Hive)
+                    | Some(DialectType::Spark)
+                    | Some(DialectType::Databricks)
+                    | Some(DialectType::StarRocks)
+                    | Some(DialectType::Doris)
+            )
+        {
+            self.unsupported("Target dialect does not support FETCH WITH TIES")?;
         }
 
         // Python: FETCH direction count limit_options
@@ -33693,6 +33724,12 @@ impl Generator {
         if let Some(count) = &e.count {
             self.write_space();
             self.generate_expression(count)?;
+        } else if matches!(
+            self.config.dialect,
+            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+        ) {
+            // Oracle/PostgreSQL allow an omitted count (one row); T-SQL requires it.
+            self.write(" 1");
         }
         // Generate PERCENT, ROWS, WITH TIES/ONLY
         if e.percent {
@@ -35969,38 +36006,62 @@ impl Generator {
         limit: Option<&Expression>,
         offset: Option<&Expression>,
     ) -> Result<()> {
-        let fetch_first = self.uses_fetch_first_limit();
-        if let Some(limit) = limit.filter(|_| !fetch_first) {
-            if self.config.pretty {
-                self.write_newline();
-            } else {
-                self.write_space();
-            }
-            self.write_keyword("LIMIT");
-            self.write_space();
-            self.generate_expression(limit)?;
+        let fetch_form = match limit {
+            Some(Expression::Fetch(fetch)) => !self.fetch_uses_limit(fetch),
+            _ => self.uses_fetch_first_limit(),
+        };
+        let offset_first = fetch_form
+            || matches!(
+                self.config.dialect,
+                Some(DialectType::Presto) | Some(DialectType::Trino)
+            );
+        if offset_first {
+            self.generate_set_offset(offset, fetch_form)?;
         }
-        if let Some(offset) = offset {
-            if self.config.pretty {
-                self.write_newline();
-            } else {
-                self.write_space();
+        if let Some(limit) = limit {
+            let count = match limit {
+                Expression::Limit(limit) => &limit.this,
+                other => other,
+            };
+            if !(self.uses_fetch_first_limit() && Self::is_noop_limit_expr(count)) {
+                self.write_row_limit_separator();
+                match limit {
+                    Expression::Limit(limit) => self.generate_limit(limit)?,
+                    Expression::Fetch(fetch) => self.generate_fetch(fetch)?,
+                    count if self.uses_fetch_first_limit() => {
+                        self.write_fetch_first(count, false, false)?
+                    }
+                    count => {
+                        self.write_keyword("LIMIT");
+                        self.write_space();
+                        self.write_limit_expr(count)?;
+                    }
+                }
             }
+        }
+        if !offset_first {
+            self.generate_set_offset(offset, fetch_form)?;
+        }
+        Ok(())
+    }
+
+    fn write_row_limit_separator(&mut self) {
+        if self.config.pretty {
+            self.write_newline();
+        } else {
+            self.write_space();
+        }
+    }
+
+    fn generate_set_offset(&mut self, offset: Option<&Expression>, rows: bool) -> Result<()> {
+        if let Some(offset) = offset {
+            self.write_row_limit_separator();
             self.write_keyword("OFFSET");
             self.write_space();
-            self.generate_expression(offset)?;
-            if fetch_first {
-                self.write_space();
-                self.write_keyword("ROWS");
+            self.write_limit_expr(offset)?;
+            if rows {
+                self.write_keyword(" ROWS");
             }
-        }
-        if let Some(limit) = limit.filter(|l| fetch_first && !Self::is_noop_limit_expr(l)) {
-            if self.config.pretty {
-                self.write_newline();
-            } else {
-                self.write_space();
-            }
-            self.write_fetch_first(limit, false, false)?;
         }
         Ok(())
     }
@@ -36008,6 +36069,9 @@ impl Generator {
     /// `LIMIT` / `OFFSET` modifiers attached to a subquery, or
     /// `OFFSET m ROWS FETCH FIRST n ROWS ONLY` for FETCH FIRST dialects.
     fn generate_subquery_limit_offset(&mut self, subquery: &Subquery) -> Result<()> {
+        if let Some(limit) = &subquery.limit {
+            self.check_limit_percent(limit.percent)?;
+        }
         let fetch_first = self.uses_fetch_first_limit();
         if let Some(limit) = subquery.limit.as_ref().filter(|_| !fetch_first) {
             self.write_space();
@@ -36043,6 +36107,7 @@ impl Generator {
     }
 
     fn generate_limit(&mut self, e: &Limit) -> Result<()> {
+        self.check_limit_percent(e.percent)?;
         if self.uses_fetch_first_limit() {
             // LIMIT ALL / LIMIT NULL mean "no limit": there is no FETCH equivalent.
             if Self::is_noop_limit_expr(&e.this) {
