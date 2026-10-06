@@ -648,6 +648,29 @@ fn is_default_presto_date_format(fmt: &str) -> bool {
     fmt == "%Y-%m-%d" || fmt == "%F"
 }
 
+/// Whether `e` is syntactically a float literal (e.g. `7.0`, `3.14`), as a
+/// cheap, annotation-free signal that an integer-truncating operation (like
+/// `DIV`) would behave differently than source dialects (DuckDB's `//`)
+/// that fall back to ordinary float division on non-integer operands.
+#[cfg(feature = "transpile")]
+pub(crate) fn is_float_literal_operand(e: &Expression) -> bool {
+    matches!(
+        e,
+        Expression::Literal(lit) if matches!(lit.as_ref(), crate::expressions::Literal::Number(n) if n.contains('.'))
+    )
+}
+
+/// Whether `e` is the integer literal `0` — used to detect integer division
+/// by a literal zero, which some targets (BigQuery's `DIV`) raise a hard
+/// error on, unlike DuckDB's `//`, which returns `NULL`.
+#[cfg(feature = "transpile")]
+pub(crate) fn is_literal_zero(e: &Expression) -> bool {
+    matches!(
+        e,
+        Expression::Literal(lit) if matches!(lit.as_ref(), crate::expressions::Literal::Number(n) if n.parse::<f64>() == Ok(0.0))
+    )
+}
+
 /// Applies a dialect transform bottom-up through selected syntax children.
 ///
 /// The public entrypoint uses an explicit task stack for the recursion-heavy shapes
