@@ -31749,25 +31749,8 @@ impl Parser {
                 let right = self.parse_power()?;
                 Expression::Mul(Box::new(BinaryOp::new(left, right)))
             } else if self.match_token(TokenType::Slash) {
-                // DuckDB `//` integer division: a second slash following `/`.
-                // (`a / / b` is invalid SQL, so this can't shadow real division.)
-                if matches!(
-                    self.config.dialect,
-                    Some(crate::dialects::DialectType::DuckDB)
-                ) && self.check(TokenType::Slash)
-                {
-                    self.advance()?;
-                    let right = self.parse_power()?;
-                    Expression::IntDiv(Box::new(crate::expressions::BinaryFunc {
-                        this: left,
-                        expression: right,
-                        original_name: None,
-                        inferred_type: None,
-                    }))
-                } else {
-                    let right = self.parse_power()?;
-                    Expression::Div(Box::new(BinaryOp::new(left, right)))
-                }
+                let right = self.parse_power()?;
+                Expression::Div(Box::new(BinaryOp::new(left, right)))
             } else if self.match_token(TokenType::Percent) {
                 let right = self.parse_power()?;
                 Expression::Mod(Box::new(BinaryOp::new(left, right)))
@@ -32065,25 +32048,8 @@ impl Parser {
                 let right = self.parse_power()?;
                 Expression::Mul(Box::new(BinaryOp::new(left, right)))
             } else if self.match_token(TokenType::Slash) {
-                // DuckDB `//` integer division: a second slash following `/`.
-                // (`a / / b` is invalid SQL, so this can't shadow real division.)
-                if matches!(
-                    self.config.dialect,
-                    Some(crate::dialects::DialectType::DuckDB)
-                ) && self.check(TokenType::Slash)
-                {
-                    self.advance()?;
-                    let right = self.parse_power()?;
-                    Expression::IntDiv(Box::new(crate::expressions::BinaryFunc {
-                        this: left,
-                        expression: right,
-                        original_name: None,
-                        inferred_type: None,
-                    }))
-                } else {
-                    let right = self.parse_power()?;
-                    Expression::Div(Box::new(BinaryOp::new(left, right)))
-                }
+                let right = self.parse_power()?;
+                Expression::Div(Box::new(BinaryOp::new(left, right)))
             } else if self.match_token(TokenType::Percent) {
                 let right = self.parse_power()?;
                 Expression::Mod(Box::new(BinaryOp::new(left, right)))

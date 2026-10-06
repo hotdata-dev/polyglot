@@ -287,6 +287,7 @@ test-rust-verify-core:
 	@cargo test --lib -p polyglot-sql
 	@cargo test -p polyglot-sql --test deep_nesting_regression
 	@cargo test -p polyglot-sql --test dialect_matrix
+	@cargo test -p polyglot-sql --test duckdb_integer_division
 	@echo ""
 	@echo "=== Generic identity tests ==="
 	@cargo test --test sqlglot_identity test_sqlglot_identity_all -p polyglot-sql -- --nocapture

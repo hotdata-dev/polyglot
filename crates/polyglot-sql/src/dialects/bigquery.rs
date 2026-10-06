@@ -263,10 +263,31 @@ impl DialectImpl for BigQueryDialect {
             )))),
 
             // IntDiv -> DIV
-            Expression::IntDiv(f) => Ok(Expression::Function(Box::new(Function::new(
-                "DIV".to_string(),
-                vec![f.this, f.expression],
-            )))),
+            Expression::IntDiv(f) => {
+                if crate::dialects::is_float_literal_operand(&f.this)
+                    || crate::dialects::is_float_literal_operand(&f.expression)
+                {
+                    // BigQuery's DIV() truncates to an integer; DuckDB's //
+                    // falls back to ordinary float division when either
+                    // operand is non-integer (e.g. `7.0 // 2` is `3.5`).
+                    return Err(crate::error::Error::unsupported(
+                        "DuckDB's // on a float operand (falls back to float division, not integer DIV)",
+                        "bigquery",
+                    ));
+                }
+                if crate::dialects::is_literal_zero(&f.expression) {
+                    // BigQuery's DIV(x, 0) raises a division-by-zero error;
+                    // DuckDB's // returns NULL for the same input.
+                    return Err(crate::error::Error::unsupported(
+                        "DuckDB's // by a literal zero (returns NULL; BigQuery's DIV raises an error)",
+                        "bigquery",
+                    ));
+                }
+                Ok(Expression::Function(Box::new(Function::new(
+                    "DIV".to_string(),
+                    vec![f.this, f.expression],
+                ))))
+            }
 
             // Int64 -> INT64
             Expression::Int64(f) => Ok(Expression::Function(Box::new(Function::new(

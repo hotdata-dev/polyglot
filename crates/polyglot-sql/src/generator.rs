@@ -3450,6 +3450,22 @@ impl Generator {
             Expression::Div(op) => self.generate_precedence_binary_op(op, "/", InfixOperator::Div),
             Expression::IntDiv(f) => {
                 use crate::dialects::DialectType;
+                let is_native_slash_op = matches!(
+                    self.config.dialect,
+                    Some(DialectType::DuckDB) | Some(DialectType::Vertica)
+                );
+                if !is_native_slash_op
+                    && (crate::dialects::is_float_literal_operand(&f.this)
+                        || crate::dialects::is_float_literal_operand(&f.expression))
+                {
+                    // DuckDB's // falls back to ordinary float division when
+                    // either operand is non-integer (e.g. `7.0 // 2` is
+                    // `3.5`), which truncating DIV forms here can't preserve.
+                    return Err(crate::error::Error::unsupported(
+                        "DuckDB's // on a float operand (falls back to float division, not integer DIV)",
+                        self.config.dialect.unwrap_or_default().to_string(),
+                    ));
+                }
                 if matches!(self.config.dialect, Some(DialectType::ClickHouse)) {
                     self.write("intDiv(");
                     self.generate_expression(&f.this)?;
@@ -3457,10 +3473,7 @@ impl Generator {
                     self.generate_expression(&f.expression)?;
                     self.write(")");
                     Ok(())
-                } else if matches!(
-                    self.config.dialect,
-                    Some(DialectType::DuckDB) | Some(DialectType::Vertica)
-                ) {
+                } else if is_native_slash_op {
                     // DuckDB and Vertica use // operator for integer division
                     self.generate_expression(&f.this)?;
                     self.write(" // ");
