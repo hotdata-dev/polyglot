@@ -3554,19 +3554,18 @@ impl Dialect {
                         }
                         Expression::DataType(DT::Char { .. }) => Ok(Expression::DataType(DT::Text)),
                         // DuckDB's `//` only truncates when both operands are
-                        // integers -- with a float operand it's ordinary float
-                        // division (`7.0 // 2` is 3.5) -- and it returns NULL on
-                        // a zero divisor. Every other target's integer division
-                        // truncates unconditionally and errors on zero, so report
-                        // those inputs rather than emit SQL with different results.
+                        // integers; with a float operand it is ordinary float
+                        // division (`7.0 // 2` is 3.5), so that case lowers to
+                        // `/` exactly. It also returns NULL on a zero divisor,
+                        // where every other target's integer division raises, so
+                        // report that rather than emit SQL with a different result.
                         Expression::IntDiv(f) if target != DialectType::DuckDB => {
                             if is_float_literal_operand(&f.this)
                                 || is_float_literal_operand(&f.expression)
                             {
-                                return Err(crate::error::Error::unsupported(
-                                    "DuckDB's // on a float operand (falls back to float division, not integer DIV)",
-                                    target.to_string(),
-                                ));
+                                return Ok(Expression::Div(Box::new(
+                                    crate::expressions::BinaryOp::new(f.this, f.expression),
+                                )));
                             }
                             if is_literal_zero(&f.expression) {
                                 return Err(crate::error::Error::unsupported(

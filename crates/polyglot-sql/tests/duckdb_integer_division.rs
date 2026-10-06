@@ -87,12 +87,11 @@ fn duckdb_int_div_rejects_separated_slashes() {
 }
 
 #[test]
-fn duckdb_int_div_on_float_operand_is_unsupported() {
-    // DuckDB's // falls back to ordinary float division when either operand
-    // is non-integer (`7.0 // 2` is `3.5`, not `3`). Every other target's
-    // integer division truncates unconditionally -- including Vertica's own
-    // `//` and ClickHouse's intDiv -- so this must be reported, not silently
-    // transpiled to a different result. Negated, parenthesized, and
+fn duckdb_int_div_on_float_operand_lowers_to_float_division() {
+    // DuckDB's // is ordinary float division when either operand is
+    // non-integer (`7.0 // 2` is `3.5`, not `3`), so it lowers to `/` --
+    // never to a truncating DIV/intDiv/CAST(... AS INTEGER) -- on every
+    // target, including Vertica's own `//`. Negated, parenthesized, and
     // exponent-form literals count too.
     for target in [
         DialectType::PostgreSQL,
@@ -100,6 +99,8 @@ fn duckdb_int_div_on_float_operand_is_unsupported() {
         DialectType::SQLite,
         DialectType::Vertica,
         DialectType::ClickHouse,
+        DialectType::MySQL,
+        DialectType::DataFusion,
     ] {
         for sql in [
             "SELECT 7.0 // 2 AS v",
@@ -108,13 +109,28 @@ fn duckdb_int_div_on_float_operand_is_unsupported() {
             "SELECT 7e0 // 2 AS v",
             "SELECT 7 // 2.0 AS v",
         ] {
-            let err = transpile(sql, DialectType::DuckDB, target).unwrap_err();
-            assert!(
-                err.to_string().contains("float"),
-                "{sql} -> {target:?}: got {err}"
-            );
+            let out = transpile(sql, DialectType::DuckDB, target)
+                .unwrap_or_else(|e| panic!("{sql} -> {target:?}: {e}"))
+                .remove(0);
+            assert!(out.contains(" / "), "{sql} -> {target:?}: got {out}");
+            for truncating in ["DIV", "intDiv", "AS INTEGER", "//"] {
+                assert!(
+                    !out.contains(truncating),
+                    "{sql} -> {target:?}: still truncates: {out}"
+                );
+            }
         }
     }
+    // The int/int case is unaffected.
+    assert_eq!(
+        transpile(
+            "SELECT 7 // 2 AS v",
+            DialectType::DuckDB,
+            DialectType::Vertica
+        )
+        .unwrap(),
+        vec!["SELECT 7 // 2 AS v"]
+    );
 }
 
 #[test]
