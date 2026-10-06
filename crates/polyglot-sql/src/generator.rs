@@ -3448,6 +3448,10 @@ impl Generator {
             Expression::Div(op) => self.generate_precedence_binary_op(op, "/", InfixOperator::Div),
             Expression::IntDiv(f) => {
                 use crate::dialects::DialectType;
+                let is_native_slash_op = matches!(
+                    self.config.dialect,
+                    Some(DialectType::DuckDB) | Some(DialectType::Vertica)
+                );
                 if matches!(self.config.dialect, Some(DialectType::ClickHouse)) {
                     self.write("intDiv(");
                     self.generate_expression(&f.this)?;
@@ -3455,10 +3459,7 @@ impl Generator {
                     self.generate_expression(&f.expression)?;
                     self.write(")");
                     Ok(())
-                } else if matches!(
-                    self.config.dialect,
-                    Some(DialectType::DuckDB) | Some(DialectType::Vertica)
-                ) {
+                } else if is_native_slash_op {
                     // DuckDB and Vertica use // operator for integer division
                     self.generate_expression(&f.this)?;
                     self.write(" // ");
