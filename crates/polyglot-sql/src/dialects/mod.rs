@@ -298,6 +298,19 @@ impl DialectType {
             DialectType::TSQL | DialectType::Fabric | DialectType::MySQL | DialectType::SQLite
         ) || (matches!(self, DialectType::DuckDB) && explicit_as)
     }
+
+    /// Whether this dialect natively accepts DuckDB-style `ORDER BY ALL`
+    /// (a bare `ALL` keyword meaning "every projected column, in order").
+    /// Other targets need it rewritten to positional `ORDER BY 1, 2, ...`.
+    pub(crate) const fn supports_order_by_all(self) -> bool {
+        matches!(
+            self,
+            DialectType::DuckDB
+                | DialectType::Snowflake
+                | DialectType::ClickHouse
+                | DialectType::Databricks
+        )
+    }
 }
 
 impl Default for DialectType {
@@ -651,7 +664,7 @@ fn is_default_presto_date_format(fmt: &str) -> bool {
 /// Whether `e` is a lone, unquoted, unqualified `ALL` — how DuckDB's
 /// `ORDER BY ALL` keyword is parsed (as a column/identifier/var, not a keyword).
 #[cfg(feature = "transpile")]
-fn is_order_by_all_marker(e: &Expression) -> bool {
+pub(crate) fn is_order_by_all_marker(e: &Expression) -> bool {
     match e {
         Expression::Column(c) => {
             c.table.is_none() && !c.name.quoted && c.name.name.eq_ignore_ascii_case("all")
@@ -662,41 +675,130 @@ fn is_order_by_all_marker(e: &Expression) -> bool {
     }
 }
 
+/// Whether `e` is a projection item that can produce more or fewer than one
+/// output column (`*`, or DuckDB's `COLUMNS(...)` macro), making the output
+/// column count unknowable from the AST alone.
+#[cfg(feature = "transpile")]
+fn has_unknown_column_count(e: &Expression) -> bool {
+    use crate::expressions::Expression as E;
+    let inner = match e {
+        E::Alias(a) => &a.this,
+        other => other,
+    };
+    match inner {
+        E::Star(_) | E::Columns(_) => true,
+        // DuckDB's `COLUMNS(...)` star-expansion macro parses as a plain
+        // function call by name in ordinary SELECT-list position.
+        E::Function(f) => f.name.eq_ignore_ascii_case("COLUMNS"),
+        E::MethodCall(m) => m.method.name.eq_ignore_ascii_case("COLUMNS"),
+        _ => false,
+    }
+}
+
+/// The number of columns a query block projects, when that count is known
+/// statically from the AST. Compound queries (UNION/INTERSECT/EXCEPT) take
+/// their width from the left-hand operand, per standard SQL set-operation
+/// rules (both sides must already agree on column count).
+#[cfg(feature = "transpile")]
+fn query_output_width(e: &Expression) -> Option<usize> {
+    use crate::expressions::Expression as E;
+    match e {
+        E::Select(sel) => {
+            if sel.expressions.is_empty() || sel.expressions.iter().any(has_unknown_column_count) {
+                None
+            } else {
+                Some(sel.expressions.len())
+            }
+        }
+        E::Paren(p) => query_output_width(&p.this),
+        E::Union(u) => query_output_width(&u.left),
+        E::Intersect(i) => query_output_width(&i.left),
+        E::Except(ex) => query_output_width(&ex.left),
+        _ => None,
+    }
+}
+
+/// Rewrite an `ORDER BY ALL` clause into positional `ORDER BY 1..n` over
+/// `width` columns, in place. No-op if `order_by` isn't the ALL marker.
+/// Errors if the marker is present but `width` is unknown (e.g. a `*` or
+/// `COLUMNS(...)` projection, where positional ordinals can't be derived).
+///
+/// DuckDB's `ORDER BY ALL` always sorts NULLs last, regardless of direction
+/// (unlike most targets' direction-dependent defaults), so that's made
+/// explicit per column unless the source already specified an override.
+#[cfg(feature = "transpile")]
+fn expand_order_by_all(
+    order_by: &mut Option<crate::expressions::OrderBy>,
+    width: Option<usize>,
+    target: DialectType,
+) -> Result<()> {
+    use crate::expressions::{Expression as E, Ordered};
+    let is_marker = order_by.as_ref().is_some_and(|ob| {
+        ob.expressions.len() == 1 && is_order_by_all_marker(&ob.expressions[0].this)
+    });
+    if !is_marker {
+        return Ok(());
+    }
+    let Some(n) = width else {
+        return Err(crate::error::Error::unsupported(
+            "ORDER BY ALL over a projection with an unknown column count (* or COLUMNS(...)) cannot be expanded to positional ORDER BY",
+            target.to_string(),
+        ));
+    };
+    let ob = order_by.as_mut().unwrap();
+    let (desc, nulls_first) = (ob.expressions[0].desc, ob.expressions[0].nulls_first);
+    let required_nulls_last = nulls_first.map(|nf| !nf).unwrap_or(true);
+
+    // MySQL has no NULLS FIRST/LAST syntax, and (NULL sorting as the
+    // smallest value) its own default is the opposite of what's required
+    // here for ascending order: ASC defaults to NULLs first, DESC to NULLs
+    // last. When the direction doesn't already give us the needed default,
+    // there's no way to express it, so report that rather than silently
+    // emitting SQL whose NULL placement (and thus LIMIT results) differs.
+    if matches!(target, DialectType::MySQL) && !(desc == required_nulls_last) {
+        return Err(crate::error::Error::unsupported(
+            "ORDER BY ALL's NULLS LAST semantics (MySQL has no NULLS FIRST/LAST syntax, and its own default NULL placement doesn't match here)",
+            target.to_string(),
+        ));
+    }
+
+    ob.expressions = (1..=n as i64)
+        .map(|i| {
+            let mut o = Ordered::asc(E::number(i));
+            o.desc = desc;
+            o.nulls_first = if matches!(target, DialectType::MySQL) {
+                // Matches MySQL's own default (checked above) -- omit the
+                // (unsupported) clause rather than spell out a no-op.
+                None
+            } else if matches!(target, DialectType::DataFusion) && nulls_first.is_none() {
+                // DataFusion's own NULL-ordering default is configurable at
+                // runtime (like DuckDB's and Snowflake's), so -- absent an
+                // explicit override from the source -- leave it unannotated
+                // rather than assume DuckDB's default applies there too.
+                None
+            } else {
+                Some(!required_nulls_last)
+            };
+            o
+        })
+        .collect();
+    Ok(())
+}
+
 /// Expand DuckDB `ORDER BY ALL` into positional `ORDER BY 1..n` over the
-/// projection list (universally supported), preserving the sort direction.
-/// A `*` projection has no known column count, so it is reported as an
-/// unsupported translation rather than emitted as an `"ALL"` column reference.
+/// projection list, for targets without native `ORDER BY ALL` support.
 #[cfg(feature = "transpile")]
 fn expand_duckdb_order_by_all(
     mut sel: Box<crate::expressions::Select>,
     target: DialectType,
 ) -> Result<Box<crate::expressions::Select>> {
-    use crate::expressions::{Expression as E, Ordered};
-    let matches = sel.order_by.as_ref().is_some_and(|ob| {
-        ob.expressions.len() == 1 && is_order_by_all_marker(&ob.expressions[0].this)
-    });
-    if !matches {
-        return Ok(sel);
-    }
-    if sel.expressions.is_empty() || sel.expressions.iter().any(|e| matches!(e, E::Star(_))) {
-        return Err(crate::error::Error::unsupported(
-            "ORDER BY ALL over a * projection cannot be expanded to positional ORDER BY",
-            target.to_string(),
-        ));
-    }
-    {
-        let n = sel.expressions.len() as i64;
-        let ob = sel.order_by.as_mut().unwrap();
-        let (desc, nulls_first) = (ob.expressions[0].desc, ob.expressions[0].nulls_first);
-        ob.expressions = (1..=n)
-            .map(|i| {
-                let mut o = Ordered::asc(E::number(i));
-                o.desc = desc;
-                o.nulls_first = nulls_first;
-                o
-            })
-            .collect();
-    }
+    let width =
+        if sel.expressions.is_empty() || sel.expressions.iter().any(has_unknown_column_count) {
+            None
+        } else {
+            Some(sel.expressions.len())
+        };
+    expand_order_by_all(&mut sel.order_by, width, target)?;
     Ok(sel)
 }
 
@@ -4536,8 +4638,25 @@ impl Dialect {
                         Expression::DataType(DT::Char { .. }) => Ok(Expression::DataType(DT::Text)),
                         // DuckDB `ORDER BY ALL` -> positional `ORDER BY 1..n` for
                         // targets without native `ORDER BY ALL` support.
-                        Expression::Select(sel) if target != DialectType::DuckDB => {
+                        Expression::Select(sel) if !target.supports_order_by_all() => {
                             expand_duckdb_order_by_all(sel, target).map(Expression::Select)
+                        }
+                        // Same, but for ORDER BY attached to a compound query
+                        // (UNION/INTERSECT/EXCEPT) rather than a single SELECT.
+                        Expression::Union(mut u) if !target.supports_order_by_all() => {
+                            let width = query_output_width(&u.left);
+                            expand_order_by_all(&mut u.order_by, width, target)?;
+                            Ok(Expression::Union(u))
+                        }
+                        Expression::Intersect(mut i) if !target.supports_order_by_all() => {
+                            let width = query_output_width(&i.left);
+                            expand_order_by_all(&mut i.order_by, width, target)?;
+                            Ok(Expression::Intersect(i))
+                        }
+                        Expression::Except(mut ex) if !target.supports_order_by_all() => {
+                            let width = query_output_width(&ex.left);
+                            expand_order_by_all(&mut ex.order_by, width, target)?;
+                            Ok(Expression::Except(ex))
                         }
                         _ => Ok(e),
                     })?
