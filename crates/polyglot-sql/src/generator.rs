@@ -1501,8 +1501,6 @@ mod reserved_keywords {
         set.remove("range");
         set.remove("row");
         set.remove("values");
-        // ORDER BY ALL needs ALL unquoted (inherited from POSTGRES_RESERVED)
-        set.remove("all");
         set
     });
 
@@ -27214,7 +27212,20 @@ impl Generator {
             }
         }
 
-        self.generate_expression(&ordered.this)?;
+        // `ORDER BY ALL` (DuckDB/Snowflake/ClickHouse/Databricks): the bare
+        // `ALL` keyword parses as an ordinary unquoted identifier/var, which
+        // would otherwise get quoted like any other identifier named "all".
+        // Render it as the keyword when this dialect actually supports it.
+        if self
+            .config
+            .dialect
+            .is_some_and(|d| d.supports_order_by_all())
+            && crate::dialects::is_order_by_all_marker(&ordered.this)
+        {
+            self.write_keyword("ALL");
+        } else {
+            self.generate_expression(&ordered.this)?;
+        }
         if ordered.desc {
             self.write_space();
             self.write_keyword("DESC");

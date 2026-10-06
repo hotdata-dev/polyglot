@@ -2745,8 +2745,15 @@ pub(super) fn normalize(
                 // When nulls_first is not specified, fill in the source dialect's implied
                 // default so the target generator can correctly add/strip NULLS FIRST/LAST.
                 Expression::Ordered(o) => {
+                    // `ORDER BY ALL` on a target that natively supports it: the
+                    // keyword carries its own implied NULL ordering on that
+                    // engine, so don't synthesize an explicit NULLS clause for
+                    // it the way a normal sort key would get one.
+                    if super::is_order_by_all_marker(&o.this) && target.supports_order_by_all() {
+                        Action::None
+                    }
                     // MySQL doesn't support NULLS FIRST/LAST - strip or rewrite
-                    if matches!(target, DialectType::MySQL) && o.nulls_first.is_some() {
+                    else if matches!(target, DialectType::MySQL) && o.nulls_first.is_some() {
                         Action::Operators(operators::Action::MysqlNullsOrdering)
                     } else {
                         // Skip targets that don't support NULLS FIRST/LAST syntax unless
