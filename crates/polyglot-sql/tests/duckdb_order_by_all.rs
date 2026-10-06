@@ -26,29 +26,66 @@ fn order_by_all_round_trips_unquoted_in_duckdb() {
 }
 
 #[test]
-fn order_by_all_passes_through_unchanged_for_native_targets() {
-    // Snowflake, ClickHouse, and Databricks all natively support ORDER BY
-    // ALL, so it should round-trip as-is rather than expand to positions.
-    for target in [
-        DialectType::Snowflake,
-        DialectType::ClickHouse,
-        DialectType::Databricks,
-    ] {
+fn order_by_all_passes_through_for_native_targets() {
+    // Snowflake, ClickHouse, and Databricks natively support ORDER BY ALL, so
+    // the keyword is kept rather than expanded to positions -- including over
+    // `*`, where expansion would have been impossible. DuckDB's ALL sorts
+    // NULLs last in both directions; the NULLS clause is spelled out only
+    // where the target's own default differs (Databricks ASC defaults to
+    // NULLs first; Snowflake DESC does too; ClickHouse already matches).
+    let cases = [
+        (DialectType::Snowflake, "ALL", "ALL DESC NULLS LAST"),
+        (DialectType::ClickHouse, "ALL", "ALL DESC"),
+        (DialectType::Databricks, "ALL NULLS LAST", "ALL DESC"),
+    ];
+    for (target, asc, desc) in cases {
         assert_eq!(
             transpile(
                 "SELECT a, b FROM t ORDER BY ALL",
                 DialectType::DuckDB,
                 target
             ),
-            "SELECT a, b FROM t ORDER BY ALL",
+            format!("SELECT a, b FROM t ORDER BY {asc}"),
             "target {target:?}"
         );
-        // Including over a `*` projection, where positional expansion would
-        // have been impossible anyway.
+        assert_eq!(
+            transpile(
+                "SELECT a, b FROM t ORDER BY ALL DESC",
+                DialectType::DuckDB,
+                target
+            ),
+            format!("SELECT a, b FROM t ORDER BY {desc}"),
+            "target {target:?}"
+        );
         assert_eq!(
             transpile("SELECT * FROM t ORDER BY ALL", DialectType::DuckDB, target),
-            "SELECT * FROM t ORDER BY ALL",
+            format!("SELECT * FROM t ORDER BY {asc}"),
             "target {target:?}"
+        );
+    }
+}
+
+#[test]
+fn order_by_all_expands_from_any_native_source() {
+    // The marker must be expanded whenever the *source* has native ORDER BY
+    // ALL and the target doesn't -- not only for DuckDB -- otherwise the bare
+    // keyword leaks out as a nonexistent `"ALL"` column. Each source's own
+    // NULL default carries over (Databricks sorts NULLs first for ASC, which
+    // PostgreSQL doesn't).
+    let cases = [
+        (DialectType::Snowflake, "1, 2"),
+        (DialectType::ClickHouse, "1, 2"),
+        (DialectType::Databricks, "1 NULLS FIRST, 2 NULLS FIRST"),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(
+            transpile(
+                "SELECT a, b FROM t ORDER BY ALL",
+                source,
+                DialectType::PostgreSQL
+            ),
+            format!("SELECT a, b FROM t ORDER BY {expected}"),
+            "source {source:?}"
         );
     }
 }
@@ -101,10 +138,8 @@ fn order_by_all_reports_unsupported_when_mysql_cant_preserve_null_order() {
 
 #[test]
 fn order_by_all_expansion_omits_nulls_clause_for_datafusion() {
-    // DataFusion's NULL-ordering default is configurable at runtime (like
-    // DuckDB's and Snowflake's), so -- absent an explicit override in the
-    // source -- the expansion leaves it unannotated rather than assuming
-    // DuckDB's own default applies there too.
+    // The cross-dialect NULL-ordering pass models DataFusion, like DuckDB, as
+    // sorting NULLs last in both directions, so no clause is needed.
     assert_eq!(
         transpile(
             "SELECT a, b FROM t ORDER BY ALL",
@@ -185,6 +220,20 @@ fn order_by_all_on_union_expands_using_left_side_width() {
             DialectType::PostgreSQL
         ),
         "SELECT a, b FROM t UNION ALL SELECT c, d FROM u ORDER BY 1, 2"
+    );
+}
+
+#[test]
+fn order_by_all_on_parenthesized_union_operands_expands() {
+    // Parenthesized set-operation operands parse as subqueries; the width
+    // lookup must see through them rather than treat the count as unknown.
+    assert_eq!(
+        transpile(
+            "(SELECT a, b FROM t) UNION (SELECT c, d FROM u) ORDER BY ALL",
+            DialectType::DuckDB,
+            DialectType::PostgreSQL
+        ),
+        "(SELECT a, b FROM t) UNION (SELECT c, d FROM u) ORDER BY 1, 2"
     );
 }
 
