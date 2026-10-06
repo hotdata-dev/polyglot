@@ -219,17 +219,6 @@ impl DialectImpl for SQLiteDialect {
             // IntDiv: SQLite has no DIV function, so emulate truncating
             // integer division as CAST(CAST(x AS REAL) / y AS INTEGER).
             Expression::IntDiv(f) => {
-                if crate::dialects::is_float_literal_operand(&f.this)
-                    || crate::dialects::is_float_literal_operand(&f.expression)
-                {
-                    // The CAST(... AS INTEGER) emulation truncates; DuckDB's
-                    // // falls back to ordinary float division when either
-                    // operand is non-integer (e.g. `7.0 // 2` is `3.5`).
-                    return Err(crate::error::Error::unsupported(
-                        "DuckDB's // on a float operand (falls back to float division, not truncating division)",
-                        "sqlite",
-                    ));
-                }
                 let cast_x = Expression::Cast(Box::new(Cast {
                     this: f.this,
                     to: DataType::Float {

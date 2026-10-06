@@ -733,24 +733,10 @@ impl DialectImpl for PostgresDialect {
             // MISC FUNCTIONS
             // ============================================
             // IntDiv -> DIV in PostgreSQL
-            Expression::IntDiv(f) => {
-                if crate::dialects::is_float_literal_operand(&f.this)
-                    || crate::dialects::is_float_literal_operand(&f.expression)
-                {
-                    // PostgreSQL's DIV() truncates to an integer; DuckDB's //
-                    // falls back to ordinary float division when either
-                    // operand is non-integer, so the result would differ
-                    // (e.g. `7.0 // 2` is `3.5`, not `3`).
-                    return Err(crate::error::Error::unsupported(
-                        "DuckDB's // on a float operand (falls back to float division, not integer DIV)",
-                        "postgresql",
-                    ));
-                }
-                Ok(Expression::Function(Box::new(Function::new(
-                    "DIV".to_string(),
-                    vec![f.this, f.expression],
-                ))))
-            }
+            Expression::IntDiv(f) => Ok(Expression::Function(Box::new(Function::new(
+                "DIV".to_string(),
+                vec![f.this, f.expression],
+            )))),
 
             // Unicode -> ASCII in PostgreSQL
             Expression::Unicode(f) => Ok(Expression::Function(Box::new(Function::new(
