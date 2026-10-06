@@ -711,6 +711,7 @@ fn query_output_width(e: &Expression) -> Option<usize> {
             }
         }
         E::Paren(p) => query_output_width(&p.this),
+        E::Subquery(s) => query_output_width(&s.this),
         E::Union(u) => query_output_width(&u.left),
         E::Intersect(i) => query_output_width(&i.left),
         E::Except(ex) => query_output_width(&ex.left),
@@ -723,13 +724,17 @@ fn query_output_width(e: &Expression) -> Option<usize> {
 /// Errors if the marker is present but `width` is unknown (e.g. a `*` or
 /// `COLUMNS(...)` projection, where positional ordinals can't be derived).
 ///
-/// DuckDB's `ORDER BY ALL` always sorts NULLs last, regardless of direction
-/// (unlike most targets' direction-dependent defaults), so that's made
-/// explicit per column unless the source already specified an override.
+/// The source's explicit direction and NULL order (if any) carry over to each
+/// positional entry unchanged; the later cross-dialect NULL-ordering pass
+/// fills in the source dialect's implied default where the target's differs.
+/// MySQL is the exception: it has no NULLS FIRST/LAST syntax and is skipped by
+/// that pass, so DuckDB's NULLs-last-in-both-directions default is checked
+/// against MySQL's own default here.
 #[cfg(feature = "transpile")]
 fn expand_order_by_all(
     order_by: &mut Option<crate::expressions::OrderBy>,
     width: Option<usize>,
+    source: DialectType,
     target: DialectType,
 ) -> Result<()> {
     use crate::expressions::{Expression as E, Ordered};
@@ -747,38 +752,26 @@ fn expand_order_by_all(
     };
     let ob = order_by.as_mut().unwrap();
     let (desc, nulls_first) = (ob.expressions[0].desc, ob.expressions[0].nulls_first);
-    let required_nulls_last = nulls_first.map(|nf| !nf).unwrap_or(true);
 
-    // MySQL has no NULLS FIRST/LAST syntax, and (NULL sorting as the
-    // smallest value) its own default is the opposite of what's required
-    // here for ascending order: ASC defaults to NULLs first, DESC to NULLs
-    // last. When the direction doesn't already give us the needed default,
-    // there's no way to express it, so report that rather than silently
-    // emitting SQL whose NULL placement (and thus LIMIT results) differs.
-    if matches!(target, DialectType::MySQL) && !(desc == required_nulls_last) {
-        return Err(crate::error::Error::unsupported(
-            "ORDER BY ALL's NULLS LAST semantics (MySQL has no NULLS FIRST/LAST syntax, and its own default NULL placement doesn't match here)",
-            target.to_string(),
-        ));
+    // MySQL sorts NULL as the smallest value (ASC -> NULLs first, DESC ->
+    // NULLs last) and can't be told otherwise. DuckDB's ALL sorts NULLs last
+    // in both directions, so only the DESC case lines up; report the rest
+    // rather than silently emitting SQL whose LIMIT results differ.
+    if matches!(target, DialectType::MySQL) && matches!(source, DialectType::DuckDB) {
+        let required_nulls_last = nulls_first.map(|nf| !nf).unwrap_or(true);
+        if desc != required_nulls_last {
+            return Err(crate::error::Error::unsupported(
+                "ORDER BY ALL's NULLS LAST semantics (MySQL has no NULLS FIRST/LAST syntax, and its own default NULL placement doesn't match here)",
+                target.to_string(),
+            ));
+        }
     }
 
     ob.expressions = (1..=n as i64)
         .map(|i| {
             let mut o = Ordered::asc(E::number(i));
             o.desc = desc;
-            o.nulls_first = if matches!(target, DialectType::MySQL) {
-                // Matches MySQL's own default (checked above) -- omit the
-                // (unsupported) clause rather than spell out a no-op.
-                None
-            } else if matches!(target, DialectType::DataFusion) && nulls_first.is_none() {
-                // DataFusion's own NULL-ordering default is configurable at
-                // runtime (like DuckDB's and Snowflake's), so -- absent an
-                // explicit override from the source -- leave it unannotated
-                // rather than assume DuckDB's default applies there too.
-                None
-            } else {
-                Some(!required_nulls_last)
-            };
+            o.nulls_first = nulls_first;
             o
         })
         .collect();
@@ -790,6 +783,7 @@ fn expand_order_by_all(
 #[cfg(feature = "transpile")]
 fn expand_duckdb_order_by_all(
     mut sel: Box<crate::expressions::Select>,
+    source: DialectType,
     target: DialectType,
 ) -> Result<Box<crate::expressions::Select>> {
     let width =
@@ -798,7 +792,7 @@ fn expand_duckdb_order_by_all(
         } else {
             Some(sel.expressions.len())
         };
-    expand_order_by_all(&mut sel.order_by, width, target)?;
+    expand_order_by_all(&mut sel.order_by, width, source, target)?;
     Ok(sel)
 }
 
@@ -4629,33 +4623,38 @@ impl Dialect {
                 // DuckDB source: normalize VARCHAR/CHAR to TEXT (DuckDB doesn't support
                 // VARCHAR length constraints). This emulates Python sqlglot's DuckDB parser
                 // where VARCHAR_LENGTH = None and VARCHAR maps to TEXT.
-                let expr = if matches!(self.dialect_type, DialectType::DuckDB) {
+                //
+                // Any source with native `ORDER BY ALL`: expand it to positional
+                // `ORDER BY 1..n` for targets without it, on both plain SELECTs and
+                // compound queries (whose ORDER BY lives on the set-op node).
+                let source = self.dialect_type;
+                let is_duckdb = matches!(source, DialectType::DuckDB);
+                let expand_all = source.supports_order_by_all() && !target.supports_order_by_all();
+                let expr = if is_duckdb || expand_all {
                     use crate::expressions::DataType as DT;
                     transform_recursive(expr, &|e| match e {
-                        Expression::DataType(DT::VarChar { .. }) => {
+                        Expression::DataType(DT::VarChar { .. }) if is_duckdb => {
                             Ok(Expression::DataType(DT::Text))
                         }
-                        Expression::DataType(DT::Char { .. }) => Ok(Expression::DataType(DT::Text)),
-                        // DuckDB `ORDER BY ALL` -> positional `ORDER BY 1..n` for
-                        // targets without native `ORDER BY ALL` support.
-                        Expression::Select(sel) if !target.supports_order_by_all() => {
-                            expand_duckdb_order_by_all(sel, target).map(Expression::Select)
+                        Expression::DataType(DT::Char { .. }) if is_duckdb => {
+                            Ok(Expression::DataType(DT::Text))
                         }
-                        // Same, but for ORDER BY attached to a compound query
-                        // (UNION/INTERSECT/EXCEPT) rather than a single SELECT.
-                        Expression::Union(mut u) if !target.supports_order_by_all() => {
+                        Expression::Select(sel) if expand_all => {
+                            expand_duckdb_order_by_all(sel, source, target).map(Expression::Select)
+                        }
+                        Expression::Union(mut u) if expand_all => {
                             let width = query_output_width(&u.left);
-                            expand_order_by_all(&mut u.order_by, width, target)?;
+                            expand_order_by_all(&mut u.order_by, width, source, target)?;
                             Ok(Expression::Union(u))
                         }
-                        Expression::Intersect(mut i) if !target.supports_order_by_all() => {
+                        Expression::Intersect(mut i) if expand_all => {
                             let width = query_output_width(&i.left);
-                            expand_order_by_all(&mut i.order_by, width, target)?;
+                            expand_order_by_all(&mut i.order_by, width, source, target)?;
                             Ok(Expression::Intersect(i))
                         }
-                        Expression::Except(mut ex) if !target.supports_order_by_all() => {
+                        Expression::Except(mut ex) if expand_all => {
                             let width = query_output_width(&ex.left);
-                            expand_order_by_all(&mut ex.order_by, width, target)?;
+                            expand_order_by_all(&mut ex.order_by, width, source, target)?;
                             Ok(Expression::Except(ex))
                         }
                         _ => Ok(e),
