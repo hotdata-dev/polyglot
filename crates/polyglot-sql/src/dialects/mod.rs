@@ -654,10 +654,15 @@ fn is_default_presto_date_format(fmt: &str) -> bool {
 /// that fall back to ordinary float division on non-integer operands.
 #[cfg(feature = "transpile")]
 pub(crate) fn is_float_literal_operand(e: &Expression) -> bool {
-    matches!(
-        e,
-        Expression::Literal(lit) if matches!(lit.as_ref(), crate::expressions::Literal::Number(n) if n.contains('.'))
-    )
+    match e {
+        Expression::Neg(n) => is_float_literal_operand(&n.this),
+        Expression::Paren(p) => is_float_literal_operand(&p.this),
+        Expression::Literal(lit) => matches!(
+            lit.as_ref(),
+            crate::expressions::Literal::Number(n) if n.contains(['.', 'e', 'E'])
+        ),
+        _ => false,
+    }
 }
 
 /// Whether `e` is the integer literal `0` — used to detect integer division
@@ -4557,6 +4562,29 @@ impl Dialect {
                             Ok(Expression::DataType(DT::Text))
                         }
                         Expression::DataType(DT::Char { .. }) => Ok(Expression::DataType(DT::Text)),
+                        // DuckDB's `//` only truncates when both operands are
+                        // integers -- with a float operand it's ordinary float
+                        // division (`7.0 // 2` is 3.5) -- and it returns NULL on
+                        // a zero divisor. Every other target's integer division
+                        // truncates unconditionally and errors on zero, so report
+                        // those inputs rather than emit SQL with different results.
+                        Expression::IntDiv(f) if target != DialectType::DuckDB => {
+                            if is_float_literal_operand(&f.this)
+                                || is_float_literal_operand(&f.expression)
+                            {
+                                return Err(crate::error::Error::unsupported(
+                                    "DuckDB's // on a float operand (falls back to float division, not integer DIV)",
+                                    target.to_string(),
+                                ));
+                            }
+                            if is_literal_zero(&f.expression) {
+                                return Err(crate::error::Error::unsupported(
+                                    "DuckDB's // by a literal zero (returns NULL; integer division elsewhere raises an error)",
+                                    target.to_string(),
+                                ));
+                            }
+                            Ok(Expression::IntDiv(f))
+                        }
                         // DuckDB `ORDER BY ALL` -> positional `ORDER BY 1..n` for
                         // targets without native `ORDER BY ALL` support.
                         Expression::Select(sel) if target != DialectType::DuckDB => {

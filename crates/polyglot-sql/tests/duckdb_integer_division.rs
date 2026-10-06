@@ -89,32 +89,69 @@ fn duckdb_int_div_rejects_separated_slashes() {
 #[test]
 fn duckdb_int_div_on_float_operand_is_unsupported() {
     // DuckDB's // falls back to ordinary float division when either operand
-    // is non-integer (`7.0 // 2` is `3.5`, not `3`), which a truncating
-    // target DIV can't reproduce -- so this must be reported, not silently
-    // transpiled to a different result.
+    // is non-integer (`7.0 // 2` is `3.5`, not `3`). Every other target's
+    // integer division truncates unconditionally -- including Vertica's own
+    // `//` and ClickHouse's intDiv -- so this must be reported, not silently
+    // transpiled to a different result. Negated, parenthesized, and
+    // exponent-form literals count too.
     for target in [
         DialectType::PostgreSQL,
         DialectType::BigQuery,
         DialectType::SQLite,
+        DialectType::Vertica,
+        DialectType::ClickHouse,
     ] {
-        let err = transpile("SELECT 7.0 // 2 AS v", DialectType::DuckDB, target).unwrap_err();
+        for sql in [
+            "SELECT 7.0 // 2 AS v",
+            "SELECT -7.0 // 2 AS v",
+            "SELECT (7.0) // 2 AS v",
+            "SELECT 7e0 // 2 AS v",
+            "SELECT 7 // 2.0 AS v",
+        ] {
+            let err = transpile(sql, DialectType::DuckDB, target).unwrap_err();
+            assert!(
+                err.to_string().contains("float"),
+                "{sql} -> {target:?}: got {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn duckdb_int_div_by_literal_zero_is_unsupported() {
+    // DuckDB's 7 // 0 returns NULL; PostgreSQL's DIV(7, 0), BigQuery's
+    // DIV(7, 0), and ClickHouse's intDiv(7, 0) all raise an error.
+    for target in [
+        DialectType::PostgreSQL,
+        DialectType::BigQuery,
+        DialectType::ClickHouse,
+    ] {
+        let err = transpile("SELECT 7 // 0 AS v", DialectType::DuckDB, target).unwrap_err();
         assert!(
-            err.to_string().contains("float"),
+            err.to_string().contains("zero"),
             "target {target:?}: got {err}"
         );
     }
 }
 
 #[test]
-fn duckdb_int_div_by_zero_is_unsupported_for_bigquery() {
-    // DuckDB's 7 // 0 returns NULL; BigQuery's DIV(7, 0) raises an error.
-    let err = transpile(
-        "SELECT 7 // 0 AS v",
-        DialectType::DuckDB,
-        DialectType::BigQuery,
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("zero"), "got: {err}");
+fn other_dialects_integer_division_is_unaffected() {
+    // The float/zero guards are about DuckDB's // semantics specifically.
+    // MySQL's and Vertica's integer division genuinely truncates float
+    // operands, so their existing lowering must keep working.
+    assert_eq!(
+        transpile("SELECT 7.5 DIV 2", DialectType::MySQL, DialectType::MySQL).unwrap(),
+        vec!["SELECT DIV(7.5, 2)"]
+    );
+    assert_eq!(
+        transpile(
+            "SELECT 7.5 // 2",
+            DialectType::Vertica,
+            DialectType::PostgreSQL
+        )
+        .unwrap(),
+        vec!["SELECT DIV(7.5, 2)"]
+    );
 }
 
 #[test]
