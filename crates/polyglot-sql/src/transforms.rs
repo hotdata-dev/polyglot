@@ -1674,12 +1674,49 @@ pub fn eliminate_distinct_on_for_dialect(
         _ => DistinctOnNullsMode::NullsFirst,
     };
 
-    transform_recursive(expr, &|expr| eliminate_distinct_on_select(expr, nulls_mode))
+    transform_recursive(expr, &|expr| {
+        eliminate_distinct_on_select(expr, nulls_mode, target)
+    })
+}
+
+/// Resolve positional `ORDER BY <n>` references against `select_exprs`,
+/// replacing each with the referenced projection's underlying expression
+/// (unaliased). Non-positional entries pass through unchanged.
+fn resolve_positional_order_by(
+    exprs: Vec<crate::expressions::Ordered>,
+    select_exprs: &[Expression],
+    target: Option<DialectType>,
+) -> Result<Vec<crate::expressions::Ordered>> {
+    exprs
+        .into_iter()
+        .map(|mut ord| {
+            if let Expression::Literal(lit) = &ord.this {
+                if let Literal::Number(n) = lit.as_ref() {
+                    if let Ok(idx) = n.parse::<usize>() {
+                        if idx >= 1 && idx <= select_exprs.len() {
+                            ord.this = match select_exprs[idx - 1].clone() {
+                                Expression::Alias(alias) => alias.this,
+                                other => other,
+                            };
+                        }
+                    }
+                }
+            }
+            if crate::dialects::contains_in_projection(&ord.this, |e| matches!(e, Expression::WindowFunction(_))) {
+                return Err(Error::unsupported(
+                    "DISTINCT ON ordering by a window expression requires an additional query layer",
+                    format!("{target:?}"),
+                ));
+            }
+            Ok(ord)
+        })
+        .collect()
 }
 
 fn eliminate_distinct_on_select(
     expr: Expression,
     nulls_mode: DistinctOnNullsMode,
+    target: Option<DialectType>,
 ) -> Result<Expression> {
     use crate::expressions::Case;
 
@@ -1692,7 +1729,16 @@ fn eliminate_distinct_on_select(
 
                     // Get order_by expressions, or use distinct_cols as default order
                     let order_exprs = if let Some(ref order_by) = select.order_by {
-                        let mut exprs = order_by.expressions.clone();
+                        // Positional references (`ORDER BY 1`, or DuckDB's
+                        // `ORDER BY ALL` already expanded to positions) mean
+                        // something different inside a window function's
+                        // ORDER BY than in the outer SELECT's, so resolve them
+                        // to the actual projected expression before reuse.
+                        let mut exprs = resolve_positional_order_by(
+                            order_by.expressions.clone(),
+                            &select.expressions,
+                            target,
+                        )?;
                         // Add NULL ordering based on target dialect
                         match nulls_mode {
                             DistinctOnNullsMode::NullsFirst => {
