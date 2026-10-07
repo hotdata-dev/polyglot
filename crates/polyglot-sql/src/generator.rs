@@ -3448,17 +3448,33 @@ impl Generator {
             Expression::Div(op) => self.generate_precedence_binary_op(op, "/", InfixOperator::Div),
             Expression::IntDiv(f) => {
                 use crate::dialects::DialectType;
-                if matches!(self.config.dialect, Some(DialectType::ClickHouse)) {
+                let is_native_slash_op = matches!(
+                    self.config.dialect,
+                    Some(DialectType::DuckDB) | Some(DialectType::Vertica)
+                );
+                if matches!(self.config.dialect, Some(DialectType::SQLite)) {
+                    // Keep native integer arithmetic exact above 2^53. The
+                    // outer cast truncates floating operands for other sources
+                    // whose IntDiv always truncates (e.g. MySQL and Vertica).
+                    self.write_keyword("CAST");
+                    self.write("(");
+                    self.generate_infix_operand(InfixOperator::Div, &f.this, OperandSide::Left)?;
+                    self.write(" / ");
+                    self.generate_infix_operand(
+                        InfixOperator::Div,
+                        &f.expression,
+                        OperandSide::Right,
+                    )?;
+                    self.write(" AS INTEGER)");
+                    Ok(())
+                } else if matches!(self.config.dialect, Some(DialectType::ClickHouse)) {
                     self.write("intDiv(");
                     self.generate_expression(&f.this)?;
                     self.write(", ");
                     self.generate_expression(&f.expression)?;
                     self.write(")");
                     Ok(())
-                } else if matches!(
-                    self.config.dialect,
-                    Some(DialectType::DuckDB) | Some(DialectType::Vertica)
-                ) {
+                } else if is_native_slash_op {
                     // DuckDB and Vertica use // operator for integer division
                     self.generate_expression(&f.this)?;
                     self.write(" // ");
