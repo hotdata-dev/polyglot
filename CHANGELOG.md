@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- DuckDB integer `//` now lowers for the DataFusion target as
+  `a / NULLIF(b, 0)`. DataFusion's `/` already truncates integer operands
+  toward zero and performs float division on a floating operand, so the
+  result matches DuckDB, including `NULL` on a zero divisor, without
+  resolving operand types. A DECIMAL operand, or a DuckDB `/` nested inside
+  the `//`, is cast to DOUBLE where DataFusion would otherwise keep integer
+  or decimal arithmetic.
+
 ## [0.13.2] - 2026-10-08
 
 ### Changed
