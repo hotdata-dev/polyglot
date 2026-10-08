@@ -51,6 +51,32 @@ pub(in crate::dialects) fn prepare_integer_division(
         let left_kind = numeric_kind(&division.this);
         let right_kind = numeric_kind(&division.expression);
         let kind = combine(left_kind, right_kind);
+
+        // DataFusion's `/` is type-dependent in the same way as DuckDB's `//`:
+        // integer operands truncate toward zero and a floating operand makes
+        // it float division. So `a / NULLIF(b, 0)` is exact without resolving
+        // operand types; only a known DECIMAL needs the DOUBLE cast, since
+        // DataFusion keeps decimal arithmetic where DuckDB produces DOUBLE.
+        if target == DialectType::DataFusion {
+            if kind == NumericKind::Decimal {
+                division.this = super::operators::cast_expr(
+                    division.this,
+                    DataType::Double {
+                        precision: None,
+                        scale: None,
+                    },
+                );
+            }
+            let divisor = Expression::Function(Box::new(Function::new(
+                "NULLIF".to_string(),
+                vec![division.expression, Expression::number(0)],
+            )));
+            return Ok(Expression::Div(Box::new(BinaryOp::new(
+                division.this,
+                divisor,
+            ))));
+        }
+
         if kind == NumericKind::Unknown {
             return Err(crate::error::Error::unsupported(
                 "DuckDB // with unresolved operand types; use explicit numeric casts",

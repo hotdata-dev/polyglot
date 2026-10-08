@@ -241,13 +241,46 @@ fn duckdb_fractional_int_div_protects_zero_for_clickhouse() {
 
 #[test]
 fn duckdb_integer_division_rejects_targets_without_a_lowering() {
-    for target in [
-        DialectType::MySQL,
-        DialectType::DataFusion,
-        DialectType::Snowflake,
-    ] {
+    for target in [DialectType::MySQL, DialectType::Snowflake] {
         assert!(transpile("SELECT 7 // 2", DialectType::DuckDB, target).is_err());
     }
+}
+
+#[test]
+fn duckdb_integer_division_lowers_to_plain_division_for_datafusion() {
+    // DataFusion's `/` already has DuckDB's `//` type-dependent semantics
+    // (integer operands truncate toward zero, a floating operand gives float
+    // division), so `a / nullif(b, 0)` is exact and -- unlike targets whose
+    // integer division is a separate operator -- needs no operand types.
+    for (sql, expected) in [
+        ("SELECT 7 // 2 AS v", "SELECT 7 / nullif(2, 0) AS v"),
+        ("SELECT -7 // 2 AS v", "SELECT -7 / nullif(2, 0) AS v"),
+        ("SELECT 7 // 0 AS v", "SELECT 7 / nullif(0, 0) AS v"),
+        ("SELECT x // 2 FROM t", "SELECT x / nullif(2, 0) FROM t"),
+        ("SELECT x // y FROM t", "SELECT x / nullif(y, 0) FROM t"),
+        (
+            "SELECT 8 // 2 // 2 AS v",
+            "SELECT 8 / nullif(2, 0) / nullif(2, 0) AS v",
+        ),
+    ] {
+        for options in [TranspileOptions::default(), TranspileOptions::strict()] {
+            let out = transpile_with_by_name(sql, "duckdb", "datafusion", &options)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(out, vec![expected], "{sql}");
+        }
+    }
+    // A known DECIMAL operand produces DOUBLE in DuckDB; DataFusion would keep
+    // decimal arithmetic, so the cast is still needed there.
+    let out = transpile(
+        "SELECT CAST(7 AS DECIMAL(10, 1)) // 2 AS v",
+        DialectType::DuckDB,
+        DialectType::DataFusion,
+    )
+    .unwrap();
+    assert!(
+        out[0].contains("AS DOUBLE") && out[0].contains("/ nullif(2, 0)"),
+        "{out:?}"
+    );
 }
 
 #[test]
