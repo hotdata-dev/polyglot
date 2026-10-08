@@ -1674,7 +1674,9 @@ pub fn eliminate_distinct_on_for_dialect(
         _ => DistinctOnNullsMode::NullsFirst,
     };
 
-    transform_recursive(expr, &|expr| eliminate_distinct_on_select(expr, nulls_mode))
+    transform_recursive(expr, &|expr| {
+        eliminate_distinct_on_select(expr, nulls_mode, target)
+    })
 }
 
 /// Resolve positional `ORDER BY <n>` references against `select_exprs`,
@@ -1683,7 +1685,8 @@ pub fn eliminate_distinct_on_for_dialect(
 fn resolve_positional_order_by(
     exprs: Vec<crate::expressions::Ordered>,
     select_exprs: &[Expression],
-) -> Vec<crate::expressions::Ordered> {
+    target: Option<DialectType>,
+) -> Result<Vec<crate::expressions::Ordered>> {
     exprs
         .into_iter()
         .map(|mut ord| {
@@ -1699,7 +1702,13 @@ fn resolve_positional_order_by(
                     }
                 }
             }
-            ord
+            if crate::dialects::contains_in_projection(&ord.this, |e| matches!(e, Expression::WindowFunction(_))) {
+                return Err(Error::unsupported(
+                    "DISTINCT ON ordering by a window expression requires an additional query layer",
+                    format!("{target:?}"),
+                ));
+            }
+            Ok(ord)
         })
         .collect()
 }
@@ -1707,6 +1716,7 @@ fn resolve_positional_order_by(
 fn eliminate_distinct_on_select(
     expr: Expression,
     nulls_mode: DistinctOnNullsMode,
+    target: Option<DialectType>,
 ) -> Result<Expression> {
     use crate::expressions::Case;
 
@@ -1727,7 +1737,8 @@ fn eliminate_distinct_on_select(
                         let mut exprs = resolve_positional_order_by(
                             order_by.expressions.clone(),
                             &select.expressions,
-                        );
+                            target,
+                        )?;
                         // Add NULL ordering based on target dialect
                         match nulls_mode {
                             DistinctOnNullsMode::NullsFirst => {
@@ -5973,7 +5984,7 @@ fn make_unnest_subquery(unnest: UnnestFunc, alias: Option<Identifier>) -> Expres
 /// the Union (unlike Python sqlglot). This function handles both cases by checking
 /// the right-hand SELECT for trailing ORDER BY/LIMIT and moving them to the Union.
 pub fn no_limit_order_by_union(expr: Expression) -> Result<Expression> {
-    use crate::expressions::{Limit as LimitClause, Offset as OffsetClause, OrderBy, Star};
+    use crate::expressions::{split_set_limit, Limit, Offset as OffsetClause, OrderBy, Star};
 
     match expr {
         Expression::Union(mut u) => {
@@ -5988,7 +5999,7 @@ pub fn no_limit_order_by_union(expr: Expression) -> Result<Expression> {
                     {
                         // Move ORDER BY/LIMIT from right Select to Union
                         u.order_by = right_select.order_by.take();
-                        u.limit = right_select.limit.take().map(|l| Box::new(l.this));
+                        u.limit = right_select.limit.take().map(Limit::into_set_limit);
                         u.offset = right_select.offset.take().map(|o| Box::new(o.this));
                     }
                 }
@@ -6002,12 +6013,7 @@ pub fn no_limit_order_by_union(expr: Expression) -> Result<Expression> {
                 let union_limit: Option<Box<Expression>> = u.limit.take();
                 let union_offset: Option<Box<Expression>> = u.offset.take();
 
-                // Convert Union's limit (Box<Expression>) to Select's limit (Limit struct)
-                let select_limit: Option<LimitClause> = union_limit.map(|l| LimitClause {
-                    this: *l,
-                    percent: false,
-                    comments: Vec::new(),
-                });
+                let (select_limit, select_fetch) = split_set_limit(union_limit);
 
                 // Convert Union's offset (Box<Expression>) to Select's offset (Offset struct)
                 let select_offset: Option<OffsetClause> = union_offset.map(|o| OffsetClause {
@@ -6049,6 +6055,7 @@ pub fn no_limit_order_by_union(expr: Expression) -> Result<Expression> {
                 });
                 select.order_by = order_by;
                 select.limit = select_limit;
+                select.fetch = select_fetch;
                 select.offset = select_offset;
 
                 Ok(Expression::Select(Box::new(select)))
