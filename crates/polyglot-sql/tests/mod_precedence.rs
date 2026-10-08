@@ -49,3 +49,33 @@ fn dialects_that_keep_the_function_form_are_unchanged() {
     .unwrap();
     assert_eq!(out, vec!["SELECT 2 * MOD(5, 3) AS v"]);
 }
+
+#[test]
+fn datafusion_renders_mod_as_percent_with_grouping() {
+    // DataFusion has no MOD function, only `%`, so both the generator path
+    // (a parsed ModFunc) and the normalization path (a generic MOD call from
+    // BigQuery) must render the operator, keeping the call's grouping.
+    for (source, sql, expected) in [
+        (
+            DialectType::DuckDB,
+            "SELECT 2 * MOD(5, 3) AS v",
+            "SELECT 2 * (5 % 3) AS v",
+        ),
+        (
+            DialectType::BigQuery,
+            "SELECT 2 * MOD(5 + 1, 4) AS v",
+            "SELECT 2 * ((5 + 1) % 4) AS v",
+        ),
+        (
+            DialectType::BigQuery,
+            "SELECT MOD(7, 4) * 2 AS v",
+            "SELECT 7 % 4 * 2 AS v",
+        ),
+    ] {
+        assert_eq!(
+            transpile(sql, source, DialectType::DataFusion).unwrap(),
+            vec![expected],
+            "{source:?}: {sql}"
+        );
+    }
+}

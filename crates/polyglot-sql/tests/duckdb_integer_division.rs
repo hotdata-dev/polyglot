@@ -297,6 +297,35 @@ fn duckdb_integer_division_lowers_to_plain_division_for_datafusion() {
 }
 
 #[test]
+fn duckdb_source_division_inside_int_div_stays_float_for_datafusion() {
+    // DuckDB's `/` is always DOUBLE, but DataFusion's `/` on two integers
+    // truncates, so a source division inside a `//` operand gets its dividend
+    // cast to DOUBLE: `(7 / 2) // 2` is 1.75 in DuckDB, not 1. A lowered `//`
+    // (the generated NULLIF divisor) is left as the integer it is.
+    for (sql, expected) in [
+        (
+            "SELECT (7 / 2) // 2 AS v",
+            "SELECT (CAST(7 AS DOUBLE) / 2) / nullif(2, 0) AS v",
+        ),
+        (
+            "SELECT 7 // (4 / 2) AS v",
+            "SELECT 7 / nullif((CAST(4 AS DOUBLE) / 2), 0) AS v",
+        ),
+        (
+            "SELECT 7.5 / 2 // 2 AS v",
+            "SELECT 7.5 / 2 / nullif(2, 0) AS v",
+        ),
+        (
+            "SELECT 7 // 2 // 2 AS v",
+            "SELECT 7 / nullif(2, 0) / nullif(2, 0) AS v",
+        ),
+    ] {
+        let out = transpile(sql, DialectType::DuckDB, DialectType::DataFusion).unwrap();
+        assert_eq!(out, vec![expected], "{sql}");
+    }
+}
+
+#[test]
 #[ignore = "requires POLYGLOT_DUCKDB and POLYGLOT_SQLITE CLI paths"]
 fn duckdb_integer_division_sqlite_execution() {
     use std::process::Command;
