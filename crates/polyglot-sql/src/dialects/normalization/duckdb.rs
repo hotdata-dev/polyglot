@@ -33,6 +33,32 @@ fn numeric_kind(expr: &Expression) -> NumericKind {
     }
 }
 
+/// DataFusion's `/` keeps the operands' own types: a lowered integer `//`
+/// (`a / NULLIF(b, 0)`) is still an integer, and a DECIMAL operand anywhere
+/// in a chain of divisions still yields DECIMAL. So, unlike `numeric_kind`,
+/// `Div` is classified from its operands rather than treated as Float.
+fn datafusion_numeric_kind(expr: &Expression) -> NumericKind {
+    match expr {
+        Expression::Paren(p) => datafusion_numeric_kind(&p.this),
+        Expression::Neg(n) => datafusion_numeric_kind(&n.this),
+        Expression::Alias(a) => datafusion_numeric_kind(&a.this),
+        Expression::Add(b)
+        | Expression::Sub(b)
+        | Expression::Mul(b)
+        | Expression::Mod(b)
+        | Expression::Div(b) => combine(
+            datafusion_numeric_kind(&b.left),
+            datafusion_numeric_kind(&b.right),
+        ),
+        Expression::IntDiv(_) => NumericKind::Integer,
+        Expression::Function(f) if f.name.eq_ignore_ascii_case("NULLIF") && f.args.len() == 2 => {
+            datafusion_numeric_kind(&f.args[0])
+        }
+        Expression::NullIf(f) => datafusion_numeric_kind(&f.this),
+        _ => expression_numeric_kind(expr),
+    }
+}
+
 pub(in crate::dialects) fn prepare_integer_division(
     expr: Expression,
     source: DialectType,
@@ -55,10 +81,16 @@ pub(in crate::dialects) fn prepare_integer_division(
         // DataFusion's `/` is type-dependent in the same way as DuckDB's `//`:
         // integer operands truncate toward zero and a floating operand makes
         // it float division. So `a / NULLIF(b, 0)` is exact without resolving
-        // operand types; only a known DECIMAL needs the DOUBLE cast, since
-        // DataFusion keeps decimal arithmetic where DuckDB produces DOUBLE.
+        // operand types. A DECIMAL operand is the one exception: DuckDB
+        // produces DOUBLE there while DataFusion keeps decimal arithmetic, so
+        // cast whenever a DECIMAL is involved on either side (an untyped
+        // partner included) unless a float operand already decides the type.
         if target == DialectType::DataFusion {
-            if kind == NumericKind::Decimal {
+            let left = datafusion_numeric_kind(&division.this);
+            let right = datafusion_numeric_kind(&division.expression);
+            let decimal_involved = left == NumericKind::Decimal || right == NumericKind::Decimal;
+            let float_involved = left == NumericKind::Float || right == NumericKind::Float;
+            if decimal_involved && !float_involved {
                 division.this = super::operators::cast_expr(
                     division.this,
                     DataType::Double {

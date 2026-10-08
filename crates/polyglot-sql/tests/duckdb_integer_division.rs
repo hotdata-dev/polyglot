@@ -269,18 +269,31 @@ fn duckdb_integer_division_lowers_to_plain_division_for_datafusion() {
             assert_eq!(out, vec![expected], "{sql}");
         }
     }
-    // A known DECIMAL operand produces DOUBLE in DuckDB; DataFusion would keep
-    // decimal arithmetic, so the cast is still needed there.
-    let out = transpile(
-        "SELECT CAST(7 AS DECIMAL(10, 1)) // 2 AS v",
-        DialectType::DuckDB,
-        DialectType::DataFusion,
-    )
-    .unwrap();
-    assert!(
-        out[0].contains("AS DOUBLE") && out[0].contains("/ nullif(2, 0)"),
-        "{out:?}"
-    );
+    // A DECIMAL operand produces DOUBLE in DuckDB, while DataFusion would keep
+    // decimal arithmetic, so the cast is still needed -- including next to an
+    // untyped column, and when the DECIMAL sits on either side of a lowered
+    // integer // (which stays integer-typed in DataFusion).
+    for (sql, expected) in [
+        (
+            "SELECT CAST(7 AS DECIMAL(10, 1)) // 2 AS v",
+            "SELECT CAST(CAST(7 AS DECIMAL(10, 1)) AS DOUBLE) / nullif(2, 0) AS v",
+        ),
+        (
+            "SELECT x // CAST(2 AS DECIMAL(10, 1)) AS v FROM t",
+            "SELECT CAST(x AS DOUBLE) / nullif(CAST(2 AS DECIMAL(10, 1)), 0) AS v FROM t",
+        ),
+        (
+            "SELECT 7 // 2 // CAST(3 AS DECIMAL(10, 1)) AS v",
+            "SELECT CAST(7 / nullif(2, 0) AS DOUBLE) / nullif(CAST(3 AS DECIMAL(10, 1)), 0) AS v",
+        ),
+        (
+            "SELECT CAST(7 AS DECIMAL(10, 1)) // (2 // 1) AS v",
+            "SELECT CAST(CAST(7 AS DECIMAL(10, 1)) AS DOUBLE) / nullif((2 / nullif(1, 0)), 0) AS v",
+        ),
+    ] {
+        let out = transpile(sql, DialectType::DuckDB, DialectType::DataFusion).unwrap();
+        assert_eq!(out, vec![expected], "{sql}");
+    }
 }
 
 #[test]
