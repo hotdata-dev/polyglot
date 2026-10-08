@@ -4,6 +4,45 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.13.2] - 2026-10-08
+
+### Changed
+
+- Routine Rust verification now includes dedicated DuckDB integer-division and
+  `ORDER BY ALL` regression suites.
+- Changelog version headings now link to comparisons against the preceding
+  release tag.
+
+### Fixed
+
+- DuckDB `//` parses as a single integer-division operator with the correct
+  precedence and round-trips without becoming two division operators.
+  Cross-dialect conversions preserve integer truncation, fractional results
+  for floating-point and decimal operands, and `NULL` on division by zero,
+  including nested expressions and typed function arguments. SQLite uses
+  integer arithmetic and a truncating cast to preserve large-integer precision.
+  Unresolved operand types and unsupported integer-division targets report errors.
+  ([#484](https://github.com/tobilg/polyglot/pull/484))
+- `ORDER BY ALL` expands to positional sort keys for targets without native
+  support, including compound and parenthesized queries, while retaining native
+  syntax for supported DuckDB, Snowflake, ClickHouse, Spark, and Databricks
+  queries. Sort direction and NULL ordering are preserved. Conversions requiring
+  expansion reject unknown projection widths (`*`, nested `COLUMNS(...)`, or
+  `UNION BY NAME`) and incompatible MySQL NULL ordering. Snowflake aggregate projections
+  use positional ordering. The `ALL` keyword remains distinct from ordinary
+  identifiers through column renaming, identifier quoting, and AST JSON round
+  trips. Ordering on parenthesized queries now participates in dialect and
+  NULL-ordering transformations.
+  ([#485](https://github.com/tobilg/polyglot/pull/485))
+- `DISTINCT ON` emulation resolves positional sort keys to their projected
+  expressions before constructing the ranking window, including keys expanded
+  from `ORDER BY ALL` for targets with native `ALL` support. Sort keys that
+  would require nesting window functions report an unsupported conversion.
+  ([#485](https://github.com/tobilg/polyglot/pull/485))
+- macOS Python wheel builds no longer depend on successful `sccache` remote-cache
+  initialization. Explicit stable Rust setup and a best-effort Rust artifact
+  cache prevent cache failures from interrupting wheel builds.
+
 ## [0.13.1] - 2026-09-30
 
 ### Fixed
@@ -2027,6 +2066,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.13.2]: https://github.com/tobilg/polyglot/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/tobilg/polyglot/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/tobilg/polyglot/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/tobilg/polyglot/compare/v0.12.0...v0.12.1
