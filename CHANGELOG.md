@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.13.3] - 2026-10-09
+
+### Added
+
+- Optional Python integration tests compare DuckDB integer-division queries
+  with generated DataFusion SQL in both engines, in default and strict modes.
+  Coverage includes nested expressions, decimal operands, large integers,
+  numeric casts, zero divisors, and NULL values.
+
+### Changed
+
+- Routine Rust verification now runs the MOD precedence regression suite.
+
+### Fixed
+
+- DuckDB integer `//` now lowers for the DataFusion target as
+  `a / NULLIF(b, 0)`. DataFusion's `/` already truncates integer operands
+  toward zero and performs float division on a floating operand, so the
+  result matches DuckDB, including `NULL` on a zero divisor, for resolved
+  numeric operands. Unresolved columns and function return types report an
+  error in both default and strict modes; explicit numeric casts remain
+  supported. Decimal operands use floating arithmetic. Nested DuckDB `/`
+  expressions retain floating division through functions, casts, and CASE,
+  including column operands and user-written `NULLIF` divisors. Numeric casts
+  from known fractional operands to integers inside `//` round as in DuckDB.
+- `MOD(a, b)` lowered to the infix `%` operator keeps the call's grouping
+  under arithmetic and unary operators, including nested calls and bitwise
+  arguments. DataFusion, which has no `MOD` function, renders `%` as well.
+- Infix integer division preserves operand grouping, including
+  `100 // MOD(7, 4)` and integer-division functions lowered to `//` or `DIV`.
+- Arithmetic expressions explicitly group bitwise operands to preserve
+  precedence across dialects.
+
 ## [0.13.2] - 2026-10-08
 
 ### Changed
@@ -2066,6 +2099,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.13.3]: https://github.com/tobilg/polyglot/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/tobilg/polyglot/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/tobilg/polyglot/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/tobilg/polyglot/compare/v0.12.1...v0.13.0
