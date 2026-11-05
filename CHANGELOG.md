@@ -4,6 +4,224 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.14.0] - 2026-11-03
+
+### Added
+
+- `polyglot-sql-wasi`, an experimental WASI command exposing parse, generate,
+  transpile, and format over JSON stdin/stdout. Build with `make build-wasi`
+  and embed the portable module in a host such as Go with wazero 1.11 or newer.
+  All dialects are included. Requests support up to 1536 JSON nesting levels;
+  parsing rejects ASTs that would exceed that limit when sent back to generate,
+  including deeper queries accepted by the core ClickHouse parser.
+- Runnable Go/wazero and TypeScript/Node.js WASI examples with CI checks,
+  a protocol and integration guide, and tested WASI release assets with SHA-256
+  checksums.
+- Parsing and generation for ClickHouse pipe queries, stream watermarks, and
+  `LIMIT AFTER`/`UNTIL` boundaries; Trino query-local SQL routines; DuckDB
+  nearest joins; Hive/Spark multiple inserts; and Doris match predicates with
+  analyzer selection. Unsupported target dialects report conversion errors.
+- Python expression subclasses and type stubs for the ten new AST variants,
+  including `PipeQuery`, `MultiInsert`, `WithFunction`, and `DorisMatch`.
+
+### Changed
+
+- Rust parsing shares source text for token ranges, and AST JSON decoding avoids
+  intermediate copies for standard inputs. AST diffing, type annotation,
+  validation, and lineage reuse matching data and scope lookups.
+- Python AST traversal uses immutable shared views instead of copying descendant
+  subtrees. TypeScript read-only traversal avoids rebuilding containers, and
+  `findFirst` stops visiting once it finds a match.
+- Playground parsing, formatting, transpilation, validation, and lineage run in
+  a Web Worker. Tabs ignore results from superseded requests or edited inputs,
+  and lineage reuses its result to collect source tables.
+- Public Rust AST types gain expression variants and fields for the new syntax,
+  including join, DML, DDL, and refresh options. Callers constructing these types
+  directly or matching enums exhaustively may need to update their code.
+- Compatibility fixtures now target SQLGlot 30.27.0 and ClickHouse
+  26.10.2.103-stable. Benchmark entry points share a locked environment with
+  SQLGlot[c] 30.27.0, SQLFluff 4.5.0, SQLParse 0.6.1, and SQLOxide 0.61.1.
+  Benchmark tooling now requires Python 3.10 or newer and includes SQLOxide on
+  Python 3.14.
+
+### Fixed
+
+- WASI generation no longer overflows wazero's x86-64 call stack for deeply
+  nested ASTs within the supported JSON depth limit.
+- DuckDB 2.0 direct AST generation now emits `REGEXP_MATCHES` for partial
+  regular expression predicates, preserving flags, negation, NULL behavior,
+  and dynamic patterns.
+  ([#521](https://github.com/tobilg/polyglot/pull/521))
+- Explicit full-match regular expressions preserve options and lineage
+  dependencies. Foreign targets without a verified mapping report unsupported
+  instead of silently converting full matching to partial matching. Strict
+  diagnostics recognize these predicates while qualified user-defined function
+  calls retain their names.
+  ([#521](https://github.com/tobilg/polyglot/pull/521))
+- Oracle flashback queries now reject unsupported relation shapes before consuming
+  the snapshot clause. Oracle SCNs reaching other dialects are reported through
+  the unsupported-construct policy.
+- Timestamp time travel generation now reports unsupported target syntax instead
+  of emitting invalid `FOR TIMESTAMP AS OF` clauses, including for BigQuery and
+  Snowflake. The generator raises in strict mode and emits a diagnostic comment
+  in lenient modes. Existing source-time-zone checks, supported conversions, and
+  native target time travel remain intact.
+- Core verification includes Oracle flashback regressions for partition and
+  subpartition selection, sampling order, aliases, and target-dialect policies.
+- Dialect round trips retain additional table and column options, constraints,
+  view properties, materialized-view refresh schedules, replacement keys, and
+  structured update targets across MySQL, PostgreSQL, Oracle, ClickHouse,
+  StarRocks, Spark, Databricks, and Snowflake.
+- Literal and expression handling preserves Oracle alternative quotes,
+  Hive/Spark escapes, PostgreSQL's internal `"char"` type, decimal precision,
+  Trino temporal precision and time zones, SQLite operator grouping, and
+  DuckDB regex, lambda, interval, and explicit sort semantics.
+- Cross-dialect generation preserves date-format fields, filtered counts,
+  array boundaries, NULL behavior, JSON key/index distinctions, and T-SQL
+  pagination scope. Conversions that cannot preserve source semantics now
+  report unsupported cases, including affected JSON, numeric, temporal, array,
+  and locking operations.
+- ClickHouse fixture extraction handles quoted SQL correctly and excludes
+  vendor-marked negative tests from successful round-trip expectations.
+
+## [0.13.5] - 2026-10-31
+
+### Added
+
+- Projection upstream references expose `pathTransformKind`, `pathFunctions`,
+  and `pathWindow` across Rust, TypeScript, Python, and Go. These describe
+  transformations through CTEs, derived tables, and set-operation branches;
+  the projection's existing `transformKind` retains its meaning. Paths to the
+  same source column merge their functions and strongest transform kind.
+  ([#516](https://github.com/tobilg/polyglot/pull/516))
+
+### Changed
+
+- OpenLineage prepares and scopes each query once, then resolves all output
+  columns against that shared scope.
+  ([#512](https://github.com/tobilg/polyglot/pull/512))
+- Rust callers constructing `ColumnReferenceFact` directly must supply the new
+  path metadata fields. Shared Rust verification also includes the DuckDB
+  decimal-precision regression suite.
+
+### Fixed
+
+- Star expansion applies `EXCEPT`/`EXCLUDE`, `REPLACE`, and `RENAME` throughout
+  qualification, query analysis, lineage, and OpenLineage. Stars over CTEs,
+  derived tables, `PIVOT`, and `UNPIVOT` expose their output columns; quoted
+  modifier names retain dialect-specific case rules. ClickHouse pattern
+  exclusions remain unexpanded and produce an OpenLineage warning.
+  ([#516](https://github.com/tobilg/polyglot/pull/516))
+- Query analysis and lineage resolve pivot aggregates and pivot fields, unpivot
+  passthrough columns, ClickHouse `ARRAY JOIN` aliases, literal Snowflake
+  `IDENTIFIER` table names, and lateral outer references. Traced constants no
+  longer acquire spurious upstream columns, and path metadata respects nested
+  query scopes and quoted function identities.
+  ([#516](https://github.com/tobilg/polyglot/pull/516))
+- DuckDB preserves leading-dot decimal literals, including trailing zeroes,
+  signs, exponents, and maximum-precision fractions, without inserting a
+  leading zero that changes inferred decimal precision.
+  ([#508](https://github.com/tobilg/polyglot/pull/508))
+- `QUALIFY` emulation reuses projected window results and preserves output
+  names, correlated subqueries, `DISTINCT`, ordering, and row limits, including
+  nested CTEs. `DISTINCT ON` runs after the qualification filter; unresolved
+  wildcard outputs report errors. Redshift retains native `QUALIFY` syntax.
+- `UNION BY NAME` conversion aligns known output names and fills missing
+  columns with `NULL`, preserving branch-local ordering, limits, and anonymous
+  parameter binding order. Unknown or ambiguous outputs report errors.
+- MySQL generation preserves explicit and source-default NULL ordering for
+  queries and windows, including aliases and known ordinal sort keys. Unsafe
+  rewrites involving unresolved ordinals or `RANGE`/`GROUPS` frames report
+  errors. StarRocks and Doris use native NULL-ordering syntax.
+- Casts from other dialects to ClickHouse preserve nullable scalar values,
+  including typed `NULL`, parameterized types, and wide or unsigned integers.
+  Native ClickHouse casts retain explicit nullability, map keys stay
+  non-nullable, and unsupported NULL container casts report errors in strict
+  mode.
+
+## [0.13.4] - Unreleased
+
+### Changed
+
+- Public Rust AST types now include `Lateral.column_aliases_quoted` and
+  `key_parts` on `TableConstraint::PrimaryKey` and `TableConstraint::Unique`.
+  Callers constructing these types directly may need to update struct literals
+  or exhaustive matches. Older serialized ASTs remain readable; unquoted
+  LATERAL aliases and simple unquoted constraint keys retain their existing
+  JSON shape.
+- Shared Rust verification and CI now run dedicated regression suites for
+  DuckDB relation aliases, numeric exponent boundaries, query analysis,
+  predicate grouping, DuckDB JSON arrows and lambdas, and quoted relation
+  columns. Coverage also includes ordinality, quoted constraint keys, legacy
+  AST JSON, and parser depth limits.
+
+### Fixed
+
+- Query analysis includes every base table in parenthesized join groups,
+  including nested joins, CTE-backed members, and subqueries in join predicates.
+  Aliased and re-aliased groups retain their scope boundaries and column aliases,
+  without leaking internal relation names or duplicating predicate references.
+  ([#491](https://github.com/tobilg/polyglot/pull/491))
+- DuckDB accepts unreserved words such as `owned`, `match`, and `final` as
+  explicit or implicit relation aliases on tables, subqueries, and table
+  functions. Column alias lists, joins, correlated queries, and following
+  clauses remain intact; ClickHouse still treats `FINAL` as a table modifier.
+  ([#493](https://github.com/tobilg/polyglot/pull/493))
+- Numeric tokenization only consumes an exponent marker and optional sign when
+  exponent digits follow. Compact expressions such as `CASE WHEN TRUE THEN
+  13END` no longer lose the start of `END`, while valid scientific notation
+  continues to parse correctly.
+  ([#495](https://github.com/tobilg/polyglot/pull/495))
+- SQLite and PostgreSQL bitwise operators use their shared left-associative
+  precedence tier, including PostgreSQL `#` XOR while retaining `^` as
+  exponentiation. Cross-dialect generation groups operands where precedence
+  differs, and bitwise shifts participate in dialect transformations.
+  ([#500](https://github.com/tobilg/polyglot/issues/500))
+- SQLite concatenation and JSON arrows (`||`, `->`, and `->>`) share the correct
+  precedence above multiplication. Parsing and cross-dialect generation preserve
+  their grouping with arithmetic, unary operators, `COLLATE`, and other JSON
+  extractions, without interpreting SQLite JSON arrows as lambdas.
+  ([#501](https://github.com/tobilg/polyglot/issues/501))
+- SQL generation preserves boolean operand grouping in comparisons, `IS NULL`,
+  truth tests, `IS JSON`, and `IS [NOT] DISTINCT FROM`, including expressions
+  constructed through the AST builder. Prefix `NOT` and nested boolean
+  connectors no longer change the meaning of the generated predicate.
+  ([#497](https://github.com/tobilg/polyglot/pull/497))
+- ClickHouse accepts operand-position `NOT` with its native comparison
+  precedence, preserving surrounding operands and following clauses. Negated
+  `LIKE`/`ILIKE` predicates retain quoted identifiers and query-analysis
+  references, and transformed `notLike` expressions round-trip consistently.
+- DuckDB distinguishes JSON extraction arrows from lambdas using the function
+  argument context. Dynamic and list-valued paths, nested lambdas, `COLUMNS`,
+  schema-qualified calls, and receiver-style list operations retain their
+  meaning. JSON `->` and scalar `->>` keep their distinct precedence, computed
+  paths and mixed extraction chains; generation groups arrow operands where
+  needed. Parenthesized lambdas respect parser depth limits.
+  ([#499](https://github.com/tobilg/polyglot/pull/499))
+- DuckDB casts accept JSON-arrow operands, including computed paths and nested
+  casts. Nested cast expressions isolate and restore the surrounding JSON-path
+  context, preserving the `AS` type separator, subsequent arrows, and following
+  query clauses.
+- LATERAL relation and column aliases preserve spaces, case, escaped quotes,
+  and explicit or implicit `AS` through parsing, generation, and AST JSON
+  round trips. Complete quoted names such as `"items(1)"`, `"items DESC"`, and
+  `"value ASC"` remain single identifiers in declarations and references rather
+  than being interpreted as index-prefix or ordering syntax.
+  ([#506](https://github.com/tobilg/polyglot/pull/506))
+- `LATERAL UNNEST ... WITH ORDINALITY` emits ordinality only once when both the
+  LATERAL wrapper and the inner function carry the flag, including older ASTs.
+- Quoted `PRIMARY KEY` and `UNIQUE` column names remain separate from index
+  prefix lengths and sort modifiers. Names containing parentheses or ending in
+  `ASC`/`DESC` retain their full spelling, while MySQL prefix/order syntax,
+  SQLite primary-key ordering, Spark/Hive normalization, and Databricks
+  `TIMESERIES` keys preserve their behavior. Legacy ASTs with encoded index
+  suffixes remain supported.
+- TypeScript SDK `addWhere`, numeric `setLimit`, and numeric `setOffset` throw
+  operation-specific errors when WASM cannot deserialize or transform the AST,
+  instead of silently returning the original query without the requested
+  clause. Failed mutations leave the input AST unchanged.
+  ([#503](https://github.com/tobilg/polyglot/pull/503))
+
 ## [0.13.3] - 2026-10-09
 
 ### Added
@@ -2099,6 +2317,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.14.0]: https://github.com/tobilg/polyglot/compare/v0.13.5...v0.14.0
+[0.13.5]: https://github.com/tobilg/polyglot/compare/v0.13.4...v0.13.5
+[0.13.4]: https://github.com/tobilg/polyglot/compare/v0.13.3...v0.13.4
 [0.13.3]: https://github.com/tobilg/polyglot/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/tobilg/polyglot/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/tobilg/polyglot/compare/v0.13.0...v0.13.1

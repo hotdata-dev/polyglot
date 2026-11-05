@@ -9,7 +9,7 @@
         test-rust-transpile-generic test-rust-parser test-rust-check \
         test-rust-clickhouse-parser test-rust-clickhouse-coverage \
         test-ffi build-go test-go test-go-integration \
-        test-compare build-wasm clean-fixtures clean-clickhouse-fixtures clean-external clean \
+        test-compare build-wasm build-wasi test-rust-wasi test-wasi-runtime prepare-wasi-examples test-wasi-examples clean-fixtures clean-clickhouse-fixtures clean-external clean \
         generate-bindings copy-bindings cargo-build-release \
         build-all build-ffi build-ffi-static generate-ffi-header build-ffi-example clean-ffi build-go \
         develop-python test-python build-python typecheck-python \
@@ -26,10 +26,10 @@
 # =============================================================================
 
 SQLGLOT_REPO := https://github.com/tobymao/sqlglot.git
-SQLGLOT_REF := v30.14.0
+SQLGLOT_REF := v30.27.0
 
 CLICKHOUSE_REPO := https://github.com/ClickHouse/ClickHouse.git
-CLICKHOUSE_REF := v26.7.1.1315-stable
+CLICKHOUSE_REF := v26.10.2.103-stable
 
 PYTHON_RELEASE_PROFILE := python_release
 PYTHON_BENCH_BUILD_ENV := MATURIN_PEP517_ARGS="--profile $(PYTHON_RELEASE_PROFILE)"
@@ -78,6 +78,9 @@ help:
 	@echo "  make test-ffi           - Run C FFI crate tests"
 	@echo "  make test-go            - Run Go SDK unit tests"
 	@echo "  make test-go-integration - Build FFI and run Go SDK integration tests"
+	@echo "  make test-rust-wasi      - Run WASI protocol tests on the host"
+	@echo "  make test-wasi-runtime   - Build WASI and test in wazero"
+	@echo "  make test-wasi-examples  - Build WASI and check Go/Node.js examples (see docs/wasi.md)"
 	@echo ""
 	@echo "  ClickHouse Tests:"
 	@echo "  make test-rust-clickhouse-parser   - ClickHouse parser tests"
@@ -109,6 +112,8 @@ help:
 	@echo "  make generate-bindings   - Generate TypeScript bindings (ts-rs) and copy to SDK"
 	@echo "  make copy-bindings       - Copy bindings from Rust crate to TypeScript SDK"
 	@echo "  make build-wasm          - Build WASM package"
+	@echo "  make build-wasi          - Build the portable WASI command module"
+	@echo "  make prepare-wasi-examples - Build and copy the module into both WASI examples"
 	@echo "  make cargo-build-release - Build core Rust crate with the native performance profile"
 	@echo "  make build-ffi           - Build C FFI shared/static library"
 	@echo "  make build-ffi-static    - Build C FFI static library"
@@ -285,12 +290,24 @@ test-rust-verify-core:
 	@echo ""
 	@echo "=== Lib unit tests ==="
 	@cargo test --lib -p polyglot-sql
+	@cargo test -p polyglot-sql --test deserialize_payloads
 	@cargo test -p polyglot-sql --test deep_nesting_regression
 	@cargo test -p polyglot-sql --test transform_regression
+	@cargo test -p polyglot-sql --test fixture_update_regression
 	@cargo test -p polyglot-sql --test dialect_matrix
 	@cargo test -p polyglot-sql --test duckdb_order_by_all
 	@cargo test -p polyglot-sql --test duckdb_integer_division
 	@cargo test -p polyglot-sql --test mod_precedence
+	@cargo test -p polyglot-sql --test duckdb_unreserved_relation_aliases
+	@cargo test -p polyglot-sql --test duckdb_regex_operators
+	@cargo test -p polyglot-sql --test numeric_exponent_boundaries
+	@cargo test -p polyglot-sql --test duckdb_decimal_precision
+	@cargo test -p polyglot-sql --test query_analysis
+	@cargo test -p polyglot-sql --test query_analysis_regression
+	@cargo test -p polyglot-sql --test is_predicate_precedence
+	@cargo test -p polyglot-sql --test duckdb_json_arrow_context
+	@cargo test -p polyglot-sql --test quoted_relation_columns
+	@cargo test -p polyglot-sql --test oracle_flashback
 	@echo ""
 	@echo "=== Generic identity tests ==="
 	@cargo test --test sqlglot_identity test_sqlglot_identity_all -p polyglot-sql -- --nocapture
@@ -331,6 +348,7 @@ test-rust-ci-release-fixtures:
 
 test-rust-ci-bindings:
 	cargo test -p polyglot-sql-wasm --lib -- --nocapture
+	@$(MAKE) test-rust-wasi
 	@$(MAKE) test-ffi
 	@$(MAKE) build-ffi
 
@@ -446,7 +464,7 @@ bench-rust-parsing-report:
 
 # Run Python sqlglot benchmarks (JSON output)
 bench-python:
-	@uv run --with sqlglot[c] python3 tools/bench-compare/bench_sqlglot.py
+	@uv run --project tools/bench-compare --locked python3 tools/bench-compare/bench_sqlglot.py
 
 # Parse benchmark (core): polyglot-sql (Rust/PyO3) vs sqlglot[c] native extensions via pyperf
 bench-parse:
@@ -531,6 +549,55 @@ build-wasm:
 	cd packages/sdk && pnpm run build:wasm
 	cd packages/sdk && pnpm run build
 
+# Build the WASI command module.
+#
+# This is a different artifact from build-wasm: that one is a wasm-bindgen
+# module for a JavaScript host, this one is a WASI command that speaks JSON on
+# stdin and stdout. A host embeds the .wasm and runs it in a WebAssembly
+# runtime, so there is nothing to install and nothing to locate at run time.
+# Go hosts can use wazero, which needs no cgo.
+#
+# panic = "abort" from the release profile turns a Rust panic into a bare trap
+# with no message, so build with WASI_PROFILE=dev when diagnosing one.
+WASI_TARGET ?= wasm32-wasip1
+WASI_PROFILE ?= release
+# Cargo writes the dev profile to target/<triple>/debug, not .../dev, so the
+# artifact directory is not always the profile name.
+WASI_OUT_DIR = $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)/$(WASI_TARGET)/$(if $(filter dev,$(WASI_PROFILE)),debug,$(WASI_PROFILE))
+WASI_ARTIFACT = $(WASI_OUT_DIR)/polyglot_sql_wasi.wasm
+build-wasi:
+	@rustup target list --installed | grep -q '^$(WASI_TARGET)$$' || \
+		{ echo "Missing target $(WASI_TARGET). Run: rustup target add $(WASI_TARGET)"; exit 1; }
+	cargo build -p polyglot-sql-wasi --target $(WASI_TARGET) \
+		$(if $(filter release,$(WASI_PROFILE)),--release,--profile $(WASI_PROFILE))
+	@ls -lh "$(WASI_ARTIFACT)"
+
+# Protocol tests for the WASI module, run on the host target so no WebAssembly
+# runtime is needed.
+test-rust-wasi:
+	cargo test -p polyglot-sql-wasi
+
+# Protocol tests against the built WASI module in a real WebAssembly runtime.
+#
+# Native tests cannot catch target-specific stack limits. The linker controls
+# the module's linear-memory stack, while runtime call stack usage also depends
+# on the host architecture. Run on amd64 and arm64: a passing runtime test on
+# one architecture does not cover the other.
+test-wasi-runtime: build-wasi
+	cd tools/wasi-smoke && POLYGLOT_WASI_MODULE="$(abspath $(WASI_ARTIFACT))" go test ./...
+
+prepare-wasi-examples: build-wasi
+	cp "$(WASI_ARTIFACT)" examples/wasi-go/polyglot_sql_wasi.wasm
+	cp "$(WASI_ARTIFACT)" examples/wasi-typescript/polyglot_sql_wasi.wasm
+
+# Install the standalone TypeScript example's locked dependencies first:
+# pnpm --dir examples/wasi-typescript install --frozen-lockfile
+test-wasi-examples: prepare-wasi-examples
+	cd examples/wasi-go && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./... && CGO_ENABLED=0 go run .
+	pnpm --dir examples/wasi-typescript typecheck
+	pnpm --dir examples/wasi-typescript test
+	pnpm --dir examples/wasi-typescript start
+
 # Build everything (release-safe order)
 build-all:
 	@$(MAKE) cargo-build-release
@@ -600,6 +667,7 @@ lint-rust:
 	cargo clippy -p polyglot-sql-ffi --all-targets --no-deps -- -D warnings
 	cargo clippy -p polyglot-sql-wasm --lib --no-deps -- -D warnings
 	cargo clippy -p polyglot-sql-python --lib --no-deps -- -D warnings
+	cargo clippy -p polyglot-sql-wasi --all-targets --no-deps -- -D warnings
 
 lint-sdk:
 	cd packages/sdk && pnpm run lint

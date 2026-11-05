@@ -26,6 +26,64 @@ fn assert_clickhouse_normalized_roundtrip(sql: &str) {
 }
 
 #[test]
+fn clickhouse_regex_extract_accepts_expression_arguments() {
+    // https://clickhouse.com/docs/sql-reference/functions/string-search-functions#extract
+    for sql in [
+        "SELECT extract((SELECT 'abc'), '(a)')",
+        "SELECT extract(('ab' || 'c'), '(a)')",
+        "SELECT extract(CAST('abc' AS String), '(a)')",
+    ] {
+        let ast = parse(sql, DialectType::ClickHouse).unwrap();
+        let polyglot_sql::Expression::Select(select) = &ast[0] else {
+            panic!("expected SELECT")
+        };
+        assert!(
+            matches!(&select.expressions[0], polyglot_sql::Expression::Function(function)
+            if function.name.eq_ignore_ascii_case("extract"))
+        );
+        assert_clickhouse_normalized_roundtrip(sql);
+    }
+    assert_clickhouse_normalized_roundtrip("SELECT EXTRACT(YEAR FROM ts) FROM t");
+}
+
+#[test]
+fn clickhouse_limit_stream_boundaries_roundtrip() {
+    // https://clickhouse.com/blog/clickhouse-release-26-09#limit-with-boundary-conditions
+    for tail in [
+        "LIMIT 2 AFTER number >= 1",
+        "LIMIT AFTER number >= 1 UNTIL number > 4",
+        "LIMIT 2 AFTER number IN (2, 3) ALL UNTIL number IN (3, 5)",
+        "LIMIT UNTIL number = 4",
+        "LIMIT 1 AFTER number IN (SELECT 1)",
+    ] {
+        let sql = format!("SELECT number FROM numbers(10) ORDER BY number {tail}");
+        assert_eq!(normalize_clickhouse(&sql), sql);
+        assert_clickhouse_normalized_roundtrip(&sql);
+        assert!(Dialect::get(DialectType::ClickHouse)
+            .transpile(&sql, DialectType::PostgreSQL)
+            .is_err());
+    }
+    for count in ["after", "until", "\"after\""] {
+        let sql = format!("SELECT number FROM numbers(10) LIMIT {count}");
+        assert_eq!(normalize_clickhouse(&sql), sql);
+    }
+}
+
+#[test]
+fn clickhouse_apply_prefix_and_nested_matcher_roundtrip() {
+    // Vendor fixtures 05211_apply_transformer_format_escaping.sql and
+    // 05182_columns_matcher_alias_columns.sql exercise these forms.
+    for sql in [
+        "SELECT * APPLY (toString, 'x''y') FROM t",
+        "SELECT * APPLY (x -> x + 1, 'p_') FROM t",
+        "SELECT t.* APPLY (toString, 'f_') FROM t",
+        "SELECT [COLUMNS('^metric_') APPLY sum] FROM t",
+    ] {
+        assert_clickhouse_normalized_roundtrip(sql);
+    }
+}
+
+#[test]
 fn clickhouse_parses_array_literal_with_nested_subscript_and_cast() {
     assert_clickhouse_parse("SELECT [[1][1]]::Array(UInt32)");
 }
@@ -236,4 +294,138 @@ fn clickhouse_parses_newer_select_tolerance_shapes() {
         "WITH interval AS (SELECT 1 AS val), t0_renamed AS (SELECT * FROM t0_renamed) SELECT TOP 10 *, t0_renamed.*, *, t0_renamed.* WHERE -t0_renamed.v1 GROUP BY t0_renamed.v1, t0_renamed.v2, t0_renamed.v3",
     );
     assert_clickhouse_normalized_roundtrip("SELECT 1 == SOME (SELECT number FROM numbers(10))");
+}
+
+#[test]
+fn clickhouse_foreign_typed_nulls_have_consistent_nullable_scalar_types() {
+    let sql = "SELECT CAST(NULL AS VARCHAR) AS s, CAST(NULL AS BIGINT) AS i, CAST(NULL AS DATE) AS d, CAST(NULL AS DOUBLE) AS f, CAST(NULL AS BOOLEAN) AS b";
+    for source in [
+        DialectType::Generic,
+        DialectType::DuckDB,
+        DialectType::PostgreSQL,
+        DialectType::Trino,
+    ] {
+        let output = polyglot_sql::transpile(sql, source, DialectType::ClickHouse).unwrap();
+        assert_eq!(output[0], "SELECT CAST(NULL AS Nullable(String)) AS s, CAST(NULL AS Nullable(Int64)) AS i, CAST(NULL AS Nullable(DATE)) AS d, CAST(NULL AS Nullable(Float64)) AS f, CAST(NULL AS Nullable(Bool)) AS b", "{source:?}");
+    }
+}
+
+#[test]
+fn clickhouse_nullable_scalars_include_parameters_and_nullable_expressions() {
+    for (dtype, expected) in [
+        ("VARCHAR(20)", "String"),
+        ("CHAR(3)", "String"),
+        ("DECIMAL(10, 2)", "Decimal(10, 2)"),
+        ("UUID", "UUID"),
+        ("DOUBLE PRECISION", "Float64"),
+        ("DATE32", "Date32"),
+    ] {
+        let sql = format!("SELECT CAST(a AS {dtype}) FROM t");
+        let output =
+            polyglot_sql::transpile(&sql, DialectType::Generic, DialectType::ClickHouse).unwrap();
+        assert_eq!(
+            output[0],
+            format!("SELECT CAST(a AS Nullable({expected})) FROM t")
+        );
+    }
+}
+
+#[test]
+fn clickhouse_keeps_native_nullability_and_map_key_rules() {
+    for sql in [
+        "SELECT CAST(NULL AS Nullable(String))",
+        "SELECT CAST(NULL AS LowCardinality(Nullable(String)))",
+        "SELECT CAST(1 AS Int64)",
+        "SELECT CAST('2025-01-01' AS Date)",
+    ] {
+        let output =
+            polyglot_sql::transpile(sql, DialectType::ClickHouse, DialectType::ClickHouse).unwrap();
+        assert!(!output[0].contains("Nullable(Nullable("), "{}", output[0]);
+        if sql.contains("CAST(1") || sql.contains("2025") {
+            assert!(!output[0].contains("Nullable"), "{}", output[0]);
+        }
+        assert_eq!(
+            polyglot_sql::transpile(&output[0], DialectType::ClickHouse, DialectType::ClickHouse)
+                .unwrap(),
+            output
+        );
+    }
+    let output = polyglot_sql::transpile(
+        "SELECT CAST(x AS MAP(VARCHAR, BIGINT)) FROM t",
+        DialectType::DuckDB,
+        DialectType::ClickHouse,
+    )
+    .unwrap();
+    assert!(
+        output[0].contains("Map(String, Nullable(Int64))"),
+        "{}",
+        output[0]
+    );
+    for dtype in ["INT[]", "MAP(VARCHAR, BIGINT)"] {
+        let error = Dialect::get(DialectType::DuckDB)
+            .transpile_with(
+                &format!("SELECT CAST(NULL AS {dtype})"),
+                DialectType::ClickHouse,
+                polyglot_sql::TranspileOptions::strict(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("cannot represent a NULL"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn clickhouse_native_generator_keeps_explicit_nullability_without_source_metadata() {
+    let dialect = Dialect::get(DialectType::ClickHouse);
+    for sql in [
+        "CAST(1 AS Bool)",
+        "CAST(x AS DATETIME)",
+        "CAST(x AS DECIMAL(38, 2))",
+        "CAST(x AS UInt64)",
+        "CAST(x AS Date)",
+    ] {
+        let expression = dialect.parse(sql).unwrap().remove(0);
+        let expression = dialect.transform(expression).unwrap();
+        let generated = dialect.generate(&expression).unwrap();
+        assert!(!generated.contains("Nullable"), "{generated}");
+    }
+}
+
+#[test]
+fn clickhouse_foreign_wide_and_unsigned_typed_nulls_are_nullable() {
+    for (source_type, target_type) in [
+        ("HUGEINT", "Int128"),
+        ("UTINYINT", "UInt8"),
+        ("USMALLINT", "UInt16"),
+        ("UINTEGER", "UInt32"),
+        ("UBIGINT", "UInt64"),
+        ("UHUGEINT", "UInt128"),
+    ] {
+        let output = polyglot_sql::transpile(
+            &format!("SELECT CAST(NULL AS {source_type})"),
+            DialectType::DuckDB,
+            DialectType::ClickHouse,
+        )
+        .unwrap();
+        assert_eq!(
+            output[0],
+            format!("SELECT CAST(NULL AS Nullable({target_type}))")
+        );
+    }
+}
+
+#[test]
+fn clickhouse_native_string_alias_casts_keep_stable_nullability() {
+    for sql in [
+        "SELECT 'key'::Varchar(255)",
+        "SELECT ['y']::Array(Char)",
+        "SELECT ['y']::Array(Varchar(255))",
+    ] {
+        assert_clickhouse_normalized_roundtrip(sql);
+        let output =
+            polyglot_sql::transpile(sql, DialectType::ClickHouse, DialectType::ClickHouse).unwrap();
+        assert!(!output[0].contains("Nullable"), "{}", output[0]);
+    }
 }

@@ -25,6 +25,144 @@ fn transpile_succeeds(sql: &str, from: DialectType, to: DialectType) -> bool {
     source_dialect.transpile(sql, to).is_ok()
 }
 
+mod concat_precedence {
+    use super::*;
+    use DialectType::{DuckDB, MySQL, PostgreSQL, SQLite};
+
+    #[test]
+    fn sqlite_concat_keeps_grouping_when_transpiled() {
+        for (sql, expected) in [
+            ("SELECT 1 || 2 * 3", "SELECT CONCAT(1, 2) * 3"),
+            ("SELECT 1 * 2 || 3", "SELECT 1 * CONCAT(2, 3)"),
+            ("SELECT 1 + 2 || 3", "SELECT 1 + CONCAT(2, 3)"),
+            ("SELECT 1 || 2 + 3", "SELECT CONCAT(1, 2) + 3"),
+            ("SELECT 1 || 2 % 5", "SELECT CONCAT(1, 2) % 5"),
+            ("SELECT 1 || 2 || 3 * 4", "SELECT CONCAT(1, 2, 3) * 4"),
+            ("SELECT 1 || (2 * 3)", "SELECT CONCAT(1, (2 * 3))"),
+            ("SELECT (1 || 2) * 3", "SELECT (CONCAT(1, 2)) * 3"),
+            ("SELECT -1 || 2 * 3", "SELECT CONCAT(-1, 2) * 3"),
+            ("SELECT 1 || -2 * 3", "SELECT CONCAT(1, -2) * 3"),
+        ] {
+            assert_eq!(transpile(sql, SQLite, MySQL), expected, "{sql}");
+            assert_eq!(transpile(sql, SQLite, SQLite), sql, "{sql}");
+        }
+        assert_eq!(
+            transpile("SELECT 1 || 2 * 3", SQLite, DuckDB),
+            "SELECT (1 || 2) * 3"
+        );
+        assert_eq!(
+            transpile("SELECT 1 + 2 || 3", SQLite, PostgreSQL),
+            "SELECT 1 + (2 || 3)"
+        );
+    }
+
+    #[test]
+    fn sqlite_target_groups_arithmetic_inside_concat() {
+        for source in [PostgreSQL, DuckDB] {
+            for (sql, expected) in [
+                ("SELECT '1' || 2 * 3", "SELECT '1' || (2 * 3)"),
+                ("SELECT 1 + 2 || '3'", "SELECT (1 + 2) || '3'"),
+                ("SELECT '1' || 2 % 5", "SELECT '1' || (2 % 5)"),
+            ] {
+                assert_eq!(
+                    transpile(sql, source, SQLite),
+                    expected,
+                    "{source:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_concat_and_json_arrows_share_precedence() {
+        assert_eq!(
+            transpile("SELECT '[' || 1 || ']' ->> 0", SQLite, DuckDB),
+            "SELECT ('[' || 1 || ']') ->> '$[0]'"
+        );
+        assert_eq!(
+            transpile("SELECT 'x' || '[1]' ->> 0", PostgreSQL, SQLite),
+            "SELECT 'x' || ('[1]' ->> 0)"
+        );
+        for sql in [
+            "SELECT '[' || 1 || ']' ->> 0",
+            "SELECT '[1]' ->> 0 || 'x'",
+            "SELECT j -> i || 'x'",
+            "SELECT (j) -> i || 'x'",
+            "SELECT ('[' || 1 || ']') -> 0",
+            "SELECT '[1]' ->> (0 || '')",
+            "SELECT 1 || 2 COLLATE NOCASE * 3",
+        ] {
+            assert_eq!(transpile(sql, SQLite, SQLite), sql, "{sql}");
+        }
+    }
+}
+
+mod bitwise_precedence {
+    use super::*;
+    use DialectType::{MySQL, PostgreSQL, SQLite, Snowflake};
+
+    #[test]
+    fn same_tier_bitwise_operators_keep_source_grouping() {
+        for source in [SQLite, PostgreSQL] {
+            for (sql, expected) in [
+                (
+                    "SELECT 1 | 2 & 4 AS v",
+                    "SELECT BITAND(BITOR(1, 2), 4) AS v",
+                ),
+                (
+                    "SELECT 1 | 2 << 1 AS v",
+                    "SELECT BITSHIFTLEFT(BITOR(1, 2), 1) AS v",
+                ),
+                (
+                    "SELECT 8 | 1 >> 1 AS v",
+                    "SELECT BITSHIFTRIGHT(BITOR(8, 1), 1) AS v",
+                ),
+                ("SELECT 1 | 2 & 4 = 0", "SELECT BITAND(BITOR(1, 2), 4) = 0"),
+                ("SELECT 1 | (2 & 4)", "SELECT BITOR(1, (BITAND(2, 4)))"),
+                ("SELECT (1 | 2) & 4", "SELECT BITAND((BITOR(1, 2)), 4)"),
+            ] {
+                assert_eq!(
+                    transpile(sql, source, Snowflake),
+                    expected,
+                    "{source:?}: {sql}"
+                );
+            }
+        }
+        assert_eq!(
+            transpile("SELECT 1 | 2 # 3", PostgreSQL, Snowflake),
+            "SELECT BITXOR(BITOR(1, 2), 3)"
+        );
+        assert_eq!(
+            transpile("SELECT 1 | 2 & 4", MySQL, Snowflake),
+            "SELECT BITOR(1, BITAND(2, 4))"
+        );
+    }
+
+    #[test]
+    fn bitwise_transpilation_preserves_grouping_in_both_directions() {
+        for shared_tier in [SQLite, PostgreSQL] {
+            for (source, target, sql, expected) in [
+                (shared_tier, MySQL, "SELECT 1 | 2 & 4", "SELECT (1 | 2) & 4"),
+                (MySQL, shared_tier, "SELECT 1 | 2 & 4", "SELECT 1 | (2 & 4)"),
+                (
+                    shared_tier,
+                    MySQL,
+                    "SELECT 1 | 2 << 1",
+                    "SELECT (1 | 2) << 1",
+                ),
+                (
+                    MySQL,
+                    shared_tier,
+                    "SELECT 1 | 2 << 1",
+                    "SELECT 1 | (2 << 1)",
+                ),
+            ] {
+                assert_eq!(transpile(sql, source, target), expected);
+            }
+        }
+    }
+}
+
 mod strict_unsupported_regressions {
     use super::*;
 
@@ -1337,7 +1475,7 @@ mod strict_unsupported_regressions {
         .expect("temporal TO_CHAR should lower to ClickHouse");
         assert_eq!(
             temporal,
-            vec!["SELECT formatDateTime(CAST('2025-01-15' AS DATE), '%Y-%m')"]
+            vec!["SELECT formatDateTime(CAST('2025-01-15' AS Nullable(DATE)), '%Y-%m')"]
         );
 
         let safe_double = transpile_with_level(
@@ -1447,7 +1585,7 @@ mod strict_unsupported_regressions {
 
         assert_eq!(
             output,
-            vec!["SELECT dateTrunc('MONTH', CAST('2025-01-05' AS DATE))"]
+            vec!["SELECT dateTrunc('MONTH', CAST('2025-01-05' AS Nullable(DATE)))"]
         );
     }
 
@@ -1832,7 +1970,9 @@ mod strict_unsupported_regressions {
         .expect("permissive transpilation should keep decimal division best effort");
         assert_eq!(
             decimal,
-            vec!["SELECT CAST(1 AS Decimal(18, 4)) / CAST(3 AS Decimal(18, 4))"]
+            vec![
+                "SELECT CAST(1 AS Nullable(Decimal(18, 4))) / CAST(3 AS Nullable(Decimal(18, 4)))"
+            ]
         );
     }
 
@@ -1942,7 +2082,7 @@ mod strict_unsupported_regressions {
         .expect("fixed-point Snowflake MEDIAN has an exact ClickHouse lowering");
         assert_eq!(
             decimal,
-            vec!["SELECT medianExactWeightedInterpolatedOrNull(CAST(value AS Decimal(10, 2)), 1) FROM events"]
+            vec!["SELECT medianExactWeightedInterpolatedOrNull(CAST(value AS Nullable(Decimal(10, 2))), 1) FROM events"]
         );
 
         let integer = transpile_with_level(
@@ -1954,7 +2094,7 @@ mod strict_unsupported_regressions {
         .expect("integer medians can retain an interpolated half value through Decimal scale");
         assert_eq!(
             integer,
-            vec!["SELECT medianExactWeightedInterpolatedOrNull(CAST(CAST(value AS Decimal(10, 0)) AS Decimal(11, 1)), 1) FROM events"]
+            vec!["SELECT medianExactWeightedInterpolatedOrNull(CAST(CAST(value AS Nullable(Decimal(10, 0))) AS Nullable(Decimal(11, 1))), 1) FROM events"]
         );
     }
 
@@ -2007,7 +2147,10 @@ mod strict_unsupported_regressions {
             UnsupportedLevel::Raise,
         )
         .expect("ClickHouse Decimal ROUND matches Snowflake's default mode");
-        assert_eq!(decimal, vec!["SELECT ROUND(CAST(2.5 AS Decimal(10, 1)))"]);
+        assert_eq!(
+            decimal,
+            vec!["SELECT ROUND(CAST(2.5 AS Nullable(Decimal(10, 1))))"]
+        );
 
         let half_even = transpile_with_level(
             "SELECT ROUND(CAST(2.5 AS NUMBER(10, 1)), 0, 'HALF_TO_EVEN')",
@@ -2018,7 +2161,7 @@ mod strict_unsupported_regressions {
         .expect("Snowflake HALF_TO_EVEN can use ClickHouse roundBankers");
         assert_eq!(
             half_even,
-            vec!["SELECT roundBankers(CAST(2.5 AS Decimal(10, 1)), 0)"]
+            vec!["SELECT roundBankers(CAST(2.5 AS Nullable(Decimal(10, 1))), 0)"]
         );
     }
 
@@ -6208,4 +6351,208 @@ mod compound_row_limit_regressions {
             assert!(Dialect::get(Oracle).parse(sql).is_err(), "{sql}");
         }
     }
+}
+
+mod qualify_and_name_aligned_sets {
+    use super::*;
+    use DialectType::*;
+
+    #[test]
+    fn grouped_qualify_uses_the_computed_rank_once() {
+        let sql = "SELECT region, brand, RANK() OVER (PARTITION BY region ORDER BY SUM(x) DESC) AS rnk FROM t GROUP BY region, brand QUALIFY rnk <= 3";
+        for target in [PostgreSQL, Trino, Athena, MySQL, StarRocks] {
+            let output = transpile(sql, Generic, target);
+            assert!(
+                output.starts_with("SELECT region, brand, rnk FROM ("),
+                "{target:?}: {output}"
+            );
+            assert_eq!(output.matches("RANK()").count(), 1, "{target:?}: {output}");
+            assert!(output.ends_with("WHERE rnk <= 3"), "{target:?}: {output}");
+            assert!(!output.contains("QUALIFY"), "{output}");
+        }
+        assert!(transpile(sql, Generic, Redshift).contains("QUALIFY rnk <= 3"));
+    }
+
+    #[test]
+    fn qualify_is_lowered_inside_ctes_for_postgres_and_athena() {
+        for target in [PostgreSQL, Athena] {
+            let output = transpile("WITH q AS (SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM t QUALIFY rn = 1) SELECT a FROM q", DuckDB, target);
+            assert!(!output.contains("QUALIFY"), "{output}");
+            assert!(output.contains("WHERE rn = 1"), "{output}");
+        }
+    }
+
+    #[test]
+    fn by_name_reorders_known_projections_and_preserves_missing_columns() {
+        for target in [Trino, StarRocks, Athena, PostgreSQL, MySQL] {
+            assert_eq!(
+                transpile(
+                    "SELECT a, b FROM t1 UNION ALL BY NAME SELECT b, a FROM t2",
+                    Generic,
+                    target
+                ),
+                "SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2"
+            );
+            assert_eq!(
+                transpile(
+                    "SELECT 1 AS a UNION ALL BY NAME SELECT 2 AS b",
+                    DuckDB,
+                    target
+                ),
+                "SELECT 1 AS a, NULL AS b UNION ALL SELECT NULL AS a, 2 AS b"
+            );
+        }
+        let output = transpile(
+            "SELECT a, b FROM t1 UNION ALL BY NAME (SELECT b, a FROM t2 ORDER BY 1 LIMIT 2)",
+            DuckDB,
+            PostgreSQL,
+        );
+        assert!(!output.contains("BY NAME"), "{output}");
+        assert!(output.contains("SELECT a, b FROM ("), "{output}");
+        assert!(output.contains("ORDER BY 1 LIMIT 2"), "{output}");
+    }
+
+    #[test]
+    fn by_name_unknown_or_ambiguous_outputs_raise() {
+        for sql in [
+            "SELECT * FROM t1 UNION ALL BY NAME SELECT * FROM t2",
+            "SELECT a, a FROM t1 UNION ALL BY NAME SELECT a, b FROM t2",
+        ] {
+            for target in [Trino, StarRocks, Athena, PostgreSQL] {
+                let error = Dialect::get(DuckDB)
+                    .transpile_with(sql, target, TranspileOptions::strict())
+                    .unwrap_err();
+                assert!(error.to_string().contains("BY NAME"), "{error}");
+            }
+        }
+        let native = "SELECT * FROM t1 UNION ALL BY NAME SELECT * FROM t2";
+        assert_eq!(transpile(native, DuckDB, DuckDB), native);
+    }
+}
+
+mod mysql_starrocks_doris_null_ordering {
+    use super::*;
+    use DialectType::*;
+
+    #[test]
+    fn mysql_preserves_source_defaults_and_explicit_placement() {
+        for source in [DuckDB, Trino, PostgreSQL] {
+            assert_eq!(
+                transpile("SELECT a FROM t ORDER BY a", source, MySQL),
+                "SELECT a FROM t ORDER BY CASE WHEN a IS NULL THEN 1 ELSE 0 END, a"
+            );
+        }
+        for (sql, expected) in [
+            (
+                "SELECT a FROM t ORDER BY a NULLS LAST",
+                "SELECT a FROM t ORDER BY CASE WHEN a IS NULL THEN 1 ELSE 0 END, a",
+            ),
+            (
+                "SELECT a FROM t ORDER BY a NULLS FIRST",
+                "SELECT a FROM t ORDER BY a",
+            ),
+            (
+                "SELECT a FROM t ORDER BY a DESC",
+                "SELECT a FROM t ORDER BY a DESC",
+            ),
+            (
+                "SELECT a FROM t ORDER BY a DESC NULLS FIRST",
+                "SELECT a FROM t ORDER BY CASE WHEN a IS NULL THEN 1 ELSE 0 END DESC, a DESC",
+            ),
+        ] {
+            assert_eq!(transpile(sql, DuckDB, MySQL), expected);
+        }
+        assert_eq!(
+            transpile("SELECT a FROM t ORDER BY a DESC", PostgreSQL, MySQL),
+            "SELECT a FROM t ORDER BY CASE WHEN a IS NULL THEN 1 ELSE 0 END DESC, a DESC"
+        );
+        assert_eq!(
+            transpile("SELECT a FROM t ORDER BY a", MySQL, MySQL),
+            "SELECT a FROM t ORDER BY a"
+        );
+    }
+
+    #[test]
+    fn starrocks_and_doris_use_native_null_ordering() {
+        for target in [StarRocks, Doris] {
+            for source in [DuckDB, Trino, PostgreSQL] {
+                assert_eq!(
+                    transpile("SELECT a FROM t ORDER BY a", source, target),
+                    "SELECT a FROM t ORDER BY a NULLS LAST"
+                );
+            }
+            assert_eq!(
+                transpile("SELECT a FROM t ORDER BY a DESC", PostgreSQL, target),
+                "SELECT a FROM t ORDER BY a DESC NULLS FIRST"
+            );
+            assert_eq!(
+                transpile("SELECT a FROM t ORDER BY a DESC", DuckDB, target),
+                "SELECT a FROM t ORDER BY a DESC"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_resolves_aliases_and_known_ordinals() {
+        for sql in [
+            "SELECT a AS z FROM t ORDER BY z NULLS LAST",
+            "SELECT a AS z FROM t ORDER BY 1 NULLS LAST",
+        ] {
+            assert_eq!(
+                transpile(sql, DuckDB, MySQL),
+                "SELECT a AS z FROM t ORDER BY CASE WHEN a IS NULL THEN 1 ELSE 0 END, a"
+            );
+        }
+        let error = Dialect::get(DuckDB)
+            .transpile_with(
+                "SELECT * FROM t ORDER BY 1 NULLS LAST",
+                MySQL,
+                TranspileOptions::strict(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("positional ordering"), "{error}");
+    }
+
+    #[test]
+    fn mysql_window_ordering_respects_explicit_requests_and_frame_limits() {
+        for source in [DuckDB, Trino, PostgreSQL] {
+            assert_eq!(transpile("SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t", source, MySQL),
+                "SELECT ROW_NUMBER() OVER (ORDER BY CASE WHEN a IS NULL THEN 1 ELSE 0 END, a) FROM t");
+        }
+        assert_eq!(
+            transpile(
+                "SELECT ROW_NUMBER() OVER (ORDER BY a NULLS FIRST) FROM t",
+                DuckDB,
+                MySQL
+            ),
+            "SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t"
+        );
+        let error = Dialect::get(DuckDB).transpile_with(
+            "SELECT SUM(a) OVER (ORDER BY a NULLS LAST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t", MySQL, TranspileOptions::strict()
+        ).unwrap_err();
+        assert!(error.to_string().contains("RANGE/GROUPS"), "{error}");
+    }
+}
+
+#[test]
+fn distinct_on_ranks_the_rows_remaining_after_qualify() {
+    let sql = "SELECT DISTINCT ON (a) a, b FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY a ORDER BY b) = 2 ORDER BY a, b";
+    for target in [
+        DialectType::MySQL,
+        DialectType::Trino,
+        DialectType::StarRocks,
+    ] {
+        let output = transpile(sql, DialectType::DuckDB, target);
+        assert!(!output.contains("QUALIFY"), "{output}");
+        assert!(output.contains("WHERE _w = 2"), "{output}");
+        assert!(output.ends_with("WHERE _row_number = 1"), "{output}");
+        assert_eq!(output.matches("ROW_NUMBER()").count(), 2, "{output}");
+    }
+}
+
+#[test]
+fn by_name_preserves_anonymous_parameter_binding_order() {
+    let sql = "SELECT ? AS a, ? AS b UNION ALL BY NAME SELECT ? AS b, ? AS a";
+    assert_eq!(transpile(sql, DialectType::DuckDB, DialectType::MySQL),
+        "SELECT a, b FROM (SELECT ? AS a, ? AS b) AS _by_name UNION ALL SELECT a, b FROM (SELECT ? AS b, ? AS a) AS _by_name");
 }

@@ -33,6 +33,9 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 
+mod pipes;
+mod routines;
+
 /// Shared only by parsers participating in the same parse (including fragments).
 /// Atomic state preserves Parser's Send/Sync properties; no global budget is used.
 #[derive(Default)]
@@ -572,6 +575,7 @@ pub struct Parser {
     /// an if-expression. Without this the retry is repeated on every path that reaches
     /// the position, and a chain of `IF`s costs 2^k.
     if_expr_ruled_out: HashSet<usize>,
+    parsing_duckdb_json_path: bool,
     recursion: Arc<ParserRecursion>,
 }
 
@@ -701,6 +705,7 @@ impl Parser {
             guards_checked: false,
             token_guard_stats: None,
             if_expr_ruled_out: HashSet::new(),
+            parsing_duckdb_json_path: false,
             recursion: Arc::default(),
         }
     }
@@ -718,6 +723,7 @@ impl Parser {
             guards_checked: false,
             token_guard_stats: None,
             if_expr_ruled_out: HashSet::new(),
+            parsing_duckdb_json_path: false,
             recursion: Arc::default(),
         }
     }
@@ -738,6 +744,7 @@ impl Parser {
             guards_checked: false,
             token_guard_stats: None,
             if_expr_ruled_out: HashSet::new(),
+            parsing_duckdb_json_path: false,
             recursion: Arc::default(),
         }
     }
@@ -761,6 +768,7 @@ impl Parser {
             guards_checked: false,
             token_guard_stats: Some(token_guard_stats),
             if_expr_ruled_out: HashSet::new(),
+            parsing_duckdb_json_path: false,
             recursion: Arc::default(),
         }
     }
@@ -1553,10 +1561,10 @@ impl Parser {
                     Some(crate::dialects::DialectType::ClickHouse)
                 ) {
                     self.fallback_to_command(statement_start)
-                } else if self
-                    .peek_nth(1)
-                    .map(|t| t.text.eq_ignore_ascii_case("IMMEDIATE"))
-                    == Some(true)
+                } else if self.peek_nth(1).map(|t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("IMMEDIATE")
+                }) == Some(true)
                 {
                     // EXECUTE IMMEDIATE — Snowflake/BigQuery dynamic SQL, treat as raw command
                     self.skip(); // consume EXECUTE
@@ -1862,8 +1870,24 @@ impl Parser {
                     || self.peek_text().eq_ignore_ascii_case("LS") =>
             {
                 self.skip(); // consume LIST/LS
-                self.parse_as_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse LIST/LS statement"))
+                let command = self
+                    .parse_as_command()?
+                    .ok_or_else(|| self.parse_error("Failed to parse LIST/LS statement"))?;
+                if let Expression::Command(mut command) = command {
+                    let rest = command
+                        .this
+                        .split_once(char::is_whitespace)
+                        .map(|(_, r)| r.trim())
+                        .unwrap_or("");
+                    let rest = rest
+                        .strip_prefix("@ ~")
+                        .map(|suffix| format!("@~{suffix}"))
+                        .unwrap_or_else(|| rest.to_string());
+                    command.this = format!("LIST {rest}");
+                    Ok(Expression::Command(command))
+                } else {
+                    Ok(command)
+                }
             }
             // DuckDB: INSTALL extension [FROM source]
             TokenType::Var if self.peek_text().eq_ignore_ascii_case("INSTALL") => {
@@ -1953,7 +1977,7 @@ impl Parser {
                 let next_is_explain = self.current + 1 < self.tokens.len()
                     && self.tokens[self.current + 1].token_type == TokenType::Var
                     && self.tokens[self.current + 1]
-                        .text
+                        .text(self.source.as_deref().unwrap_or_default())
                         .eq_ignore_ascii_case("EXPLAIN");
                 if self.check_next(TokenType::Select)
                     || self.check_next(TokenType::With)
@@ -1989,7 +2013,7 @@ impl Parser {
                         cluster_by: None,
                         lateral: false,
                         modifiers_inside: false,
-                        trailing_comments: Vec::new(),
+                        trailing_comments: self.previous_trailing_comments().to_vec(),
                         inferred_type: None,
                     }));
                     // Check for set operations after the parenthesized query
@@ -2030,7 +2054,9 @@ impl Parser {
                         let alias_keyword = if self.source.is_some() {
                             self.source_text_range(token.span.start, token.span.end)
                         } else {
-                            token.text.to_string()
+                            token
+                                .text(self.source.as_deref().unwrap_or_default())
+                                .to_string()
                         };
                         let alias = self.expect_identifier_or_keyword_with_quoted()?;
                         let trailing_comments = self.previous_trailing_comments().to_vec();
@@ -2059,7 +2085,9 @@ impl Parser {
                         let alias_keyword = if self.source.is_some() {
                             self.source_text_range(token.span.start, token.span.end)
                         } else {
-                            token.text.to_string()
+                            token
+                                .text(self.source.as_deref().unwrap_or_default())
+                                .to_string()
                         };
                         // Check for tuple alias: AS ("a", "b", ...)
                         if self.match_token(TokenType::LParen) {
@@ -2114,7 +2142,9 @@ impl Parser {
                     let alias_keyword = if self.source.is_some() {
                         self.source_text_range(token.span.start, token.span.end)
                     } else {
-                        token.text.to_string()
+                        token
+                            .text(self.source.as_deref().unwrap_or_default())
+                            .to_string()
                     };
                     // Capture comments from AS token (e.g., AS /* foo */ (a, b, c))
                     // These go into trailing_comments (after the alias), not pre_alias_comments
@@ -2239,7 +2269,7 @@ impl Parser {
         let next_is_explain = self.current + 1 < self.tokens.len()
             && self.tokens[self.current + 1].token_type == TokenType::Var
             && self.tokens[self.current + 1]
-                .text
+                .text(self.source.as_deref().unwrap_or_default())
                 .eq_ignore_ascii_case("EXPLAIN");
 
         if self.check_next(TokenType::Select)
@@ -2266,7 +2296,7 @@ impl Parser {
                 cluster_by: None,
                 lateral: false,
                 modifiers_inside: false,
-                trailing_comments: Vec::new(),
+                trailing_comments: self.previous_trailing_comments().to_vec(),
                 inferred_type: None,
             }));
             let result = self.parse_set_operation(subquery)?;
@@ -2290,7 +2320,7 @@ impl Parser {
                 cluster_by: None,
                 lateral: false,
                 modifiers_inside: false,
-                trailing_comments: Vec::new(),
+                trailing_comments: self.previous_trailing_comments().to_vec(),
                 inferred_type: None,
             }));
             let result = self.parse_set_operation(subquery)?;
@@ -2360,7 +2390,8 @@ impl Parser {
     fn parse_select(&mut self) -> Result<Expression> {
         let result = self.parse_select_body()?;
         // Check for set operations (UNION, INTERSECT, EXCEPT)
-        self.parse_set_operation(result)
+        let result = self.parse_set_operation(result)?;
+        self.parse_clickhouse_pipe_tail(result)
     }
 
     #[inline(never)]
@@ -2863,6 +2894,13 @@ impl Parser {
             None
         };
 
+        // DuckDB samples the query before ORDER BY/LIMIT.
+        let early_sample = if self.config.dialect == Some(crate::dialects::DialectType::DuckDB) {
+            self.parse_sample_clause()?
+        } else {
+            None
+        };
+
         // Parse ORDER BY or ORDER SIBLINGS BY (Oracle) - comes after SORT BY
         let order_by = if self.check(TokenType::Order) {
             let order_comments = self.current_leading_comments().to_vec();
@@ -2939,10 +2977,8 @@ impl Parser {
                 None
             };
 
-        // WITH TIES after LIMIT (ClickHouse, DuckDB)
-        if limit.is_some() {
-            let _ = self.match_keywords(&[TokenType::With, TokenType::Ties]);
-        }
+        // ClickHouse accepts WITH TIES both before and after OFFSET.
+        let with_ties = limit.is_some() && self.match_keywords(&[TokenType::With, TokenType::Ties]);
 
         // Parse OFFSET (if not already parsed from MySQL LIMIT syntax)
         // Standard SQL syntax: OFFSET n [ROW|ROWS]
@@ -2974,6 +3010,28 @@ impl Parser {
             (limit, offset)
         };
 
+        let mut limit = limit;
+        if limit.is_some()
+            && (with_ties || self.match_keywords(&[TokenType::With, TokenType::Ties]))
+        {
+            if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse) {
+                let limit = limit.as_mut().unwrap();
+                match &mut limit.this {
+                    Expression::LimitRange(range) => range.with_ties = true,
+                    count => {
+                        let count = std::mem::replace(count, Expression::Null(Null));
+                        limit.this = Expression::LimitRange(Box::new(LimitRange {
+                            count: Some(Box::new(count)),
+                            after: None,
+                            after_all: false,
+                            until: None,
+                            with_ties: true,
+                        }));
+                    }
+                }
+            }
+        }
+
         // ClickHouse: LIMIT ... BY expressions
         let limit_by = if matches!(
             self.config.dialect,
@@ -2993,7 +3051,7 @@ impl Parser {
         // ClickHouse: second LIMIT after LIMIT BY (LIMIT n BY expr LIMIT m)
         // Also supports LIMIT offset, count syntax
         let (limit, offset) = if limit_by.is_some() && self.match_token(TokenType::Limit) {
-            let first_expr = self.parse_expression()?;
+            let (first_expr, _) = self.parse_limit_value()?;
             if self.match_token(TokenType::Comma) {
                 // LIMIT offset, count
                 let count_expr = self.parse_expression()?;
@@ -3032,12 +3090,19 @@ impl Parser {
         } else {
             None
         };
-        if limit.is_some() && fetch.is_some() {
+        if limit.is_some()
+            && fetch.is_some()
+            && self.config.dialect != Some(crate::dialects::DialectType::ClickHouse)
+        {
             return Err(self.parse_error("LIMIT and FETCH cannot be combined in the same query"));
         }
 
         // Parse SAMPLE / TABLESAMPLE clause
-        let sample = self.parse_sample_clause()?;
+        let sample = if early_sample.is_some() {
+            early_sample
+        } else {
+            self.parse_sample_clause()?
+        };
 
         // Parse FOR UPDATE/SHARE locks or FOR XML/JSON (T-SQL)
         let (locks, for_xml, for_json) = self.parse_locks_and_for_xml()?;
@@ -3240,6 +3305,15 @@ impl Parser {
     /// Parse a WITH clause (CTEs)
     fn parse_with(&mut self) -> Result<Expression> {
         use crate::dialects::DialectType;
+
+        if self.config.dialect == Some(DialectType::Trino)
+            && self.check_next(TokenType::Function)
+            && self
+                .peek_nth(2)
+                .is_some_and(|token| !matches!(token.token_type, TokenType::As | TokenType::LParen))
+        {
+            return self.parse_inline_functions();
+        }
 
         let with_token = self.expect(TokenType::With)?;
         let leading_comments = with_token.comments;
@@ -3493,6 +3567,8 @@ impl Parser {
             search,
         };
         match &mut main_query {
+            Expression::PipeQuery(query) => query.with = Some(with_clause),
+            Expression::MultiInsert(query) => query.with = Some(with_clause),
             Expression::Select(ref mut select) => {
                 select.with = Some(with_clause);
             }
@@ -3627,7 +3703,8 @@ impl Parser {
                     || self.check(TokenType::Except)
                     || self.check(TokenType::Order)
                     || self.check(TokenType::Limit)
-                    || self.check(TokenType::Qualify)
+                    || (self.check(TokenType::Qualify)
+                        && self.config.dialect != Some(crate::dialects::DialectType::Redshift))
                     || self.check(TokenType::Semicolon)
                     || self.check_text_seq(&["BULK", "COLLECT", "INTO"]))
             {
@@ -3653,16 +3730,7 @@ impl Parser {
                 ) {
                     while self.check(TokenType::Apply) {
                         self.skip(); // consume APPLY
-                        let apply_expr = if self.match_token(TokenType::LParen) {
-                            // Could be APPLY(func_name) or APPLY(x -> expr)
-                            let expr = self.parse_expression()?;
-                            self.expect(TokenType::RParen)?;
-                            expr
-                        } else {
-                            // APPLY func or APPLY x -> expr (no parens)
-                            // Parse as expression to handle lambdas
-                            self.parse_expression()?
-                        };
+                        let apply_expr = self.parse_clickhouse_apply_argument()?;
                         star_expr = Expression::Apply(Box::new(crate::expressions::Apply {
                             this: Box::new(star_expr),
                             expression: Box::new(apply_expr),
@@ -3683,13 +3751,7 @@ impl Parser {
                     // Continue with more APPLYs
                     while self.check(TokenType::Apply) {
                         self.skip();
-                        let apply_expr = if self.match_token(TokenType::LParen) {
-                            let expr = self.parse_expression()?;
-                            self.expect(TokenType::RParen)?;
-                            expr
-                        } else {
-                            self.parse_expression()?
-                        };
+                        let apply_expr = self.parse_clickhouse_apply_argument()?;
                         star_expr = Expression::Apply(Box::new(crate::expressions::Apply {
                             this: Box::new(star_expr),
                             expression: Box::new(apply_expr),
@@ -3864,13 +3926,7 @@ impl Parser {
                             } else if self.check(TokenType::Apply) {
                                 // Parse APPLY transformer
                                 self.skip();
-                                let apply_expr = if self.match_token(TokenType::LParen) {
-                                    let e = self.parse_expression()?;
-                                    self.expect(TokenType::RParen)?;
-                                    e
-                                } else {
-                                    self.parse_expression()?
-                                };
+                                let apply_expr = self.parse_clickhouse_apply_argument()?;
                                 result = Expression::Apply(Box::new(crate::expressions::Apply {
                                     this: Box::new(result),
                                     expression: Box::new(apply_expr),
@@ -3932,7 +3988,9 @@ impl Parser {
                     let alias_keyword = if self.source.is_some() {
                         self.source_text_range(as_token.span.start, as_token.span.end)
                     } else {
-                        as_token.text.to_string()
+                        as_token
+                            .text(self.source.as_deref().unwrap_or_default())
+                            .to_string()
                     };
                     let alias_keyword = matches!(
                         self.config.dialect,
@@ -4062,6 +4120,9 @@ impl Parser {
                     // GROUP BY / ORDER BY are clause boundaries, not aliases.
                     && !self.check_text_seq(&["GROUP", "BY"])
                     && !self.check_text_seq(&["ORDER", "BY"])
+                    && !self.check_text_seq(&["DISTRIBUTE", "BY"])
+                    && !self.check_text_seq(&["SORT", "BY"])
+                    && !self.check_text_seq(&["CLUSTER", "BY"])
                     // QUALIFY is a clause boundary, not an alias.
                     && !self.check(TokenType::Qualify)
                     // WINDOW is only a clause boundary when followed by a named window.
@@ -4196,6 +4257,7 @@ impl Parser {
                     || (self.check(TokenType::Except) && !self.check_next(TokenType::LParen) && !self.check_next(TokenType::Comma))
                     || self.check(TokenType::Semicolon)
                     || self.check(TokenType::RParen)
+                    || self.check(TokenType::PipeGt)
                     // SETTINGS/FORMAT only as boundaries when NOT followed by ( or [ (function/column ref)
                     || (self.check(TokenType::Settings) && !self.check_next(TokenType::LParen) && !self.check_next(TokenType::LBracket))
                     || (self.check(TokenType::Format) && !self.check_next(TokenType::LParen))
@@ -4212,7 +4274,7 @@ impl Parser {
     /// FROM tbl = SELECT * FROM tbl
     /// FROM tbl SELECT col1, col2 = SELECT col1, col2 FROM tbl
     fn parse_from_first_query(&mut self) -> Result<Expression> {
-        self.expect(TokenType::From)?;
+        let leading_comments = self.expect(TokenType::From)?.comments;
 
         // Parse the FROM clause (table references)
         let from = self.parse_from()?;
@@ -4220,9 +4282,36 @@ impl Parser {
         // DuckDB FROM-first syntax allows joins before the SELECT projection.
         let joins = self.parse_joins()?;
 
+        let lateral_views = self.parse_lateral_views()?;
+        if self.check(TokenType::Insert)
+            && matches!(
+                self.config.dialect,
+                Some(
+                    crate::dialects::DialectType::Hive
+                        | crate::dialects::DialectType::Spark
+                        | crate::dialects::DialectType::Databricks
+                )
+            )
+        {
+            let mut branches = Vec::new();
+            while self.check(TokenType::Insert) {
+                branches.push(self.parse_insert()?);
+            }
+            return Ok(Expression::MultiInsert(Box::new(MultiInsert {
+                from,
+                joins,
+                lateral_views,
+                branches,
+                with: None,
+                leading_comments,
+            })));
+        }
+
         // Check if there's an explicit SELECT clause after FROM
+        let mut distinct = false;
         let expressions = if self.check(TokenType::Select) {
             self.skip(); // consume SELECT
+            distinct = self.match_token(TokenType::Distinct);
             self.parse_select_expressions()?
         } else {
             // No explicit SELECT means SELECT *
@@ -4328,7 +4417,7 @@ impl Parser {
             expressions,
             from: Some(from),
             joins,
-            lateral_views: Vec::new(),
+            lateral_views,
             prewhere,
             where_clause,
             group_by,
@@ -4342,7 +4431,7 @@ impl Parser {
             offset,
             limit_by: None,
             fetch: None,
-            distinct: false,
+            distinct,
             distinct_on: None,
             top: None,
             with: None,
@@ -4357,7 +4446,7 @@ impl Parser {
             for_xml: Vec::new(),
             for_json: Vec::new(),
 
-            leading_comments: Vec::new(),
+            leading_comments,
             post_select_comments: Vec::new(),
             kind: None,
             operation_modifiers: Vec::new(),
@@ -4368,7 +4457,8 @@ impl Parser {
 
         // Check for set operations (UNION, INTERSECT, EXCEPT)
         let result = Expression::Select(Box::new(select));
-        self.parse_set_operation(result)
+        let result = self.parse_set_operation(result)?;
+        self.parse_clickhouse_pipe_tail(result)
     }
 
     /// Parse FROM clause
@@ -4379,7 +4469,7 @@ impl Parser {
             // Capture leading comments before each table expression
             // (e.g., FROM \n/* comment */\n table_name)
             let pre_table_comments = if !self.is_at_end() {
-                self.tokens[self.current].comments.clone()
+                self.tokens[self.current].comments.to_vec()
             } else {
                 Vec::new()
             };
@@ -4511,12 +4601,41 @@ impl Parser {
         } else {
             self.parse_table_expression_primary()?
         };
-        self.parse_table_expression_tail(expr, has_only)
+        let expr = self.parse_table_expression_tail(expr, has_only)?;
+        if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+            && self.match_identifier("STREAM")
+        {
+            let bounded = self.match_identifier("BOUNDED");
+            let (watermark, watermark_expression) = if self.match_identifier("WATERMARK") {
+                self.expect(TokenType::For)?;
+                let column = self.parse_expression()?;
+                self.expect(TokenType::As)?;
+                (
+                    Some(Box::new(column)),
+                    Some(Box::new(self.parse_expression()?)),
+                )
+            } else {
+                (None, None)
+            };
+            Ok(Expression::StreamSource(Box::new(StreamSource {
+                this: expr,
+                bounded,
+                watermark,
+                watermark_expression,
+            })))
+        } else {
+            Ok(expr)
+        }
     }
 
     #[inline(never)]
     fn parse_table_expression_primary(&mut self) -> Result<Expression> {
-        let expr = if self.check(TokenType::Values) && self.check_next(TokenType::LParen) {
+        let expr = if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+            && self.check_identifier("TRIM")
+            && self.check_next(TokenType::LParen)
+        {
+            self.parse_primary()?
+        } else if self.check(TokenType::Values) && self.check_next(TokenType::LParen) {
             // VALUES as table expression: FROM (VALUES ...)
             // In ClickHouse, bare `values` without ( is a table name
             self.parse_values_with_set_operations(false)?
@@ -4545,6 +4664,7 @@ impl Parser {
                 table_sample: None,
                 hints: Vec::new(),
                 system_time: None,
+                subpartition: false,
                 partitions: Vec::new(),
                 identifier_func: None,
                 changes: None,
@@ -4561,7 +4681,11 @@ impl Parser {
         } else if self.check(TokenType::String) && self.peek_text().starts_with('@') {
             // Snowflake stage reference in string: '@mystage' or '@external/location'
             self.parse_stage_reference_from_string()?
-        } else if self.match_token(TokenType::Lateral) {
+        } else if self.check(TokenType::Lateral)
+            && (self.config.dialect != Some(crate::dialects::DialectType::ClickHouse)
+                || self.check_next(TokenType::LParen))
+            && self.match_token(TokenType::Lateral)
+        {
             if self.check(TokenType::LParen) {
                 // LATERAL (SELECT ...) or LATERAL (table_expression) or LATERAL (FROM ...) for DuckDB
                 self.expect(TokenType::LParen)?;
@@ -4720,7 +4844,9 @@ impl Parser {
                     && !self.check(TokenType::Order)
                     && !self.check(TokenType::Limit)
                     && !self.check(TokenType::Semicolon)
-                    && (self.check(TokenType::Identifier) || self.check(TokenType::Var))
+                    && (self.check(TokenType::Identifier)
+                        || self.check(TokenType::Var)
+                        || self.check(TokenType::QuotedIdentifier))
                 {
                     Some(self.expect_identifier_or_keyword_with_quoted()?)
                 } else {
@@ -4730,10 +4856,13 @@ impl Parser {
                 let alias = alias_ident.map(|id| id.name);
 
                 // Parse column aliases: (col1, col2, ...)
+                let mut column_aliases_quoted = Vec::new();
                 let column_aliases = if alias.is_some() && self.match_token(TokenType::LParen) {
                     let mut cols = Vec::new();
                     loop {
-                        cols.push(self.expect_identifier_or_keyword()?);
+                        let column = self.expect_identifier_or_keyword_with_quoted()?;
+                        column_aliases_quoted.push(column.quoted);
+                        cols.push(column.name);
                         if !self.match_token(TokenType::Comma) {
                             break;
                         }
@@ -4743,6 +4872,9 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
+                if !column_aliases_quoted.iter().any(|quoted| *quoted) {
+                    column_aliases_quoted.clear();
+                }
 
                 Expression::Lateral(Box::new(Lateral {
                     this: Box::new(func_expr),
@@ -4753,9 +4885,10 @@ impl Parser {
                     cross_apply: None,
                     ordinality,
                     column_aliases,
+                    column_aliases_quoted,
                 }))
             }
-        } else if self.match_token(TokenType::LParen) {
+        } else if !self.is_tsql_legacy_table_hint() && self.match_token(TokenType::LParen) {
             // Subquery or parenthesized set operation or (VALUES ...)
             if self.check(TokenType::Values) {
                 // (VALUES (...), (...)) AS t(c1, c2) or (VALUES (0) foo(bar))
@@ -5088,6 +5221,7 @@ impl Parser {
                 }))
             }
         } else if self.is_identifier_token() || self.is_safe_keyword_as_identifier() || self.can_be_alias_keyword()
+            || (self.config.dialect == Some(crate::dialects::DialectType::ClickHouse) && matches!(self.peek().token_type, TokenType::Select | TokenType::Lateral))
             || (matches!(self.config.dialect, Some(crate::dialects::DialectType::BigQuery)) && self.check(TokenType::Number))
             || self.is_mysql_numeric_identifier()
             // PIVOT/UNPIVOT can be table names when not followed by (
@@ -5199,6 +5333,7 @@ impl Parser {
                         table_sample: None,
                         hints: Vec::new(),
                         system_time: None,
+                        subpartition: false,
                         partitions: Vec::new(),
                         identifier_func: None,
                         changes: None,
@@ -5231,6 +5366,7 @@ impl Parser {
                         table_sample: None,
                         hints: Vec::new(),
                         system_time: None,
+                        subpartition: false,
                         partitions: Vec::new(),
                         identifier_func: None,
                         changes: None,
@@ -5268,6 +5404,7 @@ impl Parser {
                             table_sample: None,
                             hints: Vec::new(),
                             system_time: None,
+                            subpartition: false,
                             partitions: Vec::new(),
                             identifier_func: None,
                             changes: None,
@@ -5313,6 +5450,7 @@ impl Parser {
                             table_sample: None,
                             hints: Vec::new(),
                             system_time: None,
+                            subpartition: false,
                             partitions: Vec::new(),
                             identifier_func: None,
                             changes: None,
@@ -5332,7 +5470,9 @@ impl Parser {
                             vec![first_ident, second_ident, third_ident],
                             arguments,
                         )))
-                    } else if self.match_token(TokenType::LParen) {
+                    } else if !self.is_tsql_legacy_table_hint()
+                        && self.match_token(TokenType::LParen)
+                    {
                         // catalog.schema.function() - table-valued function
                         let args = if self.check(TokenType::RParen) {
                             Vec::new()
@@ -5343,7 +5483,13 @@ impl Parser {
                         let trailing_comments = self.previous_trailing_comments().to_vec();
                         Expression::Function(Box::new(Function {
                             on_error: None,
-                            qualified_name: Vec::new(),
+                            qualified_name: if self.config.dialect
+                                == Some(crate::dialects::DialectType::ClickHouse)
+                            {
+                                vec![first_ident, second_ident, third_ident]
+                            } else {
+                                Vec::new()
+                            },
                             source_dialect: None,
 
                             name: format!("{}.{}.{}", first_name, second_name, third_name),
@@ -5385,6 +5531,7 @@ impl Parser {
                             table_sample: None,
                             hints: Vec::new(),
                             system_time: None,
+                            subpartition: false,
                             partitions: Vec::new(),
                             identifier_func: None,
                             changes: None,
@@ -5405,7 +5552,7 @@ impl Parser {
                         vec![first_ident, second_ident],
                         arguments,
                     )))
-                } else if self.match_token(TokenType::LParen) {
+                } else if !self.is_tsql_legacy_table_hint() && self.match_token(TokenType::LParen) {
                     // schema.function() - table-valued function
                     let args = if self.check(TokenType::RParen) {
                         Vec::new()
@@ -5416,7 +5563,13 @@ impl Parser {
                     let trailing_comments = self.previous_trailing_comments().to_vec();
                     Expression::Function(Box::new(Function {
                         on_error: None,
-                        qualified_name: Vec::new(),
+                        qualified_name: if self.config.dialect
+                            == Some(crate::dialects::DialectType::ClickHouse)
+                        {
+                            vec![first_ident, second_ident]
+                        } else {
+                            Vec::new()
+                        },
                         source_dialect: None,
 
                         name: format!("{}.{}", first_name, second_name),
@@ -5458,6 +5611,7 @@ impl Parser {
                         table_sample: None,
                         hints: Vec::new(),
                         system_time: None,
+                        subpartition: false,
                         partitions: Vec::new(),
                         identifier_func: None,
                         changes: None,
@@ -5465,7 +5619,7 @@ impl Parser {
                         span: None,
                     })
                 }
-            } else if self.match_token(TokenType::LParen) {
+            } else if !self.is_tsql_legacy_table_hint() && self.match_token(TokenType::LParen) {
                 // Handle JSON_TABLE specially - it has COLUMNS clause syntax
                 if self.config.dialect == Some(crate::dialects::DialectType::HANA)
                     && first_name.eq_ignore_ascii_case("JSON_TABLE")
@@ -5578,7 +5732,10 @@ impl Parser {
                     semantic_view
                 } else if (first_name.eq_ignore_ascii_case("view")
                     || first_name.eq_ignore_ascii_case("merge"))
-                    && (self.check(TokenType::Select) || self.check(TokenType::With))
+                    && (self.check(TokenType::Select)
+                        || self.check(TokenType::With)
+                        || (self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                            && self.check(TokenType::From)))
                 {
                     // ClickHouse: view(SELECT ...) and merge(SELECT ...) table functions
                     // contain a subquery as the argument
@@ -5706,6 +5863,7 @@ impl Parser {
                                         table_sample: None,
                                         hints: Vec::new(),
                                         system_time: None,
+                                        subpartition: false,
                                         partitions: Vec::new(),
                                         identifier_func: Some(Box::new(func_expr)),
                                         changes: None,
@@ -5730,6 +5888,7 @@ impl Parser {
                                         table_sample: None,
                                         hints: Vec::new(),
                                         system_time: None,
+                                        subpartition: false,
                                         partitions: Vec::new(),
                                         identifier_func: Some(Box::new(func_expr)),
                                         changes: None,
@@ -5755,6 +5914,7 @@ impl Parser {
                                     table_sample: None,
                                     hints: Vec::new(),
                                     system_time: None,
+                                    subpartition: false,
                                     partitions: Vec::new(),
                                     identifier_func: Some(Box::new(func_expr)),
                                     changes: None,
@@ -5796,6 +5956,7 @@ impl Parser {
                     table_sample: None,
                     hints: Vec::new(),
                     system_time: None,
+                    subpartition: false,
                     partitions: Vec::new(),
                     identifier_func: None,
                     changes: None,
@@ -5882,6 +6043,7 @@ impl Parser {
                 table_sample: None,
                 hints: Vec::new(),
                 system_time: None,
+                subpartition: false,
                 partitions: Vec::new(),
                 identifier_func: None,
                 changes: None,
@@ -5927,7 +6089,10 @@ impl Parser {
         ) && self.check_identifier("AT")
             && self.peek_nth(1).is_some_and(|token| {
                 matches!(
-                    token.text.to_ascii_uppercase().as_str(),
+                    token
+                        .text(self.source.as_deref().unwrap_or_default())
+                        .to_ascii_uppercase()
+                        .as_str(),
                     "SNAPSHOT" | "TIMESTAMP"
                 )
             })
@@ -5976,14 +6141,14 @@ impl Parser {
         ) && self.check(TokenType::For)
             && ((self.current + 1 < self.tokens.len()
                 && self.tokens[self.current + 1]
-                    .text
+                    .text(self.source.as_deref().unwrap_or_default())
                     .eq_ignore_ascii_case("SYSTEM_TIME"))
                 || (self.current + 2 < self.tokens.len()
                     && self.tokens[self.current + 1]
-                        .text
+                        .text(self.source.as_deref().unwrap_or_default())
                         .eq_ignore_ascii_case("SYSTEM")
                     && self.tokens[self.current + 2]
-                        .text
+                        .text(self.source.as_deref().unwrap_or_default())
                         .eq_ignore_ascii_case("TIME")))
         {
             self.skip(); // consume FOR
@@ -6122,7 +6287,8 @@ impl Parser {
         // Syntax: FOR VERSION AS OF <snapshot_id>
         //         FOR TIMESTAMP AS OF <timestamp_expr>
         if self.check(TokenType::For) && self.current + 1 < self.tokens.len() {
-            let next_text = &self.tokens[self.current + 1].text;
+            let next_text =
+                self.tokens[self.current + 1].text(self.source.as_deref().unwrap_or_default());
             if next_text.eq_ignore_ascii_case("VERSION")
                 || next_text.eq_ignore_ascii_case("TIMESTAMP")
             {
@@ -6152,13 +6318,14 @@ impl Parser {
         // Syntax: TIMESTAMP AS OF <timestamp_expr>
         //         VERSION AS OF <snapshot_id>
         if self.current < self.tokens.len() {
-            let current_text = &self.tokens[self.current].text;
+            let current_text =
+                self.tokens[self.current].text(self.source.as_deref().unwrap_or_default());
             if (current_text.eq_ignore_ascii_case("TIMESTAMP")
                 || current_text.eq_ignore_ascii_case("VERSION"))
                 && self.current + 2 < self.tokens.len()
                 && self.tokens[self.current + 1].token_type == TokenType::As
                 && self.tokens[self.current + 2]
-                    .text
+                    .text(self.source.as_deref().unwrap_or_default())
                     .eq_ignore_ascii_case("OF")
             {
                 let version_kind = self.advance_text()?.to_ascii_uppercase(); // consume TIMESTAMP or VERSION
@@ -6177,6 +6344,10 @@ impl Parser {
                     }
                 }
             }
+        }
+
+        if let Expression::Table(table) = &mut expr {
+            self.parse_oracle_partition_selection(table)?;
         }
 
         // Check for MySQL PARTITION(p0, p1, ...) clause
@@ -6231,8 +6402,47 @@ impl Parser {
             }
         }
 
+        // Oracle flashback query clause on a table reference (a no-op on every
+        // other dialect):
+        //   AS OF SCN expr
+        //   AS OF TIMESTAMP expr
+        //
+        // Position matters three ways, and Oracle's grammar fixes all of them.
+        // query_table_expression is `table [PARTITION (p)] [sample_clause]`
+        // and the flashback clause follows it, with the alias last:
+        //
+        //   FROM t PARTITION (p) SAMPLE (10) AS OF SCN 12345 alias
+        //
+        // So this runs after PARTITION and after SAMPLE, and before the alias.
+        // Before the alias is the load bearing one: Oracle has no AS keyword
+        // for table aliases, but the shared alias parser does accept one, so
+        // `FROM t AS OF SCN 1` would otherwise be read as the table `t`
+        // aliased `OF`, dropping the flashback and leaving `SCN 1` to fail
+        // somewhere further on.
+        if self.at_oracle_flashback() {
+            // Only a table reference has somewhere to put the clause. A
+            // subquery or a table function would have it parsed and then
+            // discarded, which turns an explicit snapshot request into a
+            // plain read of current data: the query would succeed and return
+            // the wrong rows. Refusing is the honest answer until the AST can
+            // carry it on those shapes.
+            if !matches!(expr, Expression::Table(_)) {
+                return Err(self.parse_error(
+                    "Oracle flashback (AS OF SCN / AS OF TIMESTAMP) is only supported on a table \
+                     reference, not on a subquery or table function",
+                ));
+            }
+            if let Some(version) = self.parse_oracle_flashback()? {
+                if let Expression::Table(ref mut table) = expr {
+                    table.version = Some(Box::new(version));
+                }
+            }
+        }
+
         // Check for TSQL table hints: WITH (TABLOCK, INDEX(myindex), ...)
-        if self.check(TokenType::With) && self.check_next(TokenType::LParen) {
+        if (self.check(TokenType::With) && self.check_next(TokenType::LParen))
+            || self.is_tsql_legacy_table_hint()
+        {
             if let Expression::Table(ref mut table) = expr {
                 if let Some(hint_expr) = self.parse_table_hints()? {
                     // parse_table_hints returns a Tuple wrapping individual hint expressions.
@@ -6257,7 +6467,8 @@ impl Parser {
             // Peek ahead to see if next token after USE/IGNORE/FORCE is INDEX or KEY
             let next_idx = self.current + 1;
             let is_index_hint = next_idx < self.tokens.len() && {
-                let next_text = &self.tokens[next_idx].text;
+                let next_text =
+                    self.tokens[next_idx].text(self.source.as_deref().unwrap_or_default());
                 next_text.eq_ignore_ascii_case("INDEX") || next_text.eq_ignore_ascii_case("KEY")
             };
             if is_index_hint {
@@ -6365,6 +6576,7 @@ impl Parser {
             } else {
                 let alias_ident_parsed = self.expect_identifier_or_alias_keyword_with_quoted()?;
                 let alias_span = alias_ident_parsed.span;
+                let alias_comments = self.previous_trailing_comments().to_vec();
                 let alias = alias_ident_parsed.name;
                 let alias_is_quoted = alias_ident_parsed.quoted;
                 let make_alias_ident = |name: String| -> Identifier {
@@ -6374,10 +6586,11 @@ impl Parser {
                         Identifier::new(name)
                     };
                     identifier.span = alias_span;
+                    identifier.trailing_comments = alias_comments.clone();
                     identifier
                 };
                 // Check for column aliases: AS t(c1, c2) or AS t(c1 type1, c2 type2) for table functions
-                if self.match_token(TokenType::LParen) {
+                if !self.is_tsql_legacy_table_hint() && self.match_token(TokenType::LParen) {
                     // Check if this is typed column definitions (for table functions like JSON_TO_RECORDSET)
                     // by looking ahead: if we see identifier followed by another identifier/type (not comma/rparen),
                     // it's typed columns
@@ -6545,19 +6758,20 @@ impl Parser {
             let alias = self.advance_text()?;
             // Check for column aliases: t(c1, c2)
             // Use expect_identifier_or_keyword to allow keywords like KEY, INDEX, VALUE as column aliases
-            let mut column_aliases = if self.match_token(TokenType::LParen) {
-                let mut aliases = Vec::new();
-                loop {
-                    aliases.push(self.expect_identifier_or_keyword_with_quoted()?);
-                    if !self.match_token(TokenType::Comma) {
-                        break;
+            let mut column_aliases =
+                if !self.is_tsql_legacy_table_hint() && self.match_token(TokenType::LParen) {
+                    let mut aliases = Vec::new();
+                    loop {
+                        aliases.push(self.expect_identifier_or_keyword_with_quoted()?);
+                        if !self.match_token(TokenType::Comma) {
+                            break;
+                        }
                     }
-                }
-                self.expect(TokenType::RParen)?;
-                aliases
-            } else {
-                Vec::new()
-            };
+                    self.expect(TokenType::RParen)?;
+                    aliases
+                } else {
+                    Vec::new()
+                };
             if column_aliases.is_empty()
                 && matches!(
                     self.config.dialect,
@@ -6777,7 +6991,9 @@ impl Parser {
         }
 
         // Check for TSQL table hints after alias: t o WITH (NOLOCK), t AS a WITH (TABLOCK)
-        if self.check(TokenType::With) && self.check_next(TokenType::LParen) {
+        if (self.check(TokenType::With) && self.check_next(TokenType::LParen))
+            || self.is_tsql_legacy_table_hint()
+        {
             if let Expression::Table(ref mut table) = expr {
                 if let Some(hint_expr) = self.parse_table_hints()? {
                     match hint_expr {
@@ -6799,7 +7015,8 @@ impl Parser {
         {
             let next_idx = self.current + 1;
             let is_index_hint = next_idx < self.tokens.len() && {
-                let next_text = &self.tokens[next_idx].text;
+                let next_text =
+                    self.tokens[next_idx].text(self.source.as_deref().unwrap_or_default());
                 next_text.eq_ignore_ascii_case("INDEX") || next_text.eq_ignore_ascii_case("KEY")
             };
             if is_index_hint {
@@ -6967,14 +7184,14 @@ impl Parser {
         if self.check(TokenType::For)
             && ((self.current + 1 < self.tokens.len()
                 && self.tokens[self.current + 1]
-                    .text
+                    .text(self.source.as_deref().unwrap_or_default())
                     .eq_ignore_ascii_case("SYSTEM_TIME"))
                 || (self.current + 2 < self.tokens.len()
                     && self.tokens[self.current + 1]
-                        .text
+                        .text(self.source.as_deref().unwrap_or_default())
                         .eq_ignore_ascii_case("SYSTEM")
                     && self.tokens[self.current + 2]
-                        .text
+                        .text(self.source.as_deref().unwrap_or_default())
                         .eq_ignore_ascii_case("TIME")))
         {
             self.skip(); // consume FOR
@@ -7640,6 +7857,7 @@ impl Parser {
                 table_sample: None,
                 hints: Vec::new(),
                 system_time: None,
+                subpartition: false,
                 partitions: Vec::new(),
                 identifier_func: Some(Box::new(identifier_func)),
                 changes: None,
@@ -7673,6 +7891,7 @@ impl Parser {
                     table_sample: None,
                     hints: Vec::new(),
                     system_time: None,
+                    subpartition: false,
                     partitions: Vec::new(),
                     identifier_func: None,
                     changes: None,
@@ -7704,6 +7923,7 @@ impl Parser {
                         table_sample: None,
                         hints: Vec::new(),
                         system_time: None,
+                        subpartition: false,
                         partitions: Vec::new(),
                         identifier_func: None,
                         changes: None,
@@ -7737,6 +7957,7 @@ impl Parser {
                             table_sample: None,
                             hints: Vec::new(),
                             system_time: None,
+                            subpartition: false,
                             partitions: Vec::new(),
                             identifier_func: None,
                             changes: None,
@@ -7761,6 +7982,7 @@ impl Parser {
                         table_sample: None,
                         hints: Vec::new(),
                         system_time: None,
+                        subpartition: false,
                         partitions: Vec::new(),
                         identifier_func: None,
                         changes: None,
@@ -7784,6 +8006,7 @@ impl Parser {
                         table_sample: None,
                         hints: Vec::new(),
                         system_time: None,
+                        subpartition: false,
                         partitions: Vec::new(),
                         identifier_func: None,
                         changes: None,
@@ -7809,6 +8032,7 @@ impl Parser {
                 table_sample: None,
                 hints: Vec::new(),
                 system_time: None,
+                subpartition: false,
                 partitions: Vec::new(),
                 identifier_func: None,
                 changes: None,
@@ -7886,11 +8110,16 @@ impl Parser {
             loop {
                 let pos_before_join_kind = self.current;
                 let join_kind_result = self.try_parse_join_kind();
-                let (kind, needs_join_keyword, use_inner_keyword, use_outer_keyword, join_hint) =
-                    match join_kind_result {
-                        Some(r) => r,
-                        None => break,
-                    };
+                let (
+                    mut kind,
+                    needs_join_keyword,
+                    mut use_inner_keyword,
+                    use_outer_keyword,
+                    join_hint,
+                ) = match join_kind_result {
+                    Some(r) => r,
+                    None => break,
+                };
                 // Collect comments from all tokens consumed by try_parse_join_kind:
                 // - Leading comments on the first token (comments on a separate line before the join)
                 // - Trailing comments between join keywords (e.g., INNER /* comment */ JOIN)
@@ -7914,6 +8143,31 @@ impl Parser {
                 };
                 if needs_join_keyword {
                     self.expect(TokenType::Join)?;
+                }
+
+                if self.config.dialect == Some(crate::dialects::DialectType::DuckDB)
+                    && self.match_token(TokenType::By)
+                {
+                    self.expect(TokenType::LParen)?;
+                    self.expect(TokenType::Type)?;
+                    let name = self.expect_identifier_or_keyword()?.to_ascii_uppercase();
+                    kind = match name.strip_suffix("_JOIN").unwrap_or(&name) {
+                        "INNER" => {
+                            use_inner_keyword = true;
+                            JoinKind::Inner
+                        }
+                        "LEFT" => JoinKind::Left,
+                        "RIGHT" => JoinKind::Right,
+                        "FULL" => JoinKind::Full,
+                        "SEMI" => JoinKind::Semi,
+                        "ANTI" => JoinKind::Anti,
+                        "RIGHT_SEMI" => JoinKind::RightSemi,
+                        "RIGHT_ANTI" => JoinKind::RightAnti,
+                        "MARK" => JoinKind::Mark,
+                        "SINGLE" => JoinKind::Single,
+                        _ => return Err(self.parse_error("Unknown JOIN BY type")),
+                    };
+                    self.expect(TokenType::RParen)?;
                 }
 
                 // ClickHouse: ARRAY JOIN uses expressions, not table references
@@ -7965,10 +8219,10 @@ impl Parser {
                     kind,
                     JoinKind::AsOf | JoinKind::AsOfLeft | JoinKind::AsOfRight
                 ) && (self.check(TokenType::Offset) || self.check(TokenType::Limit))
-                    && self
-                        .peek_nth(1)
-                        .map(|t| t.text.eq_ignore_ascii_case("MATCH_CONDITION"))
-                        == Some(true)
+                    && self.peek_nth(1).map(|t| {
+                        t.text(self.source.as_deref().unwrap_or_default())
+                            .eq_ignore_ascii_case("MATCH_CONDITION")
+                    }) == Some(true)
                 {
                     let alias_name = self.advance_text()?;
                     Expression::Alias(Box::new(Alias {
@@ -7983,6 +8237,33 @@ impl Parser {
                     }))
                 } else {
                     table
+                };
+
+                let nearest = if self.config.dialect == Some(crate::dialects::DialectType::DuckDB)
+                    && (self.check_identifier("NEAREST") || self.check_identifier("APPROX"))
+                {
+                    let approximate = self.match_identifier("APPROX");
+                    if !self.match_identifier("NEAREST") {
+                        return Err(self.parse_error("Expected NEAREST after APPROX"));
+                    }
+                    let count = self.parse_expression()?;
+                    self.expect(TokenType::By)?;
+                    let similarity = if self.match_identifier("SIMILARITY") {
+                        true
+                    } else if self.match_identifier("DISTANCE") {
+                        false
+                    } else {
+                        return Err(self.parse_error("Expected DISTANCE or SIMILARITY"));
+                    };
+                    let metric = self.parse_expression()?;
+                    Some(NearestJoin {
+                        count,
+                        metric,
+                        approximate,
+                        similarity,
+                    })
+                } else {
+                    None
                 };
 
                 // Try to parse inline MATCH_CONDITION/ON/USING (only if not followed by another JOIN)
@@ -8043,6 +8324,7 @@ impl Parser {
                     comments: join_comments,
                     nesting_group,
                     directed,
+                    nearest,
                 });
             }
 
@@ -8288,7 +8570,9 @@ impl Parser {
                 Some((JoinKind::LeftSemi, true, use_inner, use_outer, join_hint))
             } else if self.match_token(TokenType::Anti) {
                 Some((JoinKind::LeftAnti, true, use_inner, use_outer, join_hint))
-            } else if self.match_token(TokenType::Lateral) {
+            } else if self.config.dialect != Some(crate::dialects::DialectType::ClickHouse)
+                && self.match_token(TokenType::Lateral)
+            {
                 Some((JoinKind::LeftLateral, true, use_inner, use_outer, join_hint))
             } else {
                 Some((JoinKind::Left, true, use_inner, use_outer, join_hint))
@@ -8520,9 +8804,10 @@ impl Parser {
             {
                 self.parse_hana_grouping()?
             } else if self.check_identifier("GROUPING")
-                && self
-                    .peek_nth(1)
-                    .map_or(false, |t| t.text.eq_ignore_ascii_case("SETS"))
+                && self.peek_nth(1).map_or(false, |t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("SETS")
+                })
                 && {
                     self.skip();
                     self.skip();
@@ -8614,9 +8899,10 @@ impl Parser {
                 if self.check(TokenType::Cube)
                     || self.check(TokenType::Rollup)
                     || (self.check_identifier("GROUPING")
-                        && self
-                            .peek_nth(1)
-                            .map_or(false, |t| t.text.eq_ignore_ascii_case("SETS")))
+                        && self.peek_nth(1).map_or(false, |t| {
+                            t.text(self.source.as_deref().unwrap_or_default())
+                                .eq_ignore_ascii_case("SETS")
+                        }))
                 {
                     continue;
                 }
@@ -8684,9 +8970,10 @@ impl Parser {
             {
                 self.parse_hana_grouping()?
             } else if self.check_identifier("GROUPING")
-                && self
-                    .peek_nth(1)
-                    .map_or(false, |t| t.text.eq_ignore_ascii_case("SETS"))
+                && self.peek_nth(1).map_or(false, |t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("SETS")
+                })
                 && {
                     self.skip();
                     self.skip();
@@ -8786,29 +9073,25 @@ impl Parser {
     }
 
     fn maybe_parse_clickhouse_order_collate(&mut self, expr: Expression) -> Result<Expression> {
-        if !matches!(
-            self.config.dialect,
-            Some(crate::dialects::DialectType::ClickHouse)
-        ) || !(self.match_token(TokenType::Collate) || self.match_identifier("COLLATE"))
+        if self.config.dialect != Some(crate::dialects::DialectType::ClickHouse)
+            || !(self.match_token(TokenType::Collate) || self.match_identifier("COLLATE"))
         {
             return Ok(expr);
         }
-
-        let collation = if self.check(TokenType::String) {
-            let value = self.advance_text()?.replace('\'', "''");
-            format!("'{}'", value)
-        } else if self.is_identifier_or_keyword_token() {
-            self.advance_text()?
-        } else {
+        let quoted = self.check(TokenType::String);
+        let double_quoted = self.check(TokenType::QuotedIdentifier);
+        if !quoted && !self.is_identifier_or_keyword_token() {
             return Err(self.parse_error("Expected collation after COLLATE"));
-        };
-
-        Ok(Expression::Raw(Raw {
-            sql: format!("{} COLLATE {}", expr, collation),
-        }))
+        }
+        let collation = self.advance_text()?;
+        Ok(Expression::Collation(Box::new(CollationExpr {
+            this: expr,
+            collation,
+            quoted,
+            double_quoted,
+        })))
     }
 
-    /// Parse ORDER BY clause with optional siblings flag (Oracle ORDER SIBLINGS BY)
     fn parse_order_by_with_siblings(&mut self, siblings: bool) -> Result<OrderBy> {
         let mut expressions = Vec::new();
 
@@ -8992,6 +9275,9 @@ impl Parser {
 
     /// Parse a LIMIT count without mistaking a trailing percent sign for modulo.
     fn parse_limit_value(&mut self) -> Result<(Expression, bool)> {
+        if self.is_clickhouse_limit_boundary() {
+            return Ok((self.parse_clickhouse_limit_range(None)?, false));
+        }
         let saved_pos = self.current;
         if let Ok(expr) = self.parse_unary() {
             if self.check(TokenType::Percent) && self.is_percent_modifier() {
@@ -9001,11 +9287,60 @@ impl Parser {
         }
         self.current = saved_pos;
         let expr = self.parse_expression()?;
+        if self.is_clickhouse_limit_boundary() {
+            return Ok((self.parse_clickhouse_limit_range(Some(expr))?, false));
+        }
         let percent = self.check(TokenType::Percent) && self.is_percent_modifier();
         if percent {
             self.skip();
         }
         Ok((expr, percent))
+    }
+
+    fn is_clickhouse_limit_boundary(&self) -> bool {
+        self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+            && !self.check(TokenType::QuotedIdentifier)
+            && (self.peek_text().eq_ignore_ascii_case("AFTER")
+                || self.peek_text().eq_ignore_ascii_case("UNTIL"))
+            && self.peek_nth(1).is_some_and(|token| {
+                !matches!(
+                    token.token_type,
+                    TokenType::Eof
+                        | TokenType::Semicolon
+                        | TokenType::RParen
+                        | TokenType::Comma
+                        | TokenType::Offset
+                        | TokenType::By
+                        | TokenType::Fetch
+                        | TokenType::Settings
+                        | TokenType::Format
+                        | TokenType::As
+                        | TokenType::Union
+                        | TokenType::Intersect
+                        | TokenType::Except
+                )
+            })
+    }
+
+    fn parse_clickhouse_limit_range(&mut self, count: Option<Expression>) -> Result<Expression> {
+        let after = if self.match_token(TokenType::After) || self.match_identifier("AFTER") {
+            Some(Box::new(self.parse_expression()?))
+        } else {
+            None
+        };
+        let after_all = after.is_some() && self.match_token(TokenType::All);
+        let until = if self.match_identifier("UNTIL") {
+            Some(Box::new(self.parse_expression()?))
+        } else {
+            None
+        };
+        Ok(Expression::LimitRange(Box::new(LimitRange {
+            count: count.map(Box::new),
+            after,
+            after_all,
+            until,
+            with_ties: false,
+        })))
     }
 
     /// Parse a query-level LIMIT/OFFSET/FETCH tail. The count parser is shared
@@ -11828,6 +12163,29 @@ impl Parser {
                     strict,
                     on_columns,
                 }));
+                if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse) {
+                    if let Expression::Intersect(mut intersect) = result {
+                        let left = std::mem::replace(&mut intersect.left, Expression::Null(Null));
+                        result = match left {
+                            Expression::Union(mut union) => {
+                                intersect.left =
+                                    std::mem::replace(&mut union.right, Expression::Null(Null));
+                                union.right = Expression::Intersect(intersect);
+                                Expression::Union(union)
+                            }
+                            Expression::Except(mut except) => {
+                                intersect.left =
+                                    std::mem::replace(&mut except.right, Expression::Null(Null));
+                                except.right = Expression::Intersect(intersect);
+                                Expression::Except(except)
+                            }
+                            left => {
+                                intersect.left = left;
+                                Expression::Intersect(intersect)
+                            }
+                        };
+                    }
+                }
                 found_set_op = true;
             } else if self.check_set_operation_start(TokenType::Except) {
                 self.skip();
@@ -11926,9 +12284,7 @@ impl Parser {
             }
             Expression::Select(select) => {
                 // ClickHouse row-limiting clauses belong to individual UNION operands.
-                if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
-                    && select.fetch.is_some()
-                {
+                if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse) {
                     return (None, None, None);
                 }
                 let order_by = select.order_by.take();
@@ -12253,7 +12609,11 @@ impl Parser {
         let overwrite = self.match_token(TokenType::Overwrite);
 
         // Handle multi-table INSERT: INSERT [OVERWRITE] ALL/FIRST ...
-        if self.match_token(TokenType::All) || self.match_token(TokenType::First) {
+        if self.match_token(TokenType::All)
+            || self.match_token(TokenType::First)
+            || (self.config.dialect == Some(crate::dialects::DialectType::Oracle)
+                && self.check(TokenType::When))
+        {
             if let Some(multi_insert) =
                 self.parse_multitable_inserts(leading_comments.clone(), overwrite)?
             {
@@ -12359,6 +12719,7 @@ impl Parser {
                 conflict_action: conflict_action.clone(),
                 is_replace: false,
                 replace_where: None,
+                replace_using: Vec::new(),
                 source: None,
                 hint: hint.clone(),
                 function_target: None,
@@ -12414,7 +12775,7 @@ impl Parser {
             self.expect_identifier_or_keyword_with_quoted()?
         };
         // Handle qualified table names like a.b or a.b.c
-        let table = if self.match_token(TokenType::Dot) {
+        let mut table = if self.match_token(TokenType::Dot) {
             let mut schema = table_name;
             let mut name = self.expect_identifier_or_keyword_with_quoted()?;
             // Check for three-part name: catalog.schema.table
@@ -12442,6 +12803,7 @@ impl Parser {
                 table_sample: None,
                 hints: Vec::new(),
                 system_time: None,
+                subpartition: false,
                 partitions: Vec::new(),
                 identifier_func: None,
                 changes: None,
@@ -12465,6 +12827,7 @@ impl Parser {
                 hints: Vec::new(),
                 system_time: None,
                 trailing_comments,
+                subpartition: false,
                 partitions: Vec::new(),
                 identifier_func: None,
                 changes: None,
@@ -12473,13 +12836,14 @@ impl Parser {
             }
         };
 
+        self.parse_oracle_partition_selection(&mut table)?;
+
         // Optional alias (PostgreSQL: INSERT INTO table AS t(...), Oracle: INSERT INTO table t ...)
         let (alias, alias_explicit_as) = if self.match_token(TokenType::As) {
-            (
-                Some(self.parse_unquoted_identifier(Self::expect_identifier)?),
-                true,
-            )
+            (Some(self.expect_identifier_with_quoted()?), true)
         } else if self.is_identifier_token()
+            && !(self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+                && self.check_identifier("VALUE"))
             && !self.check(TokenType::Values)
             && !self.check(TokenType::Select)
             && !self.check(TokenType::Default)
@@ -12492,10 +12856,7 @@ impl Parser {
             && !self.check(TokenType::LParen)
         {
             // Implicit alias without AS (e.g., INSERT INTO dest d VALUES ...)
-            (
-                Some(self.parse_unquoted_identifier(Self::expect_identifier)?),
-                false,
-            )
+            (Some(self.expect_identifier_with_quoted()?), false)
         } else {
             (None, false)
         };
@@ -12504,12 +12865,19 @@ impl Parser {
         let if_exists = self.match_keywords(&[TokenType::If, TokenType::Exists]);
 
         // Optional REPLACE WHERE clause (Databricks): INSERT INTO a REPLACE WHERE cond VALUES ...
-        let replace_where =
-            if self.match_token(TokenType::Replace) && self.match_token(TokenType::Where) {
-                Some(Box::new(self.parse_or()?))
-            } else {
-                None
-            };
+        let replace_where = if self.match_keywords(&[TokenType::Replace, TokenType::Where]) {
+            Some(Box::new(self.parse_or()?))
+        } else {
+            None
+        };
+        let replace_using = if self.match_keywords(&[TokenType::Replace, TokenType::Using]) {
+            self.expect(TokenType::LParen)?;
+            let columns = self.parse_identifier_list()?;
+            self.expect(TokenType::RParen)?;
+            columns
+        } else {
+            Vec::new()
+        };
 
         // Optional PARTITION clause
         // ClickHouse: PARTITION BY expr (no parens)
@@ -12580,7 +12948,10 @@ impl Parser {
                     || (peek1 == Some(TokenType::Var)
                         && self
                             .peek_nth(1)
-                            .map(|t| t.text.eq_ignore_ascii_case("COLUMNS"))
+                            .map(|t| {
+                                t.text(self.source.as_deref().unwrap_or_default())
+                                    .eq_ignore_ascii_case("COLUMNS")
+                            })
                             .unwrap_or(false))
             } {
                 // Consume balanced parens and skip entire column specification
@@ -12682,7 +13053,8 @@ impl Parser {
             Some(crate::dialects::DialectType::ClickHouse)
         ) && self.check(TokenType::Format)
             && self.peek_nth(1).is_some_and(|t| {
-                !t.text.eq_ignore_ascii_case("VALUES")
+                !t.text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("VALUES")
                     && (t.token_type == TokenType::Var || t.token_type == TokenType::Identifier)
             })
         {
@@ -12720,7 +13092,10 @@ impl Parser {
             }
 
             (all_values, None)
-        } else if self.match_token(TokenType::Values) {
+        } else if self.match_token(TokenType::Values)
+            || (self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+                && self.match_identifier("VALUE"))
+        {
             let mut all_values = Vec::new();
 
             // ClickHouse: INSERT INTO t VALUES; — empty VALUES (clientError expected)
@@ -12814,6 +13189,7 @@ impl Parser {
                     table_sample: None,
                     hints: Vec::new(),
                     system_time: None,
+                    subpartition: false,
                     partitions: Vec::new(),
                     identifier_func: None,
                     changes: None,
@@ -12837,6 +13213,7 @@ impl Parser {
                     table_sample: None,
                     hints: Vec::new(),
                     system_time: None,
+                    subpartition: false,
                     partitions: Vec::new(),
                     identifier_func: None,
                     changes: None,
@@ -12948,6 +13325,7 @@ impl Parser {
             conflict_action,
             is_replace: false,
             replace_where,
+            replace_using,
             source: source.map(Box::new),
             hint,
             function_target,
@@ -13167,6 +13545,7 @@ impl Parser {
                 table_sample: None,
                 hints: Vec::new(),
                 system_time: None,
+                subpartition: false,
                 partitions: Vec::new(),
                 identifier_func: None,
                 changes: None,
@@ -13239,6 +13618,7 @@ impl Parser {
             conflict_action: None,
             is_replace: true,
             replace_where: None,
+            replace_using: Vec::new(),
             source: None,
             hint: None,
             function_target: None,
@@ -13272,7 +13652,7 @@ impl Parser {
         let has_only = self.match_token(TokenType::Only);
 
         // Parse table name (can be qualified: db.table_name)
-        let first_name = self.expect_identifier_with_quoted()?;
+        let first_name = self.expect_identifier_or_safe_keyword_with_quoted()?;
         let mut table = if self.match_token(TokenType::Dot) {
             let second_name = self.expect_identifier_with_quoted()?;
             // Check for three-part name (catalog.schema.table)
@@ -13293,6 +13673,7 @@ impl Parser {
                     table_sample: None,
                     hints: Vec::new(),
                     system_time: None,
+                    subpartition: false,
                     partitions: Vec::new(),
                     identifier_func: None,
                     changes: None,
@@ -13315,6 +13696,7 @@ impl Parser {
                     table_sample: None,
                     hints: Vec::new(),
                     system_time: None,
+                    subpartition: false,
                     partitions: Vec::new(),
                     identifier_func: None,
                     changes: None,
@@ -13330,6 +13712,12 @@ impl Parser {
             table.only = true;
         }
 
+        let on_cluster = if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse) {
+            self.parse_on_cluster_clause()?
+        } else {
+            None
+        };
+
         // Optional alias (with or without AS)
         if self.match_token(TokenType::As) {
             table.alias = Some(self.expect_identifier_with_quoted()?);
@@ -13339,6 +13727,8 @@ impl Parser {
             table.alias = Some(self.expect_identifier_with_quoted()?);
             table.alias_explicit_as = false;
         }
+
+        self.parse_tsql_target_hints(&mut table)?;
 
         // Handle multi-table UPDATE syntax: UPDATE t1, t2, t3 LEFT JOIN t4 ON ... SET ...
         // Capture additional tables
@@ -13365,6 +13755,7 @@ impl Parser {
                         table_sample: None,
                         hints: Vec::new(),
                         system_time: None,
+                        subpartition: false,
                         partitions: Vec::new(),
                         identifier_func: None,
                         changes: None,
@@ -13387,6 +13778,7 @@ impl Parser {
                         table_sample: None,
                         hints: Vec::new(),
                         system_time: None,
+                        subpartition: false,
                         partitions: Vec::new(),
                         identifier_func: None,
                         changes: None,
@@ -13441,6 +13833,7 @@ impl Parser {
                 comments: Vec::new(),
                 nesting_group: 0,
                 directed: false,
+                nearest: None,
             });
         }
 
@@ -13458,30 +13851,31 @@ impl Parser {
         self.expect(TokenType::Set)?;
 
         let mut set = Vec::new();
+        let mut assignments = Vec::new();
+        let mut complex_target = false;
         loop {
-            // Column can be qualified for multi-table UPDATE (e.g., a.id = 1)
-            // Use safe keyword variant to allow keywords like 'exists' as column names (ClickHouse)
-            let mut col_ident = self.expect_identifier_or_safe_keyword_with_quoted()?;
-            while self.match_token(TokenType::Dot) {
-                let part = self.expect_identifier_or_safe_keyword_with_quoted()?;
-                // For qualified columns, preserve both parts
-                col_ident = Identifier {
-                    name: format!("{}.{}", col_ident.name, part.name),
-                    quoted: col_ident.quoted || part.quoted,
-                    trailing_comments: Vec::new(),
-                    span: col_ident
-                        .span
-                        .zip(part.span)
-                        .map(|(start, end)| start.through(end)),
-                };
-            }
+            let target = self.parse_bitwise_or()?;
             self.expect(TokenType::Eq)?;
             let value = self.parse_expression()?;
-            set.push((col_ident, value));
-
+            let identifier = match &target {
+                Expression::Column(c) if c.table.is_none() => Some(c.name.clone()),
+                Expression::Identifier(id) => Some(id.clone()),
+                _ => None,
+            };
+            if let Some(identifier) = identifier {
+                set.push((identifier, value.clone()));
+            } else {
+                complex_target = true;
+            }
+            assignments.push(BinaryOp::new(target, value));
             if !self.match_token(TokenType::Comma) {
                 break;
             }
+        }
+        if complex_target {
+            set.clear();
+        } else {
+            assignments.clear();
         }
 
         // Parse OUTPUT clause (TSQL)
@@ -13532,6 +13926,8 @@ impl Parser {
         };
 
         Ok(Expression::Update(Box::new(Update {
+            assignments,
+            on_cluster,
             table,
             hint,
             extra_tables,
@@ -13618,6 +14014,8 @@ impl Parser {
         if has_only {
             table.only = true;
         }
+
+        self.parse_tsql_target_hints(&mut table)?;
 
         // ClickHouse: ON CLUSTER clause
         let on_cluster = self.parse_on_cluster_clause()?;
@@ -13765,9 +14163,10 @@ impl Parser {
             self.config.dialect,
             Some(crate::dialects::DialectType::ClickHouse)
         ) && self.check(TokenType::In)
-            && self
-                .peek_nth(1)
-                .is_some_and(|t| t.text.eq_ignore_ascii_case("PARTITION"))
+            && self.peek_nth(1).is_some_and(|t| {
+                t.text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("PARTITION")
+            })
         {
             self.skip(); // consume IN
             self.skip(); // consume PARTITION
@@ -14094,7 +14493,9 @@ impl Parser {
                 if (self.check_identifier("FILE") || self.check(TokenType::File)) && {
                     let next = self.current + 1;
                     next < self.tokens.len()
-                        && (self.tokens[next].text.eq_ignore_ascii_case("FORMAT"))
+                        && (self.tokens[next]
+                            .text(self.source.as_deref().unwrap_or_default())
+                            .eq_ignore_ascii_case("FORMAT"))
                 } {
                     return self.parse_create_file_format(or_replace, temporary);
                 }
@@ -14152,18 +14553,20 @@ impl Parser {
     fn check_databricks_create_flow_auto_cdc(&self) -> bool {
         self.peek_nth(0)
             .is_some_and(|t| t.token_type == TokenType::Create)
-            && self
-                .peek_nth(1)
-                .is_some_and(|t| t.text.eq_ignore_ascii_case("FLOW"))
+            && self.peek_nth(1).is_some_and(|t| {
+                t.text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("FLOW")
+            })
             && (2..8).any(|i| {
-                self.peek_nth(i)
-                    .is_some_and(|t| t.text.eq_ignore_ascii_case("AUTO"))
-                    && self
-                        .peek_nth(i + 1)
-                        .is_some_and(|t| t.text.eq_ignore_ascii_case("CDC"))
-                    && self
-                        .peek_nth(i + 2)
-                        .is_some_and(|t| t.token_type == TokenType::Into)
+                self.peek_nth(i).is_some_and(|t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("AUTO")
+                }) && self.peek_nth(i + 1).is_some_and(|t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("CDC")
+                }) && self
+                    .peek_nth(i + 2)
+                    .is_some_and(|t| t.token_type == TokenType::Into)
             })
     }
 
@@ -14239,6 +14642,79 @@ impl Parser {
         })))
     }
 
+    fn parse_oracle_table_properties(&mut self) -> Result<Vec<Expression>> {
+        let mut properties = Vec::new();
+        if self.config.dialect != Some(crate::dialects::DialectType::Oracle) {
+            return Ok(properties);
+        }
+        while !self.is_at_end() && !self.check(TokenType::QuotedIdentifier) {
+            let name = self.peek_text().to_ascii_uppercase();
+            if !matches!(
+                name.as_str(),
+                "TABLESPACE"
+                    | "PCTFREE"
+                    | "PCTUSED"
+                    | "INITRANS"
+                    | "MAXTRANS"
+                    | "STORAGE"
+                    | "LOGGING"
+                    | "NOLOGGING"
+            ) {
+                break;
+            }
+            self.skip();
+            let mut property = OracleTableProperty {
+                name: name.clone(),
+                value: None,
+                unit: None,
+                options: Vec::new(),
+            };
+            if name == "STORAGE" {
+                self.expect(TokenType::LParen)?;
+                while !self.check(TokenType::RParen) {
+                    let name = self.expect_identifier_or_keyword()?.to_ascii_uppercase();
+                    let value = self.parse_primary()?;
+                    let unit = if self.match_texts(&["K", "M", "G", "T"]) {
+                        Some(self.previous_text().to_ascii_uppercase())
+                    } else {
+                        None
+                    };
+                    property.options.push(OracleTableProperty {
+                        name,
+                        value: Some(value),
+                        unit,
+                        options: Vec::new(),
+                    });
+                }
+                self.expect(TokenType::RParen)?;
+            } else if name == "TABLESPACE" {
+                property.value = Some(Expression::Identifier(
+                    self.expect_identifier_or_keyword_with_quoted()?,
+                ));
+            } else if !matches!(name.as_str(), "LOGGING" | "NOLOGGING") {
+                property.value = Some(self.parse_primary()?);
+            }
+            properties.push(Expression::OracleTableProperty(Box::new(property)));
+        }
+        Ok(properties)
+    }
+
+    fn parse_oracle_partition_selection(&mut self, table: &mut TableRef) -> Result<()> {
+        if self.config.dialect == Some(crate::dialects::DialectType::Oracle)
+            && !self.check(TokenType::QuotedIdentifier)
+            && (self.check(TokenType::Partition) || self.check_keyword_text("SUBPARTITION"))
+            && self.check_next(TokenType::LParen)
+        {
+            table.subpartition = self.advance_text()?.eq_ignore_ascii_case("SUBPARTITION");
+            self.expect(TokenType::LParen)?;
+            table
+                .partitions
+                .push(self.expect_identifier_or_keyword_with_quoted()?);
+            self.expect(TokenType::RParen)?;
+        }
+        Ok(())
+    }
+
     /// Parse CREATE TABLE
     fn parse_create_table(
         &mut self,
@@ -14281,15 +14757,21 @@ impl Parser {
         // Parse table name
         let name = self.parse_table_ref()?;
 
+        let oracle_properties = self.parse_oracle_table_properties()?;
+
         // ClickHouse: CREATE TABLE t TO INNER UUID 'xxx' ... internal table syntax.
         if is_clickhouse
             && self.check(TokenType::To)
-            && self
-                .peek_nth(1)
-                .is_some_and(|token| token.text.eq_ignore_ascii_case("INNER"))
-            && self
-                .peek_nth(2)
-                .is_some_and(|token| token.text.eq_ignore_ascii_case("UUID"))
+            && self.peek_nth(1).is_some_and(|token| {
+                token
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("INNER")
+            })
+            && self.peek_nth(2).is_some_and(|token| {
+                token
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("UUID")
+            })
         {
             self.skip(); // TO
             self.skip(); // INNER
@@ -14388,48 +14870,15 @@ impl Parser {
             let at_clause = if self.match_identifier("AT") || self.match_token(TokenType::Before) {
                 let keyword = self.previous_text().to_ascii_uppercase();
                 self.expect(TokenType::LParen)?;
-                // Parse the content: OFFSET => value or TIMESTAMP => value
-                let mut result = format!("{} (", keyword);
-                let mut prev_token_type: Option<TokenType> = None;
-                let mut paren_depth = 1;
-                while !self.is_at_end() && paren_depth > 0 {
-                    let token = self.advance()?;
-                    if token.token_type == TokenType::LParen {
-                        paren_depth += 1;
-                    } else if token.token_type == TokenType::RParen {
-                        paren_depth -= 1;
-                        if paren_depth == 0 {
-                            break;
-                        }
-                    }
-                    let needs_space = !result.ends_with('(')
-                        && prev_token_type != Some(TokenType::Arrow)
-                        && prev_token_type != Some(TokenType::Dash)
-                        && prev_token_type != Some(TokenType::LParen)
-                        && prev_token_type != Some(TokenType::Comma) // comma already adds trailing space
-                        && token.token_type != TokenType::LParen; // no space before (
-                    if needs_space
-                        && token.token_type != TokenType::RParen
-                        && token.token_type != TokenType::Comma
-                    {
-                        result.push(' ');
-                    }
-                    // Properly quote string literals
-                    if token.token_type == TokenType::String {
-                        result.push('\'');
-                        result.push_str(&token.text.replace('\'', "''"));
-                        result.push('\'');
-                    } else {
-                        result.push_str(&token.text);
-                    }
-                    if token.token_type == TokenType::Arrow || token.token_type == TokenType::Comma
-                    {
-                        result.push(' ');
-                    }
-                    prev_token_type = Some(token.token_type);
-                }
-                result.push(')');
-                Some(Expression::Raw(Raw { sql: result }))
+                let kind = self.expect_identifier_or_keyword()?.to_ascii_uppercase();
+                self.expect(TokenType::FArrow)?;
+                let value = self.parse_expression()?;
+                self.expect(TokenType::RParen)?;
+                Some(Expression::Version(Box::new(Version {
+                    this: Box::new(Expression::Identifier(Identifier::new(kind))),
+                    kind: keyword,
+                    expression: Some(Box::new(value)),
+                })))
             } else if matches!(
                 self.peek().token_type,
                 TokenType::VersionSnapshot | TokenType::TimestampSnapshot
@@ -14438,9 +14887,10 @@ impl Parser {
                 && self
                     .peek_nth(1)
                     .is_some_and(|t| t.token_type == TokenType::As)
-                && self
-                    .peek_nth(2)
-                    .is_some_and(|t| t.text.eq_ignore_ascii_case("OF")))
+                && self.peek_nth(2).is_some_and(|t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("OF")
+                }))
             {
                 // Databricks: VERSION AS OF n / TIMESTAMP AS OF t
                 let version_kind = if self.match_token(TokenType::TimestampSnapshot) {
@@ -14850,6 +15300,7 @@ impl Parser {
                         table_sample: None,
                         hints: Vec::new(),
                         system_time: None,
+                        subpartition: false,
                         partitions: Vec::new(),
                         identifier_func: Some(Box::new(func_expr)),
                         changes: None,
@@ -14928,7 +15379,8 @@ impl Parser {
                     // Keep the Subquery wrapper if it has limit/offset/order_by
                     if let Expression::Subquery(ref sq) = subquery {
                         if sq.limit.is_some() || sq.offset.is_some() || sq.order_by.is_some() {
-                            // Keep the Subquery to preserve the modifiers
+                            // This wrapper already owns its parentheses.
+                            as_select_parenthesized = false;
                             subquery
                         } else {
                             // Extract the inner query
@@ -14944,7 +15396,10 @@ impl Parser {
                         subquery
                     }
                 }
-            } else if self.check(TokenType::With) {
+            } else if self.check(TokenType::With)
+                || (self.config.dialect == Some(crate::dialects::DialectType::Athena)
+                    && self.check(TokenType::Using))
+            {
                 // Handle WITH ... SELECT ...
                 self.parse_statement()?
             } else if self.is_identifier_token() {
@@ -15009,7 +15464,7 @@ impl Parser {
                 with_statistics,
                 teradata_indexes,
                 with_cte: None,
-                properties: Vec::new(),
+                properties: oracle_properties,
                 partition_of: None,
                 post_table_properties: redshift_ctas_properties,
                 mysql_table_options: Vec::new(),
@@ -15044,7 +15499,9 @@ impl Parser {
                 } else {
                     None
                 };
-                let as_select_parenthesized = as_select.is_some();
+                let as_select_parenthesized = as_select.as_ref().is_some_and(|query| {
+                    !matches!(query, Expression::Subquery(_) | Expression::Paren(_))
+                });
 
                 if as_select.is_some() {
                     self.parse_clickhouse_table_properties(&mut table_properties)?;
@@ -15501,6 +15958,7 @@ impl Parser {
                     table_sample: None,
                     hints: Vec::new(),
                     system_time: None,
+                    subpartition: false,
                     partitions: Vec::new(),
                     identifier_func: Some(Box::new(func_expr)),
                     changes: None,
@@ -15669,12 +16127,24 @@ impl Parser {
                                 // Peek ahead to see if next identifier is a Snowflake option keyword
                                 if self.current + 1 < self.tokens.len() {
                                     let next = &self.tokens[self.current + 1];
-                                    if next.text.eq_ignore_ascii_case("FILE_FORMAT")
-                                        || next.text.eq_ignore_ascii_case("PARTITION_TYPE")
-                                        || next.text.eq_ignore_ascii_case("AUTO_REFRESH")
-                                        || next.text.eq_ignore_ascii_case("LOCATION")
-                                        || next.text.eq_ignore_ascii_case("PARTITION")
-                                        || next.text.eq_ignore_ascii_case("WAREHOUSE")
+                                    if next
+                                        .text(self.source.as_deref().unwrap_or_default())
+                                        .eq_ignore_ascii_case("FILE_FORMAT")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("PARTITION_TYPE")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("AUTO_REFRESH")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("LOCATION")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("PARTITION")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("WAREHOUSE")
                                     {
                                         // Consume the trailing slash before the keyword
                                         self.skip();
@@ -15700,12 +16170,24 @@ impl Parser {
                                 // Peek ahead to see if next identifier is a Snowflake option keyword
                                 if self.current + 1 < self.tokens.len() {
                                     let next = &self.tokens[self.current + 1];
-                                    if next.text.eq_ignore_ascii_case("FILE_FORMAT")
-                                        || next.text.eq_ignore_ascii_case("PARTITION_TYPE")
-                                        || next.text.eq_ignore_ascii_case("AUTO_REFRESH")
-                                        || next.text.eq_ignore_ascii_case("LOCATION")
-                                        || next.text.eq_ignore_ascii_case("PARTITION")
-                                        || next.text.eq_ignore_ascii_case("WAREHOUSE")
+                                    if next
+                                        .text(self.source.as_deref().unwrap_or_default())
+                                        .eq_ignore_ascii_case("FILE_FORMAT")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("PARTITION_TYPE")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("AUTO_REFRESH")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("LOCATION")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("PARTITION")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("WAREHOUSE")
                                     {
                                         // Consume the trailing slash before the keyword
                                         self.skip();
@@ -15764,11 +16246,12 @@ impl Parser {
         }
 
         // Parse MySQL table options: ENGINE=val, AUTO_INCREMENT=val, DEFAULT CHARSET=val, etc.
-        let (mysql_table_options, tidb_table_options) = if is_clickhouse {
-            (Vec::new(), Vec::new())
-        } else {
-            self.parse_mysql_table_options()?
-        };
+        let (mysql_table_options, tidb_table_options) =
+            if is_clickhouse || self.config.dialect == Some(crate::dialects::DialectType::Oracle) {
+                (Vec::new(), Vec::new())
+            } else {
+                self.parse_mysql_table_options()?
+            };
 
         // Parse StarRocks ROLLUP property: ROLLUP (r1(col1, col2), r2(col1))
         let rollup = if self.match_token(TokenType::Rollup) {
@@ -16194,52 +16677,15 @@ impl Parser {
                             Some("RANGE") | Some("LIST") | Some("HASH") | Some("KEY")
                         )
                     {
-                        // Backtrack: re-parse as bare PARTITION BY with comma-separated expressions
-                        let func_name = partition_kind.unwrap();
-                        let mut raw_sql = format!("PARTITION BY {}", func_name);
-                        // Helper closure for consuming parenthesized content with proper spacing
-                        fn consume_parens(parser: &mut Parser, raw_sql: &mut String) {
-                            if !parser.check(TokenType::LParen) {
-                                return;
-                            }
-                            parser.skip(); // consume (
-                            raw_sql.push('(');
-                            let mut depth = 1;
-                            let mut last_type: Option<TokenType> = None;
-                            while !parser.is_at_end() && depth > 0 {
-                                let Ok(tok) = parser.advance() else { break };
-                                if tok.token_type == TokenType::LParen {
-                                    depth += 1;
-                                } else if tok.token_type == TokenType::RParen {
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        break;
-                                    }
-                                }
-                                // Add space after commas
-                                if matches!(last_type, Some(TokenType::Comma)) {
-                                    raw_sql.push(' ');
-                                }
-                                if tok.token_type == TokenType::String {
-                                    raw_sql.push('\'');
-                                    raw_sql.push_str(&tok.text);
-                                    raw_sql.push('\'');
-                                } else {
-                                    raw_sql.push_str(&tok.text);
-                                }
-                                last_type = Some(tok.token_type.clone());
-                            }
-                            raw_sql.push(')');
-                        }
-                        consume_parens(self, &mut raw_sql);
-                        // Consume more comma-separated expressions
-                        while self.match_token(TokenType::Comma) {
-                            raw_sql.push_str(", ");
-                            let tok = self.advance()?;
-                            raw_sql.push_str(&tok.text);
-                            consume_parens(self, &mut raw_sql);
-                        }
-                        table_properties.push(Expression::Raw(Raw { sql: raw_sql }));
+                        // Parse expressions so nested intervals and identifiers keep their structure.
+                        self.current -= 1;
+                        let expressions = self.parse_expression_list()?;
+                        table_properties.push(Expression::PartitionByProperty(Box::new(
+                            PartitionByProperty {
+                                specification: None,
+                                expressions,
+                            },
+                        )));
                     } else
                     // For Doris/StarRocks/MySQL RANGE/LIST, use structured parsing
                     if (is_doris_starrocks
@@ -16458,12 +16904,24 @@ impl Parser {
                             while self.check(TokenType::Slash) {
                                 if self.current + 1 < self.tokens.len() {
                                     let next = &self.tokens[self.current + 1];
-                                    if next.text.eq_ignore_ascii_case("FILE_FORMAT")
-                                        || next.text.eq_ignore_ascii_case("PARTITION_TYPE")
-                                        || next.text.eq_ignore_ascii_case("AUTO_REFRESH")
-                                        || next.text.eq_ignore_ascii_case("LOCATION")
-                                        || next.text.eq_ignore_ascii_case("PARTITION")
-                                        || next.text.eq_ignore_ascii_case("WAREHOUSE")
+                                    if next
+                                        .text(self.source.as_deref().unwrap_or_default())
+                                        .eq_ignore_ascii_case("FILE_FORMAT")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("PARTITION_TYPE")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("AUTO_REFRESH")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("LOCATION")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("PARTITION")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("WAREHOUSE")
                                     {
                                         self.skip();
                                         path.push('/');
@@ -16484,12 +16942,24 @@ impl Parser {
                             while self.check(TokenType::Slash) {
                                 if self.current + 1 < self.tokens.len() {
                                     let next = &self.tokens[self.current + 1];
-                                    if next.text.eq_ignore_ascii_case("FILE_FORMAT")
-                                        || next.text.eq_ignore_ascii_case("PARTITION_TYPE")
-                                        || next.text.eq_ignore_ascii_case("AUTO_REFRESH")
-                                        || next.text.eq_ignore_ascii_case("LOCATION")
-                                        || next.text.eq_ignore_ascii_case("PARTITION")
-                                        || next.text.eq_ignore_ascii_case("WAREHOUSE")
+                                    if next
+                                        .text(self.source.as_deref().unwrap_or_default())
+                                        .eq_ignore_ascii_case("FILE_FORMAT")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("PARTITION_TYPE")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("AUTO_REFRESH")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("LOCATION")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("PARTITION")
+                                        || next
+                                            .text(self.source.as_deref().unwrap_or_default())
+                                            .eq_ignore_ascii_case("WAREHOUSE")
                                     {
                                         self.skip();
                                         path.push('/');
@@ -17131,7 +17601,7 @@ impl Parser {
                         }
                     }
                     let token = self.peek();
-                    let text = &token.text;
+                    let text = token.text(self.source.as_deref().unwrap_or_default());
                     let token_type = token.token_type;
 
                     // Determine if we need a space before this token
@@ -17256,7 +17726,9 @@ impl Parser {
                 let index_type = if self.match_token(TokenType::Type) {
                     // Parse function or identifier for type (e.g., bloom_filter(0.001), set(100), minmax)
                     // Handle keywords like 'set' that are tokenized as TokenType::Set
-                    if let Some(func) = self.parse_function()? {
+                    if self.check_identifier("TRIM") && self.check_next(TokenType::LParen) {
+                        Some(Box::new(self.parse_primary()?))
+                    } else if let Some(func) = self.parse_function()? {
                         Some(Box::new(func))
                     } else if !self.check(TokenType::Identifier)
                         && !self.check(TokenType::Var)
@@ -17395,11 +17867,21 @@ impl Parser {
                     constraints.push(TableConstraint::Projection { name, expression });
                 } else if self.match_token(TokenType::Index) {
                     // PROJECTION name INDEX expr TYPE type_name
-                    let expr = self.parse_bitwise()?.ok_or_else(|| {
+                    let mut exprs = vec![self.parse_bitwise()?.ok_or_else(|| {
                         self.parse_error(
                             "Expected expression in ClickHouse PROJECTION INDEX definition",
                         )
-                    })?;
+                    })?];
+                    while self.match_token(TokenType::Comma) {
+                        exprs.push(self.parse_bitwise()?.ok_or_else(|| {
+                            self.parse_error("Expected projection index expression")
+                        })?);
+                    }
+                    let expr = exprs
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let type_str = if self.match_token(TokenType::Type) {
                         if !self.is_at_end()
                             && !self.check(TokenType::Comma)
@@ -17520,6 +18002,17 @@ impl Parser {
         } else {
             self.expect_identifier_or_safe_keyword_with_quoted()?
         };
+        let mut name_path = Vec::new();
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::Spark | crate::dialects::DialectType::Databricks)
+        ) && self.check(TokenType::Dot)
+        {
+            name_path.push(name.clone());
+            while self.match_token(TokenType::Dot) {
+                name_path.push(self.expect_identifier_or_keyword_with_quoted()?);
+            }
+        }
         // ClickHouse: Nested column names like n.b for Nested() columns
         if matches!(
             self.config.dialect,
@@ -17539,6 +18032,14 @@ impl Parser {
             }
         }
 
+        self.parse_column_def_tail(name, name_path)
+    }
+
+    fn parse_column_def_tail(
+        &mut self,
+        name: Identifier,
+        name_path: Vec<Identifier>,
+    ) -> Result<ColumnDef> {
         // TSQL computed columns have no data type: column_name AS (expression) [PERSISTED]
         // Check if AS follows immediately (no data type)
         if self.check(TokenType::As) {
@@ -17581,6 +18082,7 @@ impl Parser {
         let mut col_def = ColumnDef::new(name.name.clone(), data_type);
         col_def.name = name;
         col_def.no_type = no_type;
+        col_def.name_path = name_path;
 
         // Parse MySQL type modifiers (UNSIGNED, ZEROFILL)
         // These come after the data type but before other constraints
@@ -17612,13 +18114,55 @@ impl Parser {
                 continue;
             }
 
+            if matches!(
+                self.config.dialect,
+                Some(
+                    crate::dialects::DialectType::Spark | crate::dialects::DialectType::Databricks
+                )
+            ) {
+                if self.match_token(TokenType::First) {
+                    col_def.position = Some(ColumnPosition::First);
+                    continue;
+                }
+                if self.match_token(TokenType::After) {
+                    col_def.position = Some(ColumnPosition::After(
+                        self.expect_identifier_or_keyword_with_quoted()?,
+                    ));
+                    continue;
+                }
+            }
+            if self.config.dialect == Some(crate::dialects::DialectType::StarRocks)
+                && self.match_token(TokenType::To)
+            {
+                col_def.rollup = Some(self.expect_identifier_or_keyword_with_quoted()?);
+                continue;
+            }
+            if matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::StarRocks | crate::dialects::DialectType::Doris)
+            ) && self.match_texts(&[
+                "SUM",
+                "MIN",
+                "MAX",
+                "REPLACE",
+                "REPLACE_IF_NOT_NULL",
+                "HLL_UNION",
+                "BITMAP_UNION",
+                "PERCENTILE_UNION",
+            ]) {
+                col_def.aggregation = Some(self.previous_text().to_ascii_uppercase());
+                continue;
+            }
             if self.match_keywords(&[TokenType::Not, TokenType::Null]) {
                 col_def.nullable = Some(false);
                 col_def.constraint_order.push(ConstraintType::NotNull);
             } else if self.match_token(TokenType::Null) {
                 col_def.nullable = Some(true);
                 col_def.constraint_order.push(ConstraintType::Null);
-            } else if self.match_keywords(&[TokenType::PrimaryKey, TokenType::Key]) {
+            } else if self.match_keywords(&[TokenType::PrimaryKey, TokenType::Key])
+                || (self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+                    && self.match_token(TokenType::Key))
+            {
                 // Handle PRIMARY KEY [ASC|DESC]
                 col_def.primary_key = true;
                 // Capture ASC/DESC after PRIMARY KEY
@@ -17630,22 +18174,29 @@ impl Parser {
                 col_def.constraint_order.push(ConstraintType::PrimaryKey);
             } else if self.match_token(TokenType::Constraint) {
                 // Inline CONSTRAINT name ... (e.g., CONSTRAINT fk_name REFERENCES ...)
-                let constraint_name = self.expect_identifier()?;
+                let constraint_name = if self.config.dialect
+                    == Some(crate::dialects::DialectType::MySQL)
+                    && self.check(TokenType::Check)
+                {
+                    None
+                } else {
+                    Some(self.expect_identifier()?)
+                };
                 // After constraint name, expect REFERENCES, PRIMARY KEY, UNIQUE, CHECK, NOT NULL, NULL, etc.
                 if self.match_token(TokenType::References) {
                     let mut fk_ref = self.parse_foreign_key_ref()?;
-                    fk_ref.constraint_name = Some(constraint_name);
+                    fk_ref.constraint_name = constraint_name;
                     col_def
                         .constraints
                         .push(ColumnConstraint::References(fk_ref));
                     col_def.constraint_order.push(ConstraintType::References);
                 } else if self.match_keywords(&[TokenType::PrimaryKey, TokenType::Key]) {
                     col_def.primary_key = true;
-                    col_def.primary_key_constraint_name = Some(constraint_name);
+                    col_def.primary_key_constraint_name = constraint_name;
                     col_def.constraint_order.push(ConstraintType::PrimaryKey);
                 } else if self.match_token(TokenType::Unique) {
                     col_def.unique = true;
-                    col_def.unique_constraint_name = Some(constraint_name);
+                    col_def.unique_constraint_name = constraint_name;
                     // Check for NULLS NOT DISTINCT (PostgreSQL 15+ feature)
                     if self.match_text_seq(&["NULLS", "NOT", "DISTINCT"]) {
                         col_def.unique_nulls_not_distinct = true;
@@ -17653,10 +18204,10 @@ impl Parser {
                     col_def.constraint_order.push(ConstraintType::Unique);
                 } else if self.match_keywords(&[TokenType::Not, TokenType::Null]) {
                     col_def.nullable = Some(false);
-                    col_def.not_null_constraint_name = Some(constraint_name);
+                    col_def.not_null_constraint_name = constraint_name;
                     col_def.constraint_order.push(ConstraintType::NotNull);
                 } else if self.match_token(TokenType::Check) {
-                    col_def.check_constraint_name = Some(constraint_name);
+                    col_def.check_constraint_name = constraint_name;
                     // Parse CHECK constraint expression
                     if self.match_token(TokenType::LParen) {
                         let check_expr = self.parse_expression()?;
@@ -17849,6 +18400,30 @@ impl Parser {
                 self.match_token(TokenType::Set);
                 let charset = self.expect_identifier_or_keyword()?;
                 col_def.character_set = Some(charset);
+            } else if self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+                && self.match_identifier("BINARY")
+            {
+                col_def.binary = true;
+                col_def.binary_before_charset = col_def.character_set.is_none()
+                    && !matches!(col_def.data_type, DataType::CharacterSet { .. });
+            } else if self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+                && self.match_texts(&["ASCII", "UNICODE"])
+            {
+                col_def.character_set = Some(
+                    if self.previous_text().eq_ignore_ascii_case("ASCII") {
+                        "latin1"
+                    } else {
+                        "ucs2"
+                    }
+                    .into(),
+                );
+            } else if self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+                && self.match_texts(&["ENGINE_ATTRIBUTE", "SECONDARY_ENGINE_ATTRIBUTE"])
+            {
+                let name = self.previous_text().to_ascii_uppercase();
+                self.match_token(TokenType::Eq);
+                let value = self.parse_primary()?;
+                col_def.engine_attributes.push((name, value));
             } else if self.match_identifier("UPPERCASE") {
                 // Teradata: UPPERCASE
                 col_def.uppercase = true;
@@ -18481,7 +19056,10 @@ impl Parser {
             {
                 let tok = self.peek();
                 // Check for AUTO keyword (SingleStore: PERSISTED AUTO)
-                if tok.text.eq_ignore_ascii_case("AUTO") {
+                if tok
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("AUTO")
+                {
                     self.skip(); // consume AUTO
                     None // AUTO is not a data type, just a modifier
                 } else if tok.token_type.is_keyword()
@@ -18556,11 +19134,18 @@ impl Parser {
     fn parse_mysql_table_options(
         &mut self,
     ) -> Result<(Vec<(String, String)>, Vec<TiDBTableOption>)> {
-        let mut options = Vec::new();
+        let mut options: Vec<(String, String)> = Vec::new();
         let mut tidb_options = Vec::new();
         loop {
             // Skip optional commas between options
-            self.match_token(TokenType::Comma);
+            if self.match_token(TokenType::Comma) {
+                if let Some((_, value)) = options.last_mut() {
+                    for comment in self.previous_trailing_comments() {
+                        value.push(' ');
+                        value.push_str(comment.trim());
+                    }
+                }
+            }
 
             if matches!(
                 self.config.dialect,
@@ -18831,9 +19416,21 @@ impl Parser {
     /// Parse Hive-specific table properties that appear after column definitions.
     /// Handles: ROW FORMAT (SERDE/DELIMITED), STORED AS/BY, LOCATION, TBLPROPERTIES
     fn parse_hive_table_properties(&mut self) -> Result<Vec<Expression>> {
-        let mut properties = Vec::new();
+        let mut properties = self.parse_oracle_table_properties()?;
 
         loop {
+            if self.config.dialect == Some(crate::dialects::DialectType::Snowflake)
+                && (self.check_text_seq(&["COPY", "TAGS"])
+                    || self.check_text_seq(&["COPY", "GRANTS"]))
+            {
+                self.skip();
+                let flag = self.advance_text()?.to_ascii_uppercase();
+                properties.push(Expression::Var(Box::new(Var {
+                    this: format!("COPY {flag}"),
+                })));
+                continue;
+            }
+
             // ROW FORMAT SERDE 'class' [WITH SERDEPROPERTIES (...)]
             // ROW FORMAT DELIMITED [FIELDS TERMINATED BY ...] [...]
             if self.check(TokenType::Row) && self.check_next(TokenType::Format) {
@@ -19229,6 +19826,13 @@ impl Parser {
                 )));
             }
 
+            if self.match_text_seq(&["AGGREGATE", "KEY"]) {
+                let expressions = self.parse_composite_key_expressions()?;
+                properties.push(Expression::AggregateKeyProperty(Box::new(
+                    UniqueKeyProperty { expressions },
+                )));
+            }
+
             // DISTRIBUTED BY HASH (col1, col2) [BUCKETS n] - comes after UNIQUE KEY / DUPLICATE KEY
             if self.match_identifier("DISTRIBUTED") {
                 if let Some(dist_prop) = self.parse_distributed_property()? {
@@ -19338,11 +19942,9 @@ impl Parser {
         self.expect(TokenType::LParen)?;
         let mut expressions = Vec::new();
         loop {
-            if let Some(id) = self.parse_id_var()? {
-                expressions.push(id);
-            } else {
-                break;
-            }
+            expressions.push(Expression::Identifier(
+                self.expect_identifier_or_keyword_with_quoted()?,
+            ));
             if !self.match_token(TokenType::Comma) {
                 break;
             }
@@ -19356,7 +19958,19 @@ impl Parser {
         // Optional constraint name
         let name = if self.match_token(TokenType::Constraint) {
             // Use safe keyword version to accept keywords as constraint names (e.g., CONSTRAINT identity CHECK ...)
-            Some(self.expect_identifier_or_safe_keyword_with_quoted()?)
+            if self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+                && matches!(
+                    self.peek().token_type,
+                    TokenType::PrimaryKey
+                        | TokenType::ForeignKey
+                        | TokenType::Unique
+                        | TokenType::Check
+                )
+            {
+                None
+            } else {
+                Some(self.expect_identifier_or_safe_keyword_with_quoted()?)
+            }
         } else {
             None
         };
@@ -19412,6 +20026,7 @@ impl Parser {
             } else {
                 name.clone()
             };
+            let mut key_parts = Vec::new();
             // ClickHouse: PRIMARY KEY col without parens — parse single column
             let (columns, timeseries_columns) = if matches!(
                 self.config.dialect,
@@ -19459,11 +20074,29 @@ impl Parser {
                     }
                     cols
                 } else {
-                    self.parse_index_identifier_list()?
+                    let (columns, parts) = self.parse_constraint_index_columns()?;
+                    key_parts = parts;
+                    columns
                 };
                 self.expect(TokenType::RParen)?;
                 (cols, timeseries_columns)
             };
+            // Special dialect paths above also produce literal identifiers.
+            // Mark quoted keys explicitly so legacy suffix decoding cannot
+            // reinterpret their names (including Databricks TIMESERIES keys).
+            if key_parts.is_empty() && columns.iter().any(|column| column.quoted) {
+                key_parts = columns
+                    .iter()
+                    .map(|column| IndexKeyPart {
+                        expression: Box::new(Expression::Identifier(column.clone())),
+                        prefix_length: None,
+                        desc: false,
+                        asc: false,
+                        nulls_first: None,
+                        opclass: None,
+                    })
+                    .collect();
+            }
             // Parse optional INCLUDE (columns)
             let include_columns = if self.match_identifier("INCLUDE") {
                 self.expect(TokenType::LParen)?;
@@ -19480,6 +20113,7 @@ impl Parser {
             Ok(TableConstraint::PrimaryKey {
                 name: actual_name.or(name),
                 columns,
+                key_parts,
                 timeseries_columns,
                 include_columns,
                 modifiers,
@@ -19514,7 +20148,7 @@ impl Parser {
                 && !self.check_next(TokenType::Comma)
             {
                 // Name might be here: UNIQUE KEY idx_name (cols)
-                if self.check_next(TokenType::LParen) {
+                if self.check_next(TokenType::LParen) || self.check_next(TokenType::Using) {
                     Some(self.expect_identifier_with_quoted()?)
                 } else {
                     None
@@ -19523,6 +20157,11 @@ impl Parser {
                 name.clone()
             };
 
+            let early_using = if self.match_token(TokenType::Using) {
+                Some(self.expect_identifier_or_keyword()?.to_ascii_uppercase())
+            } else {
+                None
+            };
             if self.match_token(TokenType::LParen) {
                 let (columns, key_parts) = if use_key_keyword
                     && matches!(
@@ -19532,11 +20171,14 @@ impl Parser {
                     let parts = self.parse_mysql_index_key_parts()?;
                     Self::split_mysql_table_index_key_parts(parts)
                 } else {
-                    (self.parse_index_identifier_list()?, Vec::new())
+                    self.parse_constraint_index_columns()?
                 };
                 self.expect(TokenType::RParen)?;
                 let mut modifiers = self.parse_constraint_modifiers();
                 modifiers.clustered = clustered;
+                if early_using.is_some() {
+                    modifiers.using = early_using;
+                }
                 if use_key_keyword {
                     // UNIQUE KEY/INDEX - use Index constraint type with UNIQUE kind
                     Ok(TableConstraint::Index {
@@ -19555,6 +20197,7 @@ impl Parser {
                     Ok(TableConstraint::Unique {
                         name: actual_name.or(name),
                         columns,
+                        key_parts,
                         columns_parenthesized: true,
                         modifiers,
                         has_constraint_keyword,
@@ -19570,6 +20213,7 @@ impl Parser {
                 Ok(TableConstraint::Unique {
                     name: actual_name.or(name),
                     columns: vec![Identifier::new(col_name)],
+                    key_parts: Vec::new(),
                     columns_parenthesized: false,
                     modifiers,
                     has_constraint_keyword,
@@ -19578,6 +20222,13 @@ impl Parser {
             }
         } else if self.match_keywords(&[TokenType::ForeignKey, TokenType::Key]) {
             // FOREIGN KEY (col1) [REFERENCES other_table(col2)] [ON DELETE ...] [ON UPDATE ...]
+            let index_name = if self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+                && !self.check(TokenType::LParen)
+            {
+                Some(self.expect_identifier_or_keyword_with_quoted()?)
+            } else {
+                None
+            };
             self.expect(TokenType::LParen)?;
             let columns = self.parse_identifier_list()?;
             self.expect(TokenType::RParen)?;
@@ -19586,6 +20237,7 @@ impl Parser {
                 let modifiers = self.parse_constraint_modifiers();
                 Ok(TableConstraint::ForeignKey {
                     name,
+                    index_name,
                     columns,
                     references: Some(references),
                     on_delete: None,
@@ -19615,6 +20267,7 @@ impl Parser {
                 let modifiers = self.parse_constraint_modifiers();
                 Ok(TableConstraint::ForeignKey {
                     name,
+                    index_name,
                     columns,
                     references: None,
                     on_delete,
@@ -19944,6 +20597,16 @@ impl Parser {
                 // MySQL index COMMENT 'text'
                 if self.check(TokenType::String) {
                     modifiers.comment = self.advance_text().ok();
+                }
+            } else if self.check_identifier("KEY_BLOCK_SIZE") {
+                let saved = self.current;
+                self.skip();
+                self.match_token(TokenType::Eq);
+                if self.check(TokenType::Number) {
+                    modifiers.key_block_size = self.advance_text().ok();
+                } else {
+                    self.current = saved;
+                    break;
                 }
             } else if self.match_identifier("VISIBLE") {
                 modifiers.visible = Some(true);
@@ -20308,7 +20971,7 @@ impl Parser {
                 && self.check_identifier("SQL")
                 && self.current + 1 < self.tokens.len()
                 && self.tokens[self.current + 1]
-                    .text
+                    .text(self.source.as_deref().unwrap_or_default())
                     .eq_ignore_ascii_case("SECURITY")
             {
                 self.skip(); // consume SQL
@@ -20355,6 +21018,24 @@ impl Parser {
             Vec::new()
         };
 
+        let with_options = if self.match_token(TokenType::With) {
+            if self.check(TokenType::LParen) {
+                self.parse_options_list()?
+            } else {
+                let mut attrs = vec![Expression::Identifier(
+                    self.expect_identifier_or_keyword_with_quoted()?,
+                )];
+                while self.match_token(TokenType::Comma) {
+                    attrs.push(Expression::Identifier(
+                        self.expect_identifier_or_keyword_with_quoted()?,
+                    ));
+                }
+                attrs
+            }
+        } else {
+            Vec::new()
+        };
+
         // Doris: BUILD IMMEDIATE/DEFERRED for materialized views
         let build = if self.match_identifier("BUILD") {
             if self.match_identifier("IMMEDIATE") {
@@ -20377,20 +21058,14 @@ impl Parser {
                 self.config.dialect,
                 Some(crate::dialects::DialectType::ClickHouse)
             ) {
-                // ClickHouse REFRESH syntax: consume tokens until AS/POPULATE/TO/ENGINE or end
-                while !self.is_at_end()
-                    && !self.check(TokenType::As)
-                    && !self.check_identifier("POPULATE")
-                    && !self.check_identifier("TO")
-                    && !self.check_identifier("APPEND")
-                    && !self.check_identifier("ENGINE")
-                    && !self.check(TokenType::Semicolon)
-                {
-                    self.skip();
-                }
-                // Consume APPEND if present (REFRESH ... APPEND TO target)
-                let _ = self.match_identifier("APPEND");
-                None
+                Some(Box::new(RefreshTriggerProperty {
+                    clickhouse: Some(self.parse_clickhouse_refresh()?),
+                    method: String::new(),
+                    kind: None,
+                    every: None,
+                    unit: None,
+                    starts: None,
+                }))
             } else {
                 Some(Box::new(self.parse_refresh_trigger_property()?))
             }
@@ -20501,6 +21176,8 @@ impl Parser {
                 row_access_policy,
                 tags,
                 options,
+                with_options,
+                check_option: None,
                 build,
                 refresh,
                 schema: schema.map(Box::new),
@@ -20542,6 +21219,8 @@ impl Parser {
         let query_parenthesized = self.check(TokenType::LParen);
         let query = if self.check(TokenType::With) {
             self.parse_statement()?
+        } else if self.check(TokenType::From) {
+            self.parse_from_first_query()?
         } else if query_parenthesized {
             // Handle (SELECT ...) or (WITH ... SELECT ...) - parenthesized query
             self.skip(); // consume (
@@ -20558,6 +21237,21 @@ impl Parser {
 
         // Redshift: WITH NO SCHEMA BINDING (after the query)
         let no_schema_binding = self.match_text_seq(&["WITH", "NO", "SCHEMA", "BINDING"]);
+
+        let check_option = if self.match_token(TokenType::With) {
+            let mode = if self.match_texts(&["CASCADED", "LOCAL"]) {
+                self.previous_text().to_ascii_uppercase()
+            } else {
+                String::new()
+            };
+            self.expect(TokenType::Check)?;
+            if !self.match_keyword("OPTION") {
+                return Err(self.parse_error("Expected OPTION after WITH CHECK"));
+            }
+            Some(mode)
+        } else {
+            None
+        };
 
         Ok(Expression::CreateView(Box::new(CreateView {
             name,
@@ -20582,6 +21276,8 @@ impl Parser {
             row_access_policy,
             tags,
             options,
+            with_options,
+            check_option,
             build,
             refresh,
             schema: schema.map(Box::new),
@@ -20648,7 +21344,8 @@ impl Parser {
         self.expect(TokenType::Index)?;
 
         // PostgreSQL: CREATE INDEX CONCURRENTLY idx ON t(c)
-        let concurrently = self.match_identifier("CONCURRENTLY");
+        let concurrently = self.config.dialect != Some(crate::dialects::DialectType::MySQL)
+            && self.match_identifier("CONCURRENTLY");
 
         // Handle IF NOT EXISTS
         let if_not_exists =
@@ -20962,18 +21659,27 @@ impl Parser {
         let leading_comments = self.current_leading_comments().to_vec();
         self.expect(TokenType::Drop)?;
 
-        // ClickHouse: DROP TEMPORARY TABLE / DROP TEMPORARY VIEW
+        // TEMPORARY limits the drop to temporary tables and must be preserved.
         if self.check(TokenType::Temporary)
             && matches!(
                 self.config.dialect,
-                Some(crate::dialects::DialectType::ClickHouse)
+                Some(
+                    crate::dialects::DialectType::ClickHouse
+                        | crate::dialects::DialectType::MySQL
+                        | crate::dialects::DialectType::StarRocks
+                )
             )
         {
             self.skip(); // consume TEMPORARY
             if self.check(TokenType::View) {
                 return self.parse_drop_view(false);
             }
-            return self.parse_drop_table_with_iceberg(leading_comments.clone(), false);
+            let mut statement =
+                self.parse_drop_table_with_iceberg(leading_comments.clone(), false)?;
+            if let Expression::DropTable(table) = &mut statement {
+                table.temporary = true;
+            }
+            return Ok(statement);
         }
 
         // Snowflake: DROP ICEBERG TABLE
@@ -21046,6 +21752,8 @@ impl Parser {
                     if matches!(
                         text_upper.as_str(),
                         "DICTIONARY"
+                            | "HANDLER"
+                            | "HYPOTHETICAL"
                             | "USER"
                             | "QUOTA"
                             | "ROLE"
@@ -21103,7 +21811,7 @@ impl Parser {
                     ) || (text_upper == "FILE"
                         && self.current + 1 < self.tokens.len()
                         && self.tokens[self.current + 1]
-                            .text
+                            .text(self.source.as_deref().unwrap_or_default())
                             .eq_ignore_ascii_case("FORMAT"));
                     if is_snowflake_drop {
                         self.skip(); // consume the object type keyword
@@ -21163,7 +21871,7 @@ impl Parser {
             if self.check(TokenType::If)
                 && self.current + 1 < self.tokens.len()
                 && self.tokens[self.current + 1]
-                    .text
+                    .text(self.source.as_deref().unwrap_or_default())
                     .eq_ignore_ascii_case("EMPTY")
             {
                 self.skip(); // consume IF
@@ -21218,7 +21926,13 @@ impl Parser {
             false
         };
 
+        let force = matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::Doris | crate::dialects::DialectType::StarRocks)
+        ) && self.match_identifier("FORCE");
         Ok(Expression::DropTable(Box::new(DropTable {
+            temporary: false,
+            force,
             names,
             if_exists,
             cascade,
@@ -21239,6 +21953,19 @@ impl Parser {
         let if_exists = self.match_keywords(&[TokenType::If, TokenType::Exists]);
         let name = self.parse_table_ref()?;
 
+        let mut additional_names = Vec::new();
+        while self.match_token(TokenType::Comma) {
+            additional_names.push(self.parse_table_ref()?);
+        }
+        // SQL Server drops views in the current database. Never silently strip a catalog.
+        if self.config.dialect == Some(crate::dialects::DialectType::TSQL)
+            && std::iter::once(&name)
+                .chain(additional_names.iter())
+                .any(|t| t.catalog.is_some())
+        {
+            return Err(self.parse_error("DROP VIEW accepts schema.view, not a database qualifier"));
+        }
+
         // ClickHouse: ON CLUSTER clause
         if matches!(
             self.config.dialect,
@@ -21249,6 +21976,7 @@ impl Parser {
         }
 
         Ok(Expression::DropView(Box::new(DropView {
+            additional_names,
             name,
             if_exists,
             materialized,
@@ -21260,7 +21988,8 @@ impl Parser {
         self.expect(TokenType::Index)?;
 
         // PostgreSQL CONCURRENTLY modifier
-        let concurrently = self.match_identifier("CONCURRENTLY");
+        let concurrently = self.config.dialect != Some(crate::dialects::DialectType::MySQL)
+            && self.match_identifier("CONCURRENTLY");
 
         let if_exists = self.match_keywords(&[TokenType::If, TokenType::Exists]);
 
@@ -21320,7 +22049,9 @@ impl Parser {
                 let on_cluster = self.parse_on_cluster_clause()?;
 
                 // Hive: PARTITION(key=value, ...) clause before actions
-                let partition = if self.match_token(TokenType::Partition) {
+                let partition = if self.check_next(TokenType::LParen)
+                    && self.match_token(TokenType::Partition)
+                {
                     self.expect(TokenType::LParen)?;
                     let mut parts = Vec::new();
                     loop {
@@ -21709,6 +22440,87 @@ impl Parser {
             }
         }
 
+        if self.config.dialect == Some(crate::dialects::DialectType::StarRocks)
+            && (self.match_token(TokenType::PartitionBy)
+                || self.match_keywords(&[TokenType::Partition, TokenType::By]))
+        {
+            let expressions = self.parse_expression_list()?;
+            let partition = Expression::PartitionByProperty(Box::new(PartitionByProperty {
+                specification: None,
+                expressions,
+            }));
+            let distribution = if self.match_identifier("DISTRIBUTED") {
+                self.parse_distributed_property()?
+            } else {
+                None
+            };
+            return Ok(AlterTableAction::PartitionBy {
+                partition,
+                distribution,
+            });
+        }
+
+        if self.config.dialect == Some(crate::dialects::DialectType::MySQL) {
+            if self.match_identifier("FORCE") {
+                return Ok(AlterTableAction::Force);
+            }
+            let option_names = [
+                "ENGINE",
+                "COMMENT",
+                "ROW_FORMAT",
+                "KEY_BLOCK_SIZE",
+                "AUTO_INCREMENT",
+                "AVG_ROW_LENGTH",
+                "MAX_ROWS",
+                "MIN_ROWS",
+                "PACK_KEYS",
+                "CHECKSUM",
+                "COMPRESSION",
+                "ENCRYPTION",
+                "STATS_AUTO_RECALC",
+                "STATS_PERSISTENT",
+                "STATS_SAMPLE_PAGES",
+            ];
+            let mut options = Vec::new();
+            while !self.is_at_end()
+                && option_names
+                    .iter()
+                    .any(|name| self.peek_text().eq_ignore_ascii_case(name))
+            {
+                let name = self.advance_text()?.to_ascii_uppercase();
+                self.match_token(TokenType::Eq);
+                options.push((name, self.parse_primary()?));
+                if self.check(TokenType::Comma)
+                    && self.peek_nth(1).is_some_and(|token| {
+                        option_names.iter().any(|name| {
+                            token
+                                .text(self.source.as_deref().unwrap_or_default())
+                                .eq_ignore_ascii_case(name)
+                        })
+                    })
+                {
+                    self.skip();
+                }
+            }
+            if !options.is_empty() {
+                let partition_by = if self.match_token(TokenType::PartitionBy)
+                    || self.match_keywords(&[TokenType::Partition, TokenType::By])
+                {
+                    let kind = self.expect_identifier_or_keyword()?.to_ascii_uppercase();
+                    if !matches!(kind.as_str(), "RANGE" | "LIST") {
+                        return Err(self.parse_error("Expected RANGE or LIST partitioning"));
+                    }
+                    Some(self.parse_doris_partition_by_range_or_list(&kind)?)
+                } else {
+                    None
+                };
+                return Ok(AlterTableAction::TableOptions {
+                    options,
+                    partition_by,
+                });
+            }
+        }
+
         if self.match_token(TokenType::Add) {
             // ClickHouse: ADD INDEX idx expr TYPE minmax GRANULARITY 1
             // ClickHouse: ADD PROJECTION name (SELECT ...)
@@ -21737,13 +22549,7 @@ impl Parser {
                     if token.token_type == TokenType::RParen {
                         paren_depth -= 1;
                     }
-                    let text = if token.token_type == TokenType::QuotedIdentifier {
-                        format!("\"{}\"", token.text)
-                    } else if token.token_type == TokenType::String {
-                        format!("'{}'", token.text)
-                    } else {
-                        token.text.to_string()
-                    };
+                    let text = self.raw_sql_token_text(&token);
                     tokens.push((text, token.token_type));
                 }
                 return Ok(AlterTableAction::Raw {
@@ -21752,10 +22558,10 @@ impl Parser {
             }
             // ADD SEARCH OPTIMIZATION [ON method(columns), ...] — Snowflake
             if self.check_identifier("SEARCH")
-                && self
-                    .peek_nth(1)
-                    .map(|t| t.text.eq_ignore_ascii_case("OPTIMIZATION"))
-                    == Some(true)
+                && self.peek_nth(1).map(|t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("OPTIMIZATION")
+                }) == Some(true)
             {
                 let mut tokens: Vec<(String, TokenType)> =
                     vec![("ADD".to_string(), TokenType::Add)];
@@ -21779,10 +22585,10 @@ impl Parser {
             }
             // ADD ROW ACCESS POLICY name ON (columns) — Snowflake
             if self.check(TokenType::Row)
-                && self
-                    .peek_nth(1)
-                    .map(|t| t.text.eq_ignore_ascii_case("ACCESS"))
-                    == Some(true)
+                && self.peek_nth(1).map(|t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("ACCESS")
+                }) == Some(true)
             {
                 let mut tokens: Vec<(String, TokenType)> =
                     vec![("ADD".to_string(), TokenType::Add)];
@@ -21807,9 +22613,30 @@ impl Parser {
             // ADD CONSTRAINT or ADD COLUMN or ADD INDEX
             if self.match_token(TokenType::Constraint) {
                 // ADD CONSTRAINT name ...
-                let name = Some(self.expect_identifier_with_quoted()?);
+                let conditional = self.config.dialect
+                    == Some(crate::dialects::DialectType::ClickHouse)
+                    && self.match_keywords(&[TokenType::If, TokenType::Not, TokenType::Exists]);
+                let name = if matches!(
+                    self.peek().token_type,
+                    TokenType::ForeignKey
+                        | TokenType::Unique
+                        | TokenType::PrimaryKey
+                        | TokenType::Check
+                ) {
+                    None
+                } else {
+                    Some(self.expect_identifier_with_quoted()?)
+                };
                 let constraint = self.parse_constraint_definition(name)?;
-                Ok(AlterTableAction::AddConstraint(constraint))
+                if conditional {
+                    Ok(AlterTableAction::AlterConstraint {
+                        constraint,
+                        modify: false,
+                        conditional,
+                    })
+                } else {
+                    Ok(AlterTableAction::AddConstraint(constraint))
+                }
             } else if self.check(TokenType::PrimaryKey)
                 || self.check(TokenType::ForeignKey)
                 || self.check(TokenType::Check)
@@ -21848,6 +22675,11 @@ impl Parser {
                     None
                 };
 
+                let early_using = if self.match_token(TokenType::Using) {
+                    Some(self.expect_identifier_or_keyword()?.to_ascii_uppercase())
+                } else {
+                    None
+                };
                 // Parse columns and functional key parts.
                 self.expect(TokenType::LParen)?;
                 let key_parts = self.parse_mysql_index_key_parts()?;
@@ -21855,7 +22687,10 @@ impl Parser {
                 let (columns, key_parts) = Self::split_mysql_table_index_key_parts(key_parts);
 
                 // Parse optional USING BTREE|HASH
-                let modifiers = self.parse_constraint_modifiers();
+                let mut modifiers = self.parse_constraint_modifiers();
+                if early_using.is_some() {
+                    modifiers.using = early_using;
+                }
 
                 Ok(AlterTableAction::AddConstraint(TableConstraint::Index {
                     name,
@@ -22028,13 +22863,7 @@ impl Parser {
                     if token.token_type == TokenType::RParen {
                         paren_depth -= 1;
                     }
-                    let text = if token.token_type == TokenType::QuotedIdentifier {
-                        format!("\"{}\"", token.text)
-                    } else if token.token_type == TokenType::String {
-                        format!("'{}'", token.text)
-                    } else {
-                        token.text.to_string()
-                    };
+                    let text = self.raw_sql_token_text(&token);
                     tokens.push((text, token.token_type));
                 }
                 return Ok(AlterTableAction::Raw {
@@ -22043,7 +22872,10 @@ impl Parser {
             }
             // DROP CLUSTERING KEY — Snowflake
             if self.check_identifier("CLUSTERING")
-                && self.peek_nth(1).map(|t| t.text.eq_ignore_ascii_case("KEY")) == Some(true)
+                && self.peek_nth(1).map(|t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("KEY")
+                }) == Some(true)
             {
                 self.skip(); // consume CLUSTERING
                 self.skip(); // consume KEY
@@ -22053,10 +22885,10 @@ impl Parser {
             }
             // DROP SEARCH OPTIMIZATION [ON method(columns), ...] — Snowflake
             if self.check_identifier("SEARCH")
-                && self
-                    .peek_nth(1)
-                    .map(|t| t.text.eq_ignore_ascii_case("OPTIMIZATION"))
-                    == Some(true)
+                && self.peek_nth(1).map(|t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("OPTIMIZATION")
+                }) == Some(true)
             {
                 let mut tokens: Vec<(String, TokenType)> =
                     vec![("DROP".to_string(), TokenType::Drop)];
@@ -22081,12 +22913,15 @@ impl Parser {
 
             // DROP [ALL] ROW ACCESS POLICY/POLICIES — Snowflake
             if (self.check(TokenType::Row)
-                && self
-                    .peek_nth(1)
-                    .map(|t| t.text.eq_ignore_ascii_case("ACCESS"))
-                    == Some(true))
+                && self.peek_nth(1).map(|t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("ACCESS")
+                }) == Some(true))
                 || (self.check_identifier("ALL")
-                    && self.peek_nth(1).map(|t| t.text.eq_ignore_ascii_case("ROW")) == Some(true))
+                    && self.peek_nth(1).map(|t| {
+                        t.text(self.source.as_deref().unwrap_or_default())
+                            .eq_ignore_ascii_case("ROW")
+                    }) == Some(true))
             {
                 let mut tokens: Vec<(String, TokenType)> =
                     vec![("DROP".to_string(), TokenType::Drop)];
@@ -22125,7 +22960,7 @@ impl Parser {
                 };
                 Ok(AlterTableAction::Raw { sql })
             } else if self.match_token(TokenType::Index) || self.match_token(TokenType::Key) {
-                let name = self.expect_identifier_with_quoted()?;
+                let name = self.expect_identifier_or_keyword_with_quoted()?;
                 Ok(AlterTableAction::Raw {
                     sql: format!("DROP INDEX {}", self.format_identifier_for_raw_sql(&name)),
                 })
@@ -22207,7 +23042,7 @@ impl Parser {
                 ) {
                     self.expect_identifier_or_safe_keyword_with_quoted()?
                 } else {
-                    self.expect_identifier_with_quoted()?
+                    self.expect_identifier_or_keyword_with_quoted()?
                 };
                 // ClickHouse: nested column names like n.ui8
                 if matches!(
@@ -22215,22 +23050,65 @@ impl Parser {
                     Some(crate::dialects::DialectType::ClickHouse)
                 ) && self.match_token(TokenType::Dot)
                 {
-                    let sub = self.expect_identifier_with_quoted()?;
+                    let sub = self.expect_identifier_or_keyword_with_quoted()?;
                     name.name = format!("{}.{}", name.name, sub.name);
                 }
+                if !if_exists
+                    && matches!(
+                        self.config.dialect,
+                        Some(
+                            crate::dialects::DialectType::TSQL
+                                | crate::dialects::DialectType::Fabric
+                                | crate::dialects::DialectType::Snowflake
+                        )
+                    )
+                    && self.check(TokenType::Comma)
+                {
+                    let mut names = vec![name.clone()];
+                    while self.check(TokenType::Comma)
+                        && self.peek_nth(1).is_some_and(|token| {
+                            matches!(
+                                token.token_type,
+                                TokenType::Var
+                                    | TokenType::Identifier
+                                    | TokenType::QuotedIdentifier
+                            ) && !matches!(
+                                token
+                                    .text(self.source.as_deref().unwrap_or_default())
+                                    .to_ascii_uppercase()
+                                    .as_str(),
+                                "MODIFY" | "RENAME"
+                            )
+                        })
+                    {
+                        self.skip();
+                        names.push(self.expect_identifier_or_keyword_with_quoted()?);
+                    }
+                    if names.len() > 1 {
+                        return Ok(AlterTableAction::DropColumns { names });
+                    }
+                }
                 let cascade = self.match_token(TokenType::Cascade);
+                let restrict = !cascade && self.match_token(TokenType::Restrict);
                 Ok(AlterTableAction::DropColumn {
                     name,
                     if_exists,
                     cascade,
+                    restrict,
+                })
+            } else if self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+                && self.match_token(TokenType::Check)
+            {
+                Ok(AlterTableAction::DropCheck {
+                    name: self.expect_identifier_or_keyword_with_quoted()?,
                 })
             } else if self.match_token(TokenType::Constraint) {
                 // DROP [IF EXISTS] CONSTRAINT name
-                let name = self.expect_identifier_with_quoted()?;
+                let name = self.expect_identifier_or_keyword_with_quoted()?;
                 Ok(AlterTableAction::DropConstraint { name, if_exists })
             } else if self.match_keywords(&[TokenType::ForeignKey, TokenType::Key]) {
                 // DROP FOREIGN KEY name (Oracle/MySQL)
-                let name = self.expect_identifier_with_quoted()?;
+                let name = self.expect_identifier_or_keyword_with_quoted()?;
                 Ok(AlterTableAction::DropForeignKey { name })
             } else if self.check_identifier("COLUMNS") && self.check_next(TokenType::LParen) {
                 // DROP COLUMNS (col1, col2, ...) - Spark/Databricks syntax
@@ -22238,7 +23116,7 @@ impl Parser {
                 self.expect(TokenType::LParen)?;
                 let mut names = Vec::new();
                 loop {
-                    let name = self.expect_identifier_with_quoted()?;
+                    let name = self.expect_identifier_or_keyword_with_quoted()?;
                     names.push(name);
                     if !self.match_token(TokenType::Comma) {
                         break;
@@ -22248,21 +23126,23 @@ impl Parser {
                 Ok(AlterTableAction::DropColumns { names })
             } else {
                 // DROP [IF EXISTS] name (implicit column) [CASCADE]
-                let mut name = self.expect_identifier_with_quoted()?;
+                let mut name = self.expect_identifier_or_keyword_with_quoted()?;
                 // ClickHouse: nested column names like n.ui8
                 if matches!(
                     self.config.dialect,
                     Some(crate::dialects::DialectType::ClickHouse)
                 ) && self.match_token(TokenType::Dot)
                 {
-                    let sub = self.expect_identifier_with_quoted()?;
+                    let sub = self.expect_identifier_or_keyword_with_quoted()?;
                     name.name = format!("{}.{}", name.name, sub.name);
                 }
                 let cascade = self.match_token(TokenType::Cascade);
+                let restrict = !cascade && self.match_token(TokenType::Restrict);
                 Ok(AlterTableAction::DropColumn {
                     name,
                     if_exists,
                     cascade,
+                    restrict,
                 })
             }
         } else if self.match_token(TokenType::Rename) {
@@ -22430,6 +23310,43 @@ impl Parser {
             } else {
                 // ALTER COLUMN
                 self.match_token(TokenType::Column); // optional COLUMN keyword
+                if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse) {
+                    let if_exists = self.match_keywords(&[TokenType::If, TokenType::Exists]);
+                    let mut name = self.expect_identifier_or_keyword_with_quoted()?;
+                    while self.match_token(TokenType::Dot) {
+                        let part = self.expect_identifier_or_keyword_with_quoted()?;
+                        name.name.push('.');
+                        name.name.push_str(&part.name);
+                        name.span = name
+                            .span
+                            .zip(part.span)
+                            .map(|(start, end)| start.through(end));
+                        name.trailing_comments = part.trailing_comments;
+                    }
+                    if self.match_token(TokenType::Type) || self.match_identifier("TYPE") {
+                        let column = self.parse_column_def_tail(name, Vec::new())?;
+                        let position = if self.match_token(TokenType::First) {
+                            Some(ColumnPosition::First)
+                        } else if self.match_token(TokenType::After) {
+                            Some(ColumnPosition::After(
+                                self.expect_identifier_or_keyword_with_quoted()?,
+                            ))
+                        } else {
+                            None
+                        };
+                        return Ok(AlterTableAction::ModifyColumn {
+                            column,
+                            if_exists,
+                            position,
+                        });
+                    }
+                    let action = self.parse_alter_column_action()?;
+                    return Ok(AlterTableAction::AlterColumn {
+                        name,
+                        action,
+                        use_modify_keyword: false,
+                    });
+                }
                 let name = self.expect_identifier_with_quoted()?;
                 let action = self.parse_alter_column_action()?;
                 Ok(AlterTableAction::AlterColumn {
@@ -22439,6 +23356,75 @@ impl Parser {
                 })
             }
         } else if self.match_identifier("MODIFY") {
+            if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                && self.match_token(TokenType::Constraint)
+            {
+                let conditional = self.match_keywords(&[TokenType::If, TokenType::Exists]);
+                let name = Some(self.expect_identifier_with_quoted()?);
+                let constraint = self.parse_constraint_definition(name)?;
+                return Ok(AlterTableAction::AlterConstraint {
+                    constraint,
+                    modify: true,
+                    conditional,
+                });
+            }
+            if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                && self.check(TokenType::Column)
+                && !self
+                    .peek_nth(
+                        if self
+                            .peek_nth(1)
+                            .is_some_and(|t| t.token_type == TokenType::If)
+                        {
+                            4
+                        } else {
+                            2
+                        },
+                    )
+                    .is_some_and(|t| {
+                        matches!(
+                            t.text(self.source.as_deref().unwrap_or_default())
+                                .to_ascii_uppercase()
+                                .as_str(),
+                            "REMOVE"
+                                | "RESET"
+                                | "MODIFY"
+                                | "COMMENT"
+                                | "DEFAULT"
+                                | "MATERIALIZED"
+                                | "ALIAS"
+                                | "TTL"
+                                | "CODEC"
+                                | "SETTINGS"
+                        )
+                    })
+            {
+                self.skip();
+                let if_exists = self.match_keywords(&[TokenType::If, TokenType::Exists]);
+                let column = self.parse_column_def()?;
+                let position = if self.match_token(TokenType::First) {
+                    Some(ColumnPosition::First)
+                } else if self.match_token(TokenType::After) {
+                    Some(ColumnPosition::After(
+                        self.expect_identifier_or_keyword_with_quoted()?,
+                    ))
+                } else {
+                    None
+                };
+                return Ok(AlterTableAction::ModifyColumn {
+                    column,
+                    if_exists,
+                    position,
+                });
+            }
+            if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                && self.match_identifier("TTL")
+            {
+                let ttl = self
+                    .parse_ttl()?
+                    .ok_or_else(|| self.parse_error("Expected TTL expression"))?;
+                return Ok(AlterTableAction::ModifyTtl { ttl });
+            }
             // ClickHouse: MODIFY ORDER BY, MODIFY SETTING, MODIFY TTL, MODIFY QUERY,
             // MODIFY COLUMN name type [DEFAULT|MATERIALIZED|ALIAS] [CODEC] [TTL] [COMMENT], etc.
             // These are ClickHouse-specific and have richer syntax than MySQL MODIFY COLUMN.
@@ -22464,13 +23450,7 @@ impl Parser {
                     if token.token_type == TokenType::RParen {
                         paren_depth -= 1;
                     }
-                    let text = if token.token_type == TokenType::QuotedIdentifier {
-                        format!("\"{}\"", token.text)
-                    } else if token.token_type == TokenType::String {
-                        format!("'{}'", token.text)
-                    } else {
-                        token.text.to_string()
-                    };
+                    let text = self.raw_sql_token_text(&token);
                     tokens.push((text, token.token_type));
                 }
                 return Ok(AlterTableAction::Raw {
@@ -22613,7 +23593,26 @@ impl Parser {
                     vec![("DELETE".to_string(), TokenType::Delete)];
                 let mut paren_depth = 0i32;
                 while !self.is_at_end() && !self.check(TokenType::Semicolon) {
-                    if self.check(TokenType::Comma) && paren_depth == 0 {
+                    if self.check(TokenType::Comma)
+                        && paren_depth == 0
+                        && self.peek_nth(1).is_some_and(|t| {
+                            matches!(
+                                t.text(self.source.as_deref().unwrap_or_default())
+                                    .to_ascii_uppercase()
+                                    .as_str(),
+                                "ADD"
+                                    | "DROP"
+                                    | "ALTER"
+                                    | "MODIFY"
+                                    | "DELETE"
+                                    | "UPDATE"
+                                    | "CLEAR"
+                                    | "MATERIALIZE"
+                                    | "COMMENT"
+                                    | "RENAME"
+                            )
+                        })
+                    {
                         break;
                     }
                     let token = self.advance()?;
@@ -22622,13 +23621,7 @@ impl Parser {
                     } else if token.token_type == TokenType::RParen {
                         paren_depth -= 1;
                     }
-                    let text = if token.token_type == TokenType::QuotedIdentifier {
-                        format!("\"{}\"", token.text)
-                    } else if token.token_type == TokenType::String {
-                        format!("'{}'", token.text)
-                    } else {
-                        token.text.to_string()
-                    };
+                    let text = self.raw_sql_token_text(&token);
                     tokens.push((text, token.token_type));
                 }
                 return Ok(AlterTableAction::Raw {
@@ -22808,13 +23801,7 @@ impl Parser {
                         break;
                     }
                     let token = self.advance()?;
-                    let text = if token.token_type == TokenType::QuotedIdentifier {
-                        format!("\"{}\"", token.text)
-                    } else if token.token_type == TokenType::String {
-                        format!("'{}'", token.text)
-                    } else {
-                        token.text.to_string()
-                    };
+                    let text = self.raw_sql_token_text(&token);
                     tokens.push((text, token.token_type));
                 }
                 Ok(AlterTableAction::Raw {
@@ -22912,6 +23899,27 @@ impl Parser {
                 sql: format!("AUTO_INCREMENT={}", self.tokens_to_sql(start, self.current)),
             })
         } else if self.match_token(TokenType::Replace) {
+            if matches!(
+                self.config.dialect,
+                Some(
+                    crate::dialects::DialectType::Hive
+                        | crate::dialects::DialectType::Spark
+                        | crate::dialects::DialectType::Databricks
+                )
+            ) && self.match_identifier("COLUMNS")
+            {
+                self.expect(TokenType::LParen)?;
+                let mut columns = Vec::new();
+                loop {
+                    columns.push(self.parse_column_def()?);
+                    if !self.match_token(TokenType::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenType::RParen)?;
+                let cascade = self.match_token(TokenType::Cascade);
+                return Ok(AlterTableAction::ReplaceColumns { columns, cascade });
+            }
             // ClickHouse: REPLACE PARTITION expr FROM table
             if self.match_token(TokenType::Partition) {
                 let partition_expr = if self.match_text_seq(&["ALL"]) {
@@ -22970,13 +23978,7 @@ impl Parser {
                     if token.token_type == TokenType::RParen {
                         paren_depth -= 1;
                     }
-                    let text = if token.token_type == TokenType::QuotedIdentifier {
-                        format!("\"{}\"", token.text)
-                    } else if token.token_type == TokenType::String {
-                        format!("'{}'", token.text)
-                    } else {
-                        token.text.to_string()
-                    };
+                    let text = self.raw_sql_token_text(&token);
                     tokens.push((text, token.token_type));
                 }
                 Ok(AlterTableAction::Raw {
@@ -23012,13 +24014,7 @@ impl Parser {
                         break;
                     }
                 }
-                let text = if token.token_type == TokenType::QuotedIdentifier {
-                    format!("\"{}\"", token.text)
-                } else if token.token_type == TokenType::String {
-                    format!("'{}'", token.text)
-                } else {
-                    token.text.to_string()
-                };
+                let text = self.raw_sql_token_text(&token);
                 tokens.push((text, token.token_type));
             }
             Ok(AlterTableAction::Raw {
@@ -23198,6 +24194,8 @@ impl Parser {
             } else if self.match_token(TokenType::Default) {
                 let expr = self.parse_primary()?;
                 Ok(AlterColumnAction::SetDefault(expr))
+            } else if self.match_keyword("STATISTICS") {
+                Ok(AlterColumnAction::SetStatistics(self.parse_primary()?))
             } else if self.match_identifier("DATA") {
                 // SET DATA TYPE
                 // TYPE can be a keyword token or identifier
@@ -23224,6 +24222,7 @@ impl Parser {
                     data_type,
                     using,
                     collate,
+                    nullable: None,
                 })
             } else if self.match_identifier("VISIBLE") {
                 Ok(AlterColumnAction::SetVisible)
@@ -23232,6 +24231,40 @@ impl Parser {
             } else {
                 Err(self.parse_error("Expected NOT NULL, DEFAULT, VISIBLE, or INVISIBLE after SET"))
             }
+        } else if self.match_keyword("RESTART") {
+            let with = self.match_token(TokenType::With);
+            let value = if with || self.check(TokenType::Number) || self.check(TokenType::Dash) {
+                Some(self.parse_unary()?)
+            } else {
+                None
+            };
+            Ok(AlterColumnAction::Restart(value))
+        } else if self.match_keyword("OPTIONS") {
+            self.expect(TokenType::LParen)?;
+            let mut options = Vec::new();
+            loop {
+                let action = if self.match_texts(&["ADD", "SET", "DROP"]) {
+                    Some(self.previous_text().to_ascii_uppercase())
+                } else {
+                    None
+                };
+                let name = self.expect_identifier_or_keyword_with_quoted()?;
+                let value = if action.as_deref() == Some("DROP") {
+                    None
+                } else {
+                    Some(self.parse_primary()?)
+                };
+                options.push(AlterColumnOption {
+                    action,
+                    name,
+                    value,
+                });
+                if !self.match_token(TokenType::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenType::RParen)?;
+            Ok(AlterColumnAction::Options(options))
         } else if self.match_token(TokenType::Drop) {
             if self.match_keywords(&[TokenType::Not, TokenType::Null]) {
                 Ok(AlterColumnAction::DropNotNull)
@@ -23266,10 +24299,18 @@ impl Parser {
             } else {
                 None
             };
+            let nullable = if self.match_keywords(&[TokenType::Not, TokenType::Null]) {
+                Some(false)
+            } else if self.match_token(TokenType::Null) {
+                Some(true)
+            } else {
+                None
+            };
             Ok(AlterColumnAction::SetDataType {
                 data_type,
                 using,
                 collate,
+                nullable,
             })
         } else {
             Err(self.parse_error("Expected SET, DROP, or TYPE in ALTER COLUMN"))
@@ -23287,7 +24328,7 @@ impl Parser {
         ) && self.check_identifier("ALL")
             && self.current + 1 < self.tokens.len()
             && self.tokens[self.current + 1]
-                .text
+                .text(self.source.as_deref().unwrap_or_default())
                 .eq_ignore_ascii_case("TABLES")
         {
             // Consume remaining tokens as Command
@@ -23504,6 +24545,76 @@ impl Parser {
             alias,
             column_aliases,
         }));
+
+        let values_expr = if matches!(
+            self.config.dialect,
+            None | Some(
+                crate::dialects::DialectType::Generic
+                    | crate::dialects::DialectType::Spark
+                    | crate::dialects::DialectType::Databricks
+                    | crate::dialects::DialectType::Hive
+            )
+        ) && matches!(
+            self.peek().token_type,
+            TokenType::Order | TokenType::Limit | TokenType::Offset
+        ) {
+            let order_by = if self.match_keywords(&[TokenType::Order, TokenType::By]) {
+                Some(self.parse_order_by()?)
+            } else {
+                None
+            };
+            let limit = if self.match_token(TokenType::Limit) {
+                Some(Limit {
+                    this: self.parse_expression()?,
+                    percent: false,
+                    comments: Vec::new(),
+                })
+            } else {
+                None
+            };
+            let offset = if self.match_token(TokenType::Offset) {
+                Some(Offset {
+                    this: self.parse_expression()?,
+                    rows: None,
+                })
+            } else {
+                None
+            };
+            let values_expr = if matches!(
+                self.config.dialect,
+                None | Some(crate::dialects::DialectType::Generic)
+            ) {
+                if let Expression::Values(mut values) = values_expr {
+                    if values.alias.is_none() {
+                        values.alias = Some(Identifier::new("_values"));
+                    }
+                    Expression::Values(values)
+                } else {
+                    values_expr
+                }
+            } else {
+                values_expr
+            };
+            Expression::Select(Box::new(Select {
+                expressions: vec![Expression::Star(Star {
+                    table: None,
+                    except: None,
+                    replace: None,
+                    rename: None,
+                    trailing_comments: Vec::new(),
+                    span: None,
+                })],
+                from: Some(From {
+                    expressions: vec![values_expr],
+                }),
+                order_by,
+                limit,
+                offset,
+                ..Select::new()
+            }))
+        } else {
+            values_expr
+        };
 
         if parse_set_operations {
             self.parse_set_operation(values_expr)
@@ -24162,7 +25273,7 @@ impl Parser {
         let catch_body = if self.check(TokenType::Begin)
             && self.current + 1 < self.tokens.len()
             && self.tokens[self.current + 1]
-                .text
+                .text(self.source.as_deref().unwrap_or_default())
                 .eq_ignore_ascii_case("CATCH")
         {
             self.skip(); // consume BEGIN
@@ -24197,7 +25308,7 @@ impl Parser {
             if self.check(TokenType::Begin)
                 && self.current + 1 < self.tokens.len()
                 && self.tokens[self.current + 1]
-                    .text
+                    .text(self.source.as_deref().unwrap_or_default())
                     .eq_ignore_ascii_case(block_kind)
             {
                 depth += 1;
@@ -24209,7 +25320,7 @@ impl Parser {
             if self.check(TokenType::End)
                 && self.current + 1 < self.tokens.len()
                 && self.tokens[self.current + 1]
-                    .text
+                    .text(self.source.as_deref().unwrap_or_default())
                     .eq_ignore_ascii_case(block_kind)
             {
                 depth -= 1;
@@ -24622,10 +25733,10 @@ impl Parser {
 
         // Databricks: DESCRIBE ... AS JSON
         let as_json = if self.check(TokenType::As)
-            && self
-                .peek_nth(1)
-                .map(|t| t.text.eq_ignore_ascii_case("JSON"))
-                == Some(true)
+            && self.peek_nth(1).map(|t| {
+                t.text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("JSON")
+            }) == Some(true)
         {
             self.skip(); // consume AS
             self.skip(); // consume JSON
@@ -24724,11 +25835,18 @@ impl Parser {
                 continue;
             }
             // Stop at HISTORY keyword (but not as the first word)
-            if !this_parts.is_empty() && current.text.eq_ignore_ascii_case("HISTORY") {
+            if !this_parts.is_empty()
+                && current
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("HISTORY")
+            {
                 break;
             }
             // Stop at STARTS keyword
-            if current.text.eq_ignore_ascii_case("STARTS") {
+            if current
+                .text(self.source.as_deref().unwrap_or_default())
+                .eq_ignore_ascii_case("STARTS")
+            {
                 break;
             }
             // SingleStore: SHOW PLAN <id> - handle number directly (before Var/keyword check)
@@ -24756,14 +25874,21 @@ impl Parser {
 
                 // SingleStore: SHOW <type> ON <name> - preserve case for name after ON
                 // Check if current token is "ON" (but not at start)
-                if current.text.eq_ignore_ascii_case("ON") && !this_parts.is_empty() {
+                if current
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("ON")
+                    && !this_parts.is_empty()
+                {
                     this_parts.push("ON".to_string());
                     self.skip();
                     // Parse the name after ON, preserving case
                     if !self.is_at_end() {
                         let next = self.peek();
                         // Handle "ON TABLE name" pattern
-                        if next.text.eq_ignore_ascii_case("TABLE") {
+                        if next
+                            .text(self.source.as_deref().unwrap_or_default())
+                            .eq_ignore_ascii_case("TABLE")
+                        {
                             this_parts.push("TABLE".to_string());
                             self.skip();
                         }
@@ -24782,7 +25907,11 @@ impl Parser {
                 }
 
                 // SingleStore: SHOW REPRODUCTION INTO OUTFILE 'filename'
-                if current.text.eq_ignore_ascii_case("INTO") && joined == "REPRODUCTION" {
+                if current
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("INTO")
+                    && joined == "REPRODUCTION"
+                {
                     this_parts.push("INTO".to_string());
                     self.skip();
                     if !self.is_at_end() && self.peek_text().eq_ignore_ascii_case("OUTFILE") {
@@ -24800,7 +25929,10 @@ impl Parser {
                 // SingleStore: SHOW PLAN [JSON] <id> - capture the numeric ID
                 if joined == "PLAN" {
                     // Check if current is "JSON" - if so, push it and check for number
-                    if current.text.eq_ignore_ascii_case("JSON") {
+                    if current
+                        .text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("JSON")
+                    {
                         this_parts.push("JSON".to_string());
                         self.skip();
                         // Now check for number
@@ -24818,7 +25950,11 @@ impl Parser {
                     }
                 }
 
-                this_parts.push(current.text.to_ascii_uppercase());
+                this_parts.push(
+                    current
+                        .text(self.source.as_deref().unwrap_or_default())
+                        .to_ascii_uppercase(),
+                );
                 self.skip();
 
                 // ClickHouse: SHOW CREATE TABLE/VIEW/DICTIONARY <qualified_name>
@@ -24922,7 +26058,9 @@ impl Parser {
                             // Parse STATUS or MUTEX
                             if !self.is_at_end() {
                                 let next = self.peek();
-                                let next_upper = next.text.to_ascii_uppercase();
+                                let next_upper = next
+                                    .text(self.source.as_deref().unwrap_or_default())
+                                    .to_ascii_uppercase();
                                 if next_upper == "STATUS" {
                                     self.skip();
                                     mutex = Some(false);
@@ -25134,6 +26272,22 @@ impl Parser {
         } else {
             None
         };
+
+        if self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+            && this == "CREATE TABLE"
+        {
+            if let (Some(Expression::Table(table)), Some(database)) = (&mut target, &from) {
+                let identifier = match database {
+                    Expression::Column(c) if c.table.is_none() => Some(c.name.clone()),
+                    Expression::Identifier(i) => Some(i.clone()),
+                    _ => None,
+                };
+                if let Some(identifier) = identifier {
+                    table.schema = Some(identifier);
+                    from = None;
+                }
+            }
+        }
 
         // Normalize MySQL SHOW INDEX/COLUMNS FROM db.tbl -> FROM tbl FROM db.
         if matches!(this.as_str(), "INDEX" | "COLUMNS") && db.is_none() {
@@ -26569,9 +27723,14 @@ impl Parser {
     }
 
     fn raw_sql_token_text(&self, token: &crate::tokens::Token) -> String {
+        if self.source.is_some() && Self::text_match_excludes_token(token.token_type) {
+            return self.source_text_range(token.span.start, token.span.end);
+        }
         match token.token_type {
             TokenType::QuotedIdentifier => format!("`{}`", token.text),
-            TokenType::String => format!("'{}'", token.text),
+            TokenType::String => {
+                format!("'{}'", token.text.replace('\\', "\\\\").replace('\'', "''"))
+            }
             _ => token.text.to_string(),
         }
     }
@@ -27236,7 +28395,7 @@ impl Parser {
         } else if self.check_identifier("FILE")
             && self.current + 1 < self.tokens.len()
             && self.tokens[self.current + 1]
-                .text
+                .text(self.source.as_deref().unwrap_or_default())
                 .eq_ignore_ascii_case("FORMAT")
         {
             self.skip(); // consume FILE
@@ -27245,7 +28404,7 @@ impl Parser {
         } else if self.check_identifier("NETWORK")
             && self.current + 1 < self.tokens.len()
             && self.tokens[self.current + 1]
-                .text
+                .text(self.source.as_deref().unwrap_or_default())
                 .eq_ignore_ascii_case("POLICY")
         {
             self.skip(); // consume NETWORK
@@ -28067,6 +29226,30 @@ impl Parser {
             self.expect(TokenType::RParen)?;
         }
 
+        if self.config.dialect == Some(crate::dialects::DialectType::MySQL)
+            && (self.check_identifier("CHARACTER")
+                || self.check_identifier("CHARSET")
+                || (self.check(TokenType::Default)
+                    && (self.check_next_identifier("CHARACTER")
+                        || self.check_next_identifier("CHARSET"))))
+        {
+            let default = self.match_token(TokenType::Default);
+            if self.match_identifier("CHARACTER") {
+                self.expect(TokenType::Set)?;
+            } else {
+                self.match_identifier("CHARSET");
+            }
+            self.match_token(TokenType::Eq);
+            let charset = self.expect_identifier_or_keyword_with_quoted()?;
+            properties.push(Expression::CharacterSetProperty(Box::new(
+                CharacterSetProperty {
+                    this: Box::new(Expression::Identifier(charset)),
+                    default: default
+                        .then(|| Box::new(Expression::Boolean(BooleanLiteral { value: true }))),
+                },
+            )));
+        }
+
         // Parse DEFAULT COLLATE 'value' (BigQuery)
         if self.match_token(TokenType::Default) && self.match_token(TokenType::Collate) {
             // Parse the collation value (could be string literal or identifier)
@@ -28181,6 +29364,12 @@ impl Parser {
 
         // Parse database options
         while !self.is_at_end() && !self.check(TokenType::Semicolon) {
+            let default_charset = self.check(TokenType::Default)
+                && (self.check_next_identifier("CHARACTER")
+                    || self.check_next_identifier("CHARSET"));
+            if default_charset {
+                self.skip();
+            }
             if self.match_identifier("OWNER") || self.match_token(TokenType::Eq) {
                 self.match_token(TokenType::Eq);
                 options.push(DatabaseOption::Owner(Identifier::new(
@@ -28200,7 +29389,7 @@ impl Parser {
                     self.expect_identifier()?
                 };
                 options.push(DatabaseOption::Encoding(encoding));
-            } else if self.match_identifier("CHARACTER") {
+            } else if self.match_identifier("CHARACTER") || self.match_identifier("CHARSET") {
                 self.match_token(TokenType::Set);
                 self.match_token(TokenType::Eq);
                 let charset = if self.check(TokenType::String) {
@@ -28209,7 +29398,11 @@ impl Parser {
                 } else {
                     self.expect_identifier()?
                 };
-                options.push(DatabaseOption::CharacterSet(charset));
+                options.push(if default_charset {
+                    DatabaseOption::DefaultCharacterSet(charset)
+                } else {
+                    DatabaseOption::CharacterSet(charset)
+                });
             } else if self.match_identifier("COLLATE") {
                 self.match_token(TokenType::Eq);
                 let collate = if self.check(TokenType::String) {
@@ -28219,6 +29412,9 @@ impl Parser {
                     self.expect_identifier()?
                 };
                 options.push(DatabaseOption::Collate(collate));
+            } else if self.match_token(TokenType::Comment) {
+                self.match_token(TokenType::Eq);
+                options.push(DatabaseOption::Comment(self.expect_string()?));
             } else if self.match_identifier("LOCATION") {
                 self.match_token(TokenType::Eq);
                 let loc = if self.check(TokenType::String) {
@@ -28258,7 +29454,7 @@ impl Parser {
             if self.check(TokenType::If)
                 && self.current + 1 < self.tokens.len()
                 && self.tokens[self.current + 1]
-                    .text
+                    .text(self.source.as_deref().unwrap_or_default())
                     .eq_ignore_ascii_case("EMPTY")
             {
                 self.skip(); // consume IF
@@ -28367,7 +29563,8 @@ impl Parser {
                             if needs_space {
                                 col_defs_str.push(' ');
                             }
-                            col_defs_str.push_str(&tok.text);
+                            col_defs_str
+                                .push_str(&tok.text(self.source.as_deref().unwrap_or_default()));
                         }
                         returns_table_body = Some(format!("{} TABLE ({})", var_name, col_defs_str));
                         self.expect(TokenType::RParen)?;
@@ -28639,6 +29836,9 @@ impl Parser {
                 }
             } else if self.match_identifier("RETURN") {
                 // RETURN expression (or SELECT statement for TSQL TVFs)
+                if !property_order.contains(&FunctionPropertyKind::As) {
+                    property_order.push(FunctionPropertyKind::As);
+                }
                 let expr = if self.check(TokenType::Select) || self.check(TokenType::With) {
                     self.parse_statement()?
                 } else {
@@ -28738,7 +29938,7 @@ impl Parser {
             } else if self.check_identifier("SQL")
                 && self.current + 1 < self.tokens.len()
                 && self.tokens[self.current + 1]
-                    .text
+                    .text(self.source.as_deref().unwrap_or_default())
                     .eq_ignore_ascii_case("SECURITY")
             {
                 // SQL SECURITY DEFINER/INVOKER
@@ -29200,7 +30400,9 @@ impl Parser {
                                     t.token_type,
                                     TokenType::If | TokenType::Case | TokenType::For
                                 ) || matches!(
-                                    t.text.to_ascii_uppercase().as_str(),
+                                    t.text(self.source.as_deref().unwrap_or_default())
+                                        .to_ascii_uppercase()
+                                        .as_str(),
                                     "IF" | "WHILE" | "LOOP" | "REPEAT" | "CASE" | "FOR"
                                 )
                             })
@@ -30317,16 +31519,35 @@ impl Parser {
     /// Assignment (:=) has lower precedence than OR, matching Python sqlglot's
     /// _parse_expression -> _parse_assignment -> _parse_disjunction chain
     fn parse_expression(&mut self) -> Result<Expression> {
-        self.with_recursive_stack(|parser| parser.parse_expression_inner())
+        let outer_path = std::mem::take(&mut self.parsing_duckdb_json_path);
+        let result = self.with_recursive_stack(|parser| parser.parse_expression_inner());
+        self.parsing_duckdb_json_path = outer_path;
+        result
     }
 
     fn parse_expression_inner(&mut self) -> Result<Expression> {
-        let mut left = self.parse_or()?;
+        let mut left = self.parse_duckdb_json_arrow()?;
+
+        if matches!(
+            self.config.dialect,
+            None | Some(crate::dialects::DialectType::Generic)
+        ) {
+            while self.check_identifier("PER") && self.check_next(TokenType::LParen) {
+                self.skip();
+                self.expect(TokenType::LParen)?;
+                let expressions = self.parse_expression_list()?;
+                self.expect(TokenType::RParen)?;
+                left = Expression::Per(Box::new(BinaryOp::new(
+                    left,
+                    Expression::Tuple(Box::new(Tuple { expressions })),
+                )));
+            }
+        }
 
         // Handle := assignment operator (MySQL @var := val, DuckDB named args/settings)
         // This has lower precedence than OR
         while self.match_token(TokenType::ColonEq) {
-            let right = self.parse_or()?;
+            let right = self.parse_duckdb_json_arrow()?;
             left = Expression::PropertyEQ(Box::new(BinaryOp::new(left, right)));
         }
 
@@ -30366,11 +31587,13 @@ impl Parser {
             self.config.dialect,
             Some(crate::dialects::DialectType::ClickHouse)
         ) {
-            while self.check(TokenType::Apply) && self.check_next(TokenType::LParen) {
+            while self.check(TokenType::Apply)
+                && (self.check_next(TokenType::LParen)
+                    || matches!(&left, Expression::Function(f) if f.name.eq_ignore_ascii_case("COLUMNS"))
+                    || matches!(&left, Expression::MethodCall(f) if f.method.name.eq_ignore_ascii_case("COLUMNS")))
+            {
                 self.skip(); // consume APPLY
-                self.skip(); // consume (
-                let expr = self.with_parser_depth(|parser| parser.parse_expression())?;
-                self.expect(TokenType::RParen)?;
+                let expr = self.parse_clickhouse_apply_argument()?;
                 left = Expression::Apply(Box::new(crate::expressions::Apply {
                     this: Box::new(left),
                     expression: Box::new(expr),
@@ -30379,6 +31602,65 @@ impl Parser {
         }
 
         Ok(left)
+    }
+
+    /// ClickHouse APPLY accepts a function/lambda and an optional column-name prefix.
+    fn parse_clickhouse_apply_argument(&mut self) -> Result<Expression> {
+        if !self.match_token(TokenType::LParen) {
+            return self.parse_expression();
+        }
+        let function = self.parse_expression()?;
+        let argument = if self.match_token(TokenType::Comma) {
+            let prefix = self.parse_expression()?;
+            Expression::Tuple(Box::new(Tuple {
+                expressions: vec![function, prefix],
+            }))
+        } else {
+            function
+        };
+        self.expect(TokenType::RParen)?;
+        Ok(argument)
+    }
+
+    // DuckDB's -> binds below boolean and arithmetic operators. Other dialects
+    // retain their postfix arrows, and ->> keeps its distinct native precedence.
+    fn parse_duckdb_json_arrow(&mut self) -> Result<Expression> {
+        let expression_start = self.current;
+        let mut expression = self.parse_or()?;
+        if self.config.dialect == Some(crate::dialects::DialectType::DuckDB) {
+            while self.match_token(TokenType::Arrow) {
+                let outer_path = std::mem::replace(&mut self.parsing_duckdb_json_path, true);
+                let path = self.parse_or();
+                self.parsing_duckdb_json_path = outer_path;
+                expression = Expression::JsonExtract(Box::new(JsonExtractFunc {
+                    options: None,
+                    source_dialect: None,
+                    this: expression,
+                    path: path?,
+                    returning: None,
+                    arrow_syntax: true,
+                    hash_arrow_syntax: false,
+                    wrapper_option: None,
+                    quotes_option: None,
+                    on_scalar_string: false,
+                    on_error: None,
+                }));
+                if self.check(TokenType::DArrow) {
+                    // A mixed chain continues on the extracted document, rather
+                    // than becoming a scalar extraction inside the path.
+                    expression = self.parse_duckdb_concat_tail(expression)?;
+                    expression = self.parse_shift_tail(expression, expression_start)?;
+                    expression = self.parse_bitwise_and_tail(expression)?;
+                    expression = self.parse_bitwise_xor_tail(expression)?;
+                    expression = self.parse_bitwise_or_tail(expression)?;
+                    expression = self.parse_comparison_tail(expression, Vec::new())?;
+                    expression = self.parse_and_tail(expression)?;
+                    expression = self.parse_xor_tail(expression)?;
+                    expression = self.parse_or_tail(expression)?;
+                }
+            }
+        }
+        Ok(expression)
     }
 
     /// Parse OR expressions
@@ -30624,12 +31906,7 @@ impl Parser {
 
     /// Parse NOT expressions
     fn parse_not(&mut self) -> Result<Expression> {
-        if !self.check(TokenType::Not)
-            || matches!(
-                self.config.dialect,
-                Some(crate::dialects::DialectType::ClickHouse)
-            )
-        {
+        if !self.check(TokenType::Not) {
             return self.parse_comparison();
         }
 
@@ -30651,6 +31928,7 @@ impl Parser {
                 self.config.dialect,
                 Some(crate::dialects::DialectType::TSQL)
                     | Some(crate::dialects::DialectType::Fabric)
+                    | Some(crate::dialects::DialectType::ClickHouse)
             );
             if matches!(expr, Expression::Like(_) | Expression::ILike(_))
                 && !preserve_typed_not_like
@@ -30676,6 +31954,35 @@ impl Parser {
     }
 
     #[inline(never)]
+    fn is_doris_match_operator(&self, offset: usize) -> bool {
+        self.config.dialect == Some(crate::dialects::DialectType::Doris)
+            && self.peek_nth(offset + 1).is_some_and(|t| {
+                !matches!(
+                    t.token_type,
+                    TokenType::Eof
+                        | TokenType::From
+                        | TokenType::Comma
+                        | TokenType::RParen
+                        | TokenType::Semicolon
+                )
+            })
+            && self.peek_nth(offset).is_some_and(|t| {
+                !Self::text_match_excludes_token(t.token_type)
+                    && matches!(
+                        t.text(self.source.as_deref().unwrap_or_default())
+                            .to_ascii_uppercase()
+                            .as_str(),
+                        "MATCH"
+                            | "MATCH_ANY"
+                            | "MATCH_ALL"
+                            | "MATCH_PHRASE"
+                            | "MATCH_PHRASE_PREFIX"
+                            | "MATCH_PHRASE_EDGE"
+                            | "MATCH_REGEXP"
+                    )
+            })
+    }
+
     fn parse_comparison_tail(
         &mut self,
         mut left: Expression,
@@ -30761,7 +32068,32 @@ impl Parser {
                 global_in = true;
             }
 
-            let expr = if self.config.dialect == Some(crate::dialects::DialectType::HANA)
+            let expr = if self.is_doris_match_operator(0)
+                || (self.check(TokenType::Not) && self.is_doris_match_operator(1))
+            {
+                let negated = self.match_token(TokenType::Not);
+                let kind = self.advance_text()?.to_ascii_uppercase();
+                let expression = self.parse_bitwise_or()?;
+                let analyzer = if self.match_token(TokenType::Using) {
+                    if !self.match_identifier("ANALYZER") {
+                        return Err(self.parse_error("Expected ANALYZER after USING"));
+                    }
+                    Some(self.parse_primary()?)
+                } else {
+                    None
+                };
+                let predicate = Expression::DorisMatch(Box::new(DorisMatch {
+                    this: left,
+                    expression,
+                    kind,
+                    analyzer,
+                }));
+                if negated {
+                    Expression::Not(Box::new(UnaryOp::new(predicate)))
+                } else {
+                    predicate
+                }
+            } else if self.config.dialect == Some(crate::dialects::DialectType::HANA)
                 && (self.peek_text().eq_ignore_ascii_case("LIKE_REGEXPR")
                     || (self.check(TokenType::Not) && self.check_next_identifier("LIKE_REGEXPR")))
             {
@@ -31196,7 +32528,48 @@ impl Parser {
                 && self.match_token(TokenType::Is)
             {
                 let not = self.match_token(TokenType::Not);
-                if self.match_token(TokenType::Null) {
+                if self.config.dialect == Some(crate::dialects::DialectType::SQLite)
+                    && !self.check(TokenType::Distinct)
+                {
+                    // SQLite relational comparisons bind above IS, whereas IN
+                    // and equality remain in the enclosing comparison chain.
+                    let mut right = self.parse_bitwise_or()?;
+                    while matches!(
+                        self.peek().token_type,
+                        TokenType::Lt | TokenType::Lte | TokenType::Gt | TokenType::Gte
+                    ) {
+                        let operator = self.advance()?.token_type;
+                        let rhs = self.parse_bitwise_or()?;
+                        let op = Box::new(BinaryOp::new(right, rhs));
+                        right = match operator {
+                            TokenType::Lt => Expression::Lt(op),
+                            TokenType::Lte => Expression::Lte(op),
+                            TokenType::Gt => Expression::Gt(op),
+                            _ => Expression::Gte(op),
+                        };
+                    }
+                    match right {
+                        Expression::Null(_) => Expression::IsNull(Box::new(IsNull {
+                            this: left,
+                            not,
+                            postfix_form: false,
+                        })),
+                        Expression::Boolean(b) if b.value => {
+                            Expression::IsTrue(Box::new(IsTrueFalse { this: left, not }))
+                        }
+                        Expression::Boolean(_) => {
+                            Expression::IsFalse(Box::new(IsTrueFalse { this: left, not }))
+                        }
+                        right => {
+                            let is = Expression::Is(Box::new(BinaryOp::new(left, right)));
+                            if not {
+                                Expression::Not(Box::new(UnaryOp::new(is)))
+                            } else {
+                                is
+                            }
+                        }
+                    }
+                } else if self.match_token(TokenType::Null) {
                     let expr = Expression::IsNull(Box::new(IsNull {
                         this: left,
                         not,
@@ -31231,7 +32604,34 @@ impl Parser {
                 } else if self.match_token(TokenType::Distinct) {
                     // IS DISTINCT FROM / IS NOT DISTINCT FROM
                     self.expect(TokenType::From)?;
-                    let right = self.parse_bitwise_or()?;
+                    // PostgreSQL comparisons bind more tightly than IS. Hive
+                    // puts inequalities above equality/IS DISTINCT FROM.
+                    let right = if matches!(
+                        self.config.dialect,
+                        Some(
+                            crate::dialects::DialectType::PostgreSQL
+                                | crate::dialects::DialectType::CockroachDB
+                        )
+                    ) {
+                        self.parse_comparison()?
+                    } else {
+                        let right = self.parse_bitwise_or()?;
+                        if matches!(
+                            self.config.dialect,
+                            Some(
+                                crate::dialects::DialectType::Hive
+                                    | crate::dialects::DialectType::Spark
+                                    | crate::dialects::DialectType::Databricks
+                            )
+                        ) && matches!(
+                            self.peek().token_type,
+                            TokenType::Lt | TokenType::Lte | TokenType::Gt | TokenType::Gte
+                        ) {
+                            self.parse_comparison_tail(right, Vec::new())?
+                        } else {
+                            right
+                        }
+                    };
                     if not {
                         // IS NOT DISTINCT FROM → null-safe equality
                         Expression::NullSafeEq(Box::new(BinaryOp::new(left, right)))
@@ -31309,7 +32709,12 @@ impl Parser {
                             is_field: false,
                         }))
                     } else if self.match_token(TokenType::LParen) {
-                        if self.check(TokenType::Select) || self.check(TokenType::With) {
+                        if self.check(TokenType::Select)
+                            || self.check(TokenType::With)
+                            || (self.config.dialect
+                                == Some(crate::dialects::DialectType::ClickHouse)
+                                && self.check(TokenType::From))
+                        {
                             let subquery = self.parse_statement()?;
                             self.expect(TokenType::RParen)?;
                             Expression::In(Box::new(In {
@@ -31498,7 +32903,11 @@ impl Parser {
                 } else if self.match_token(TokenType::LParen) {
                     // Standard IN (list) or IN (subquery)
                     // Check if this is a subquery (IN (SELECT ...) or IN (WITH ... SELECT ...))
-                    if self.check(TokenType::Select) || self.check(TokenType::With) {
+                    if self.check(TokenType::Select)
+                        || self.check(TokenType::With)
+                        || (self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                            && self.check(TokenType::From))
+                    {
                         // Use parse_statement to handle both SELECT and WITH...SELECT
                         let subquery = self.parse_statement()?;
                         self.expect(TokenType::RParen)?;
@@ -31604,14 +33013,18 @@ impl Parser {
                     right_start: None,
                     right_end: None,
                 }))
-            } else if self.match_token(TokenType::IsNull) {
+            } else if self.config.dialect != Some(crate::dialects::DialectType::BigQuery)
+                && self.match_token(TokenType::IsNull)
+            {
                 // ISNULL postfix operator (PostgreSQL/SQLite)
                 Expression::IsNull(Box::new(IsNull {
                     this: left,
                     not: false,
                     postfix_form: true,
                 }))
-            } else if self.match_token(TokenType::NotNull) {
+            } else if self.config.dialect != Some(crate::dialects::DialectType::BigQuery)
+                && self.match_token(TokenType::NotNull)
+            {
                 // NOTNULL postfix operator (PostgreSQL/SQLite)
                 Expression::IsNull(Box::new(IsNull {
                     this: left,
@@ -31702,7 +33115,8 @@ impl Parser {
                     this: Box::new(left),
                     expression: Box::new(right),
                 }))
-            } else if self.match_token(TokenType::Operator) {
+            } else if self.check(TokenType::Operator) && self.check_next(TokenType::LParen) {
+                self.skip();
                 // PostgreSQL OPERATOR(schema.op) syntax for schema-qualified operators
                 // Example: col1 OPERATOR(pg_catalog.~) col2
                 self.expect(TokenType::LParen)?;
@@ -31720,7 +33134,7 @@ impl Parser {
                 // Try trailing comments of the RParen (previous token) first,
                 // then leading comments of the next token
                 let mut comments = if self.current > 0 {
-                    std::mem::take(&mut self.tokens[self.current - 1].trailing_comments)
+                    std::mem::take(&mut self.tokens[self.current - 1].trailing_comments).into_vec()
                 } else {
                     Vec::new()
                 };
@@ -31776,6 +33190,11 @@ impl Parser {
                     this: expr,
                     trailing_comments: Vec::new(),
                 }))
+            } else if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                && matches!(expr, Expression::Any(_) | Expression::All(_))
+                && (self.check(TokenType::Dot) || self.check(TokenType::LBracket))
+            {
+                self.maybe_parse_subscript(expr)?
             } else {
                 expr
             };
@@ -31785,8 +33204,57 @@ impl Parser {
     /// Parse bitwise OR expressions (|)
     #[inline(always)]
     fn parse_bitwise_or(&mut self) -> Result<Expression> {
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::SQLite | crate::dialects::DialectType::PostgreSQL)
+        ) {
+            return self.parse_bitwise_same_precedence();
+        }
         let left = self.parse_bitwise_xor()?;
         self.parse_bitwise_or_tail(left)
+    }
+
+    /// SQLite's &, |, <<, >> and PostgreSQL's additional # operator share
+    /// one left-associative tier, below arithmetic. PostgreSQL's ^ remains
+    /// exponentiation and is consumed by parse_power.
+    fn parse_bitwise_same_precedence(&mut self) -> Result<Expression> {
+        let expr_start = self.current;
+        let mut left = self.parse_addition()?;
+        loop {
+            let token = self.peek().token_type;
+            if !matches!(
+                token,
+                TokenType::Pipe | TokenType::Amp | TokenType::LtLt | TokenType::GtGt
+            ) && !(token == TokenType::Hash
+                && self.config.dialect == Some(crate::dialects::DialectType::PostgreSQL))
+            {
+                return Ok(left);
+            }
+            self.skip();
+
+            // Preserve the PostgreSQL extension operator <<=> raw fallback.
+            if token == TokenType::LtLt
+                && self.config.dialect == Some(crate::dialects::DialectType::PostgreSQL)
+                && self.match_token(TokenType::DArrow)
+            {
+                let _ = self.parse_addition()?;
+                left = Expression::Raw(Raw {
+                    sql: self.tokens_to_sql(expr_start, self.current),
+                });
+                continue;
+            }
+
+            let right = self.parse_addition()?;
+            let op = Box::new(BinaryOp::new(left, right));
+            left = match token {
+                TokenType::Pipe => Expression::BitwiseOr(op),
+                TokenType::Amp => Expression::BitwiseAnd(op),
+                TokenType::Hash => Expression::BitwiseXor(op),
+                TokenType::LtLt => Expression::BitwiseLeftShift(op),
+                TokenType::GtGt => Expression::BitwiseRightShift(op),
+                _ => unreachable!("bitwise operator was checked above"),
+            };
+        }
     }
 
     #[inline(never)]
@@ -31810,7 +33278,8 @@ impl Parser {
         // Then work up through addition, shift, bitwise AND/XOR/OR
         let mult_result = self.parse_multiplication_continuation(left)?;
         let add_result = self.parse_addition_continuation(mult_result)?;
-        self.parse_bitwise_or_continuation(add_result)
+        let concat_result = self.parse_duckdb_concat_tail(add_result)?;
+        self.parse_bitwise_or_continuation(concat_result)
     }
 
     /// Parse bitwise OR with an existing left expression
@@ -31900,7 +33369,10 @@ impl Parser {
                     trailing_comments,
                     inferred_type: None,
                 }))
-            } else if !self.dpipe_is_logical_or() && self.match_token(TokenType::DPipe) {
+            } else if self.config.dialect != Some(crate::dialects::DialectType::DuckDB)
+                && !self.dpipe_is_logical_or()
+                && self.match_token(TokenType::DPipe)
+            {
                 let operator_comments = self.previous_trailing_comments().to_vec();
                 let right = self.parse_at_time_zone()?;
                 let trailing_comments = self.previous_trailing_comments().to_vec();
@@ -31981,7 +33453,7 @@ impl Parser {
     #[inline(always)]
     fn parse_shift(&mut self) -> Result<Expression> {
         let expr_start = self.current;
-        let left = self.parse_addition()?;
+        let left = self.parse_duckdb_concat()?;
         self.parse_shift_tail(left, expr_start)
     }
 
@@ -31994,17 +33466,67 @@ impl Parser {
                     Some(crate::dialects::DialectType::PostgreSQL)
                 ) && self.match_token(TokenType::DArrow)
                 {
-                    let _ = self.parse_addition()?;
+                    let _ = self.parse_duckdb_concat()?;
                     left = Expression::Raw(Raw {
                         sql: self.tokens_to_sql(expr_start, self.current),
                     });
                     continue;
                 }
-                let right = self.parse_addition()?;
+                let right = self.parse_duckdb_concat()?;
                 left = Expression::BitwiseLeftShift(Box::new(BinaryOp::new(left, right)));
             } else if self.match_token(TokenType::GtGt) {
-                let right = self.parse_addition()?;
+                let right = self.parse_duckdb_concat()?;
                 left = Expression::BitwiseRightShift(Box::new(BinaryOp::new(left, right)));
+            } else {
+                return Ok(left);
+            }
+        }
+    }
+
+    fn parse_duckdb_concat(&mut self) -> Result<Expression> {
+        let left = self.parse_addition()?;
+        self.parse_duckdb_concat_tail(left)
+    }
+
+    // ->> shares DuckDB's concatenation precedence, below arithmetic but above
+    // comparisons. It intentionally differs from the low-precedence -> operator.
+    fn parse_duckdb_concat_tail(&mut self, mut left: Expression) -> Result<Expression> {
+        if self.config.dialect != Some(crate::dialects::DialectType::DuckDB) {
+            return Ok(left);
+        }
+        loop {
+            if self.parsing_duckdb_json_path && self.check(TokenType::DArrow) {
+                return Ok(left);
+            }
+            if self.match_token(TokenType::DArrow) {
+                let path = self.parse_addition()?;
+                left = Expression::JsonExtractScalar(Box::new(JsonExtractFunc {
+                    options: None,
+                    source_dialect: None,
+                    this: left,
+                    path,
+                    returning: None,
+                    arrow_syntax: true,
+                    hash_arrow_syntax: false,
+                    wrapper_option: None,
+                    quotes_option: None,
+                    on_scalar_string: false,
+                    on_error: None,
+                }));
+            } else if self.check(TokenType::DPipe) {
+                let left_comments = self.previous_trailing_comments().to_vec();
+                self.skip();
+                let operator_comments = self.previous_trailing_comments().to_vec();
+                let right = self.parse_addition()?;
+                let trailing_comments = self.previous_trailing_comments().to_vec();
+                left = Expression::Concat(Box::new(BinaryOp {
+                    left,
+                    right,
+                    left_comments,
+                    operator_comments,
+                    trailing_comments,
+                    inferred_type: None,
+                }));
             } else {
                 return Ok(left);
             }
@@ -32049,7 +33571,10 @@ impl Parser {
                     trailing_comments,
                     inferred_type: None,
                 }))
-            } else if !self.dpipe_is_logical_or() && self.match_token(TokenType::DPipe) {
+            } else if self.config.dialect != Some(crate::dialects::DialectType::DuckDB)
+                && !self.dpipe_is_logical_or()
+                && self.match_token(TokenType::DPipe)
+            {
                 let operator_comments = self.previous_trailing_comments().to_vec();
                 let right = self.parse_at_time_zone()?;
                 let trailing_comments = self.previous_trailing_comments().to_vec();
@@ -32120,21 +33645,79 @@ impl Parser {
     /// Parse multiplication/division
     #[inline(always)]
     fn parse_multiplication(&mut self) -> Result<Expression> {
-        let left = self.parse_power()?;
+        let left = self.parse_multiplicative_operand()?;
         self.parse_multiplication_tail(left)
+    }
+
+    #[inline(always)]
+    fn parse_multiplicative_operand(&mut self) -> Result<Expression> {
+        if self.config.dialect == Some(crate::dialects::DialectType::SQLite) {
+            self.parse_sqlite_concat()
+        } else {
+            self.parse_power()
+        }
+    }
+
+    /// SQLite's concatenation and JSON arrows share a left-associative tier
+    /// above multiplication and below unary operators and COLLATE.
+    #[inline(never)]
+    fn parse_sqlite_concat(&mut self) -> Result<Expression> {
+        let mut left = self.parse_power()?;
+        loop {
+            let left_comments = self.previous_trailing_comments().to_vec();
+            if self.match_token(TokenType::DPipe) {
+                let operator_comments = self.previous_trailing_comments().to_vec();
+                let right = self.parse_power()?;
+                let trailing_comments = self.previous_trailing_comments().to_vec();
+                left = Expression::Concat(Box::new(BinaryOp {
+                    left,
+                    right,
+                    left_comments,
+                    operator_comments,
+                    trailing_comments,
+                    inferred_type: None,
+                }));
+            } else if self.check(TokenType::Arrow) || self.check(TokenType::DArrow) {
+                let scalar = self.match_token(TokenType::DArrow);
+                if !scalar {
+                    self.skip();
+                }
+                let path = self.parse_power()?;
+                let extract = Box::new(JsonExtractFunc {
+                    this: left,
+                    path,
+                    arrow_syntax: true,
+                    source_dialect: None,
+                    options: None,
+                    returning: None,
+                    hash_arrow_syntax: false,
+                    wrapper_option: None,
+                    quotes_option: None,
+                    on_scalar_string: false,
+                    on_error: None,
+                });
+                left = if scalar {
+                    Expression::JsonExtractScalar(extract)
+                } else {
+                    Expression::JsonExtract(extract)
+                };
+            } else {
+                return Ok(left);
+            }
+        }
     }
 
     #[inline(never)]
     fn parse_multiplication_tail(&mut self, mut left: Expression) -> Result<Expression> {
         loop {
             let expr = if self.match_token(TokenType::Star) {
-                let right = self.parse_power()?;
+                let right = self.parse_multiplicative_operand()?;
                 Expression::Mul(Box::new(BinaryOp::new(left, right)))
             } else if self.match_token(TokenType::Slash) {
-                let right = self.parse_power()?;
+                let right = self.parse_multiplicative_operand()?;
                 Expression::Div(Box::new(BinaryOp::new(left, right)))
             } else if self.match_token(TokenType::Percent) {
-                let right = self.parse_power()?;
+                let right = self.parse_multiplicative_operand()?;
                 Expression::Mod(Box::new(BinaryOp::new(left, right)))
             } else if !self.check(TokenType::QuotedIdentifier)
                 && (self.match_identifier("MOD") || self.match_token(TokenType::Mod))
@@ -32259,7 +33842,12 @@ impl Parser {
             return Ok(None);
         }
 
-        if self.tokens[self.current + 1].token_type != TokenType::String {
+        if !matches!(
+            self.tokens[self.current + 1].token_type,
+            TokenType::String
+                | TokenType::TripleSingleQuotedString
+                | TokenType::TripleDoubleQuotedString
+        ) {
             return Ok(None);
         }
 
@@ -32278,7 +33866,12 @@ impl Parser {
         };
 
         // Parse the string literal
-        if !self.check(TokenType::String) {
+        if !matches!(
+            self.peek().token_type,
+            TokenType::String
+                | TokenType::TripleSingleQuotedString
+                | TokenType::TripleDoubleQuotedString
+        ) {
             // Backtrack - something went wrong
             self.current = start_pos;
             return Ok(None);
@@ -32293,7 +33886,7 @@ impl Parser {
         {
             return Ok(Some(Expression::ParseJson(Box::new(UnaryFunc {
                 this: value,
-                original_name: None,
+                original_name: Some(type_name.clone()),
                 inferred_type: None,
             }))));
         }
@@ -32437,6 +34030,20 @@ impl Parser {
                 self.skip();
                 continue;
             }
+            if token == TokenType::Exclamation
+                && matches!(
+                    self.config.dialect,
+                    Some(
+                        crate::dialects::DialectType::MySQL
+                            | crate::dialects::DialectType::TiDB
+                            | crate::dialects::DialectType::SingleStore
+                    )
+                )
+            {
+                prefixes.push(TokenType::Not);
+                self.skip();
+                continue;
+            }
             if !matches!(
                 token,
                 TokenType::Plus
@@ -32444,9 +34051,7 @@ impl Parser {
                     | TokenType::Tilde
                     | TokenType::DPipeSlash
                     | TokenType::PipeSlash
-            ) && !(token == TokenType::Not
-                && self.config.dialect == Some(crate::dialects::DialectType::ClickHouse))
-            {
+            ) {
                 break;
             }
             let _scope = self.enter_parser_depth(prefixes.len() + 1)?;
@@ -32482,6 +34087,14 @@ impl Parser {
 
     #[inline(never)]
     fn parse_unary_operand(&mut self) -> Result<Expression> {
+        // ClickHouse also permits NOT where an arithmetic/comparison operand is
+        // expected. It still binds below comparisons: 1 + NOT a = b means
+        // 1 + (NOT (a = b)), so do not collect it as a high-precedence prefix.
+        if self.check(TokenType::Not)
+            && self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+        {
+            return self.with_parser_depth(|parser| parser.parse_not_prefixes());
+        }
         // IF cannot be a type literal or a low-precedence prefix operator. Keep
         // its recursive descent out of the large special-operator frame.
         if self.check(TokenType::If) {
@@ -33389,7 +35002,9 @@ impl Parser {
         if self.check(TokenType::RParen) {
             self.skip(); // consume )
                          // Check for lambda: () -> body
-            if self.match_token(TokenType::Arrow) || self.match_token(TokenType::FArrow) {
+            if self.config.dialect != Some(crate::dialects::DialectType::DuckDB)
+                && (self.match_token(TokenType::Arrow) || self.match_token(TokenType::FArrow))
+            {
                 let body = self.parse_expression()?;
                 return Ok(Expression::Lambda(Box::new(LambdaExpr {
                     parameters: Vec::new(),
@@ -33442,7 +35057,9 @@ impl Parser {
                         | TokenType::System
                         | TokenType::Table
                 ) || matches!(
-                    t.text.to_ascii_uppercase().as_str(),
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .to_ascii_uppercase()
+                        .as_str(),
                     "SYNTAX" | "AST" | "PLAN" | "PIPELINE" | "ESTIMATE" | "CURRENT" | "QUERY"
                 ) || (t.token_type == TokenType::Var
                     && self
@@ -33490,6 +35107,7 @@ impl Parser {
                 }
             }
             if is_tuple_lambda
+                && self.config.dialect != Some(crate::dialects::DialectType::SQLite)
                 && param_count >= 1
                 && look < self.tokens.len()
                 && self.tokens[look].token_type == TokenType::Arrow
@@ -33516,7 +35134,33 @@ impl Parser {
         }
         if self.check(TokenType::Select)
             || self.check(TokenType::With)
-            || self.check(TokenType::From)
+            || (self.check(TokenType::From)
+                && !(self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                    && self.peek_nth(1).is_some_and(|t| {
+                        matches!(
+                            t.token_type,
+                            TokenType::In
+                                | TokenType::Not
+                                | TokenType::Is
+                                | TokenType::Like
+                                | TokenType::Between
+                                | TokenType::Eq
+                                | TokenType::Neq
+                                | TokenType::Gt
+                                | TokenType::Gte
+                                | TokenType::Lt
+                                | TokenType::Lte
+                                | TokenType::And
+                                | TokenType::Or
+                                | TokenType::Plus
+                                | TokenType::Dash
+                                | TokenType::Star
+                                | TokenType::Slash
+                                | TokenType::DColon
+                                | TokenType::Dot
+                                | TokenType::LBracket
+                        )
+                    })))
             || is_explain_subquery
         {
             let query = if is_explain_subquery {
@@ -33773,7 +35417,9 @@ impl Parser {
 
             self.expect(TokenType::RParen)?;
 
-            if self.match_token(TokenType::Arrow) {
+            if self.config.dialect != Some(crate::dialects::DialectType::DuckDB)
+                && self.match_token(TokenType::Arrow)
+            {
                 let expression_count = expressions.len();
                 let parameters: Vec<Identifier> = expressions
                     .into_iter()
@@ -33861,7 +35507,11 @@ impl Parser {
         let mut paren_comments = lparen_comments.clone();
         paren_comments.extend_from_slice(self.previous_trailing_comments());
 
-        if self.match_token(TokenType::Arrow) {
+        if !matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::SQLite | crate::dialects::DialectType::DuckDB)
+        ) && self.match_token(TokenType::Arrow)
+        {
             let parameters = if let Expression::Column(c) = first_expr {
                 vec![c.name]
             } else if let Expression::Identifier(id) = first_expr {
@@ -33967,7 +35617,17 @@ impl Parser {
                 Some(crate::dialects::DialectType::ClickHouse)
             ) && Self::is_clickhouse_simple_function_chain_name(canonical_upper_name)
             {
-                let func_expr = self.parse_clickhouse_simple_function_chain(name, quoted)?;
+                let arguments_start = self.current;
+                let func_expr =
+                    match self.parse_clickhouse_simple_function_chain(name.clone(), quoted) {
+                        Ok(expr) => expr,
+                        Err(_) => {
+                            // The iterative fast path handles nested calls, but an operand may
+                            // also contain operators. Let the expression grammar parse those.
+                            self.current = arguments_start;
+                            self.parse_generic_function(&name, quoted)?
+                        }
+                    };
                 return self.maybe_parse_over(func_expr);
             }
             let func_expr = self.parse_typed_function(&name, &upper_name, quoted)?;
@@ -34013,13 +35673,7 @@ impl Parser {
                     loop {
                         if self.check(TokenType::Apply) {
                             self.skip();
-                            let apply_expr = if self.match_token(TokenType::LParen) {
-                                let e = self.parse_expression()?;
-                                self.expect(TokenType::RParen)?;
-                                e
-                            } else {
-                                self.parse_expression()?
-                            };
+                            let apply_expr = self.parse_clickhouse_apply_argument()?;
                             star_expr = Expression::Apply(Box::new(crate::expressions::Apply {
                                 this: Box::new(star_expr),
                                 expression: Box::new(apply_expr),
@@ -34082,7 +35736,16 @@ impl Parser {
                 return Ok(star_expr);
             }
             if self.check(TokenType::Number) {
-                let field_name = self.advance_text()?;
+                let mut field_name = self.advance_text()?;
+                if self.config.dialect == Some(crate::dialects::DialectType::BigQuery) {
+                    while self.is_connected()
+                        && (self.check(TokenType::Var)
+                            || self.check(TokenType::Identifier)
+                            || self.check_keyword())
+                    {
+                        field_name.push_str(&self.advance_text()?);
+                    }
+                }
                 let col_expr = Expression::Dot(Box::new(DotAccess {
                     this: Self::parsed_column(Column {
                         name: ident,
@@ -34176,7 +35839,7 @@ impl Parser {
                 let args = if self.check(TokenType::RParen) {
                     Vec::new()
                 } else {
-                    self.parse_function_arguments()?
+                    self.parse_method_arguments_for(&col_ident.name)?
                 };
                 self.expect(TokenType::RParen)?;
                 let this = Self::parsed_column(Column {
@@ -34221,6 +35884,8 @@ impl Parser {
                 self.config.dialect,
                 Some(crate::dialects::DialectType::PostgreSQL)
                     | Some(crate::dialects::DialectType::Redshift)
+                    | Some(crate::dialects::DialectType::SQLite)
+                    | Some(crate::dialects::DialectType::DuckDB)
             )
             && !self
                 .peek_nth(1)
@@ -34836,17 +36501,18 @@ impl Parser {
 
         // NULL
         if self.match_token(TokenType::Null) {
-            return Ok(Expression::Null(Null));
+            return self.maybe_parse_subscript(Expression::Null(Null));
         }
 
         // TRUE
         if self.match_token(TokenType::True) {
-            return Ok(Expression::Boolean(BooleanLiteral { value: true }));
+            return self.maybe_parse_subscript(Expression::Boolean(BooleanLiteral { value: true }));
         }
 
         // FALSE
         if self.match_token(TokenType::False) {
-            return Ok(Expression::Boolean(BooleanLiteral { value: false }));
+            return self
+                .maybe_parse_subscript(Expression::Boolean(BooleanLiteral { value: false }));
         }
 
         // LAMBDA expression (DuckDB syntax: LAMBDA x : expr)
@@ -34857,7 +36523,20 @@ impl Parser {
         }
 
         // CASE expression - but not if followed by DOT (then it's an identifier like case.column)
-        if self.check(TokenType::Case) && !self.check_next(TokenType::Dot) {
+        if self.check(TokenType::Case)
+            && !self.check_next(TokenType::Dot)
+            && !(self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                && self.peek_nth(1).is_some_and(|t| {
+                    matches!(
+                        t.token_type,
+                        TokenType::Comma
+                            | TokenType::From
+                            | TokenType::Semicolon
+                            | TokenType::RParen
+                            | TokenType::Eof
+                    )
+                }))
+        {
             let case_expr = self.parse_case()?;
             return self.maybe_parse_over(case_expr);
         }
@@ -35112,7 +36791,9 @@ impl Parser {
                     // Check for WITH, WITHOUT, or String after the closing paren
                     lookahead < self.tokens.len()
                         && (self.tokens[lookahead].token_type == TokenType::With
-                            || self.tokens[lookahead].text.eq_ignore_ascii_case("WITHOUT")
+                            || self.tokens[lookahead]
+                                .text(self.source.as_deref().unwrap_or_default())
+                                .eq_ignore_ascii_case("WITHOUT")
                             || self.tokens[lookahead].token_type == TokenType::String)
                 };
 
@@ -35178,7 +36859,10 @@ impl Parser {
             // Use lookahead to verify WITH is followed by TIME (not WITH FILL, WITH TOTALS, etc.)
             if (self.check(TokenType::With)
                 && self.peek_nth(1).map_or(false, |t| {
-                    t.text.eq_ignore_ascii_case("TIME") || t.text.eq_ignore_ascii_case("LOCAL")
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .eq_ignore_ascii_case("TIME")
+                        || t.text(self.source.as_deref().unwrap_or_default())
+                            .eq_ignore_ascii_case("LOCAL")
                 }))
                 || self.check_keyword_text("WITHOUT")
             {
@@ -35229,7 +36913,7 @@ impl Parser {
                 return Ok(Expression::DataType(data_type));
             }
             // Fallback to TIMESTAMP as column reference - preserve original case
-            return Ok(Self::parsed_column(Column {
+            return self.maybe_parse_subscript(Self::parsed_column(Column {
                 name: Identifier::new(original_text).with_span(token.span),
                 table: None,
                 join_mark: false,
@@ -35317,7 +37001,7 @@ impl Parser {
             {
                 if let Some(next) = self.tokens.get(self.current) {
                     let is_adjacent = token.span.end == next.span.start;
-                    let next_text = next.text();
+                    let next_text = next.text(self.source.as_deref().unwrap_or_default());
                     let is_hex_prefix = next_text.starts_with('x') || next_text.starts_with('X');
                     if is_adjacent
                         && matches!(next.token_type, TokenType::Identifier | TokenType::Var)
@@ -35341,9 +37025,13 @@ impl Parser {
                     let is_adjacent = token.span.end == next.span.start;
                     if is_adjacent
                         && matches!(next.token_type, TokenType::Identifier | TokenType::Var)
-                        && next.text.starts_with('_')
+                        && next
+                            .text(self.source.as_deref().unwrap_or_default())
+                            .starts_with('_')
                     {
-                        let suffix = next.text.to_string();
+                        let suffix = next
+                            .text(self.source.as_deref().unwrap_or_default())
+                            .to_string();
                         self.skip(); // consume suffix token
                         let combined = format!("{}{}", token.text, suffix);
                         let literal = Expression::Literal(Box::new(Literal::Number(combined)));
@@ -35355,7 +37043,11 @@ impl Parser {
             let literal = if let Some(sep_pos) = token.text.find("::") {
                 let num_part = &token.text[..sep_pos];
                 let type_name = &token.text[sep_pos + 2..];
-                let num_expr = Expression::Literal(Box::new(Literal::Number(num_part.to_string())));
+                let num_expr = if type_name == "DECIMAL" {
+                    Expression::string(num_part)
+                } else {
+                    Expression::Literal(Box::new(Literal::Number(num_part.to_string())))
+                };
                 let data_type = match type_name {
                     "BIGINT" => crate::expressions::DataType::BigInt { length: None },
                     "SMALLINT" => crate::expressions::DataType::SmallInt { length: None },
@@ -35369,10 +37061,7 @@ impl Parser {
                         scale: None,
                         real_spelling: false,
                     },
-                    "DECIMAL" => crate::expressions::DataType::Decimal {
-                        precision: None,
-                        scale: None,
-                    },
+                    "DECIMAL" => decimal_literal_type(num_part)?,
                     _ => crate::expressions::DataType::Custom {
                         name: type_name.to_string(),
                     },
@@ -35565,6 +37254,8 @@ impl Parser {
                             trailing_comments: Vec::new(),
                             span: None,
                         })
+                    } else if let Some(lambda) = self.parse_function_lambda()? {
+                        lambda
                     } else {
                         self.parse_expression()?
                     };
@@ -35733,7 +37424,10 @@ impl Parser {
 
         // Keywords as identifiers when followed by DOT (e.g., case.x, top.y)
         // These keywords can be table/column names when used with dot notation
-        if (self.check(TokenType::Case) || self.check(TokenType::Top))
+        if (self.check(TokenType::Case)
+            || self.check(TokenType::Top)
+            || (self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                && self.check(TokenType::Lateral)))
             && self.check_next(TokenType::Dot)
         {
             let token = self.advance()?;
@@ -35808,6 +37502,18 @@ impl Parser {
 
         // RLIKE/REGEXP as function call: RLIKE(expr, pattern, flags)
         // Normally RLIKE is an operator, but Snowflake allows function syntax
+        if self.config.dialect == Some(crate::dialects::DialectType::Teradata)
+            && self.check(TokenType::Mod)
+            && self.check_next(TokenType::LParen)
+        {
+            self.skip();
+            self.expect(TokenType::LParen)?;
+            let left = self.parse_expression()?;
+            self.expect(TokenType::Comma)?;
+            let right = self.parse_expression()?;
+            self.expect(TokenType::RParen)?;
+            return Ok(Expression::Mod(Box::new(BinaryOp::new(left, right))));
+        }
         if self.check(TokenType::RLike) && self.check_next(TokenType::LParen) {
             let token = self.advance()?; // consume RLIKE
             self.skip(); // consume LParen
@@ -36022,10 +37728,10 @@ impl Parser {
         if self.check(TokenType::Next)
             && self.current + 2 < self.tokens.len()
             && self.tokens[self.current + 1]
-                .text
+                .text(self.source.as_deref().unwrap_or_default())
                 .eq_ignore_ascii_case("VALUE")
             && self.tokens[self.current + 2]
-                .text
+                .text(self.source.as_deref().unwrap_or_default())
                 .eq_ignore_ascii_case("FOR")
         {
             self.skip(); // consume NEXT
@@ -36034,30 +37740,13 @@ impl Parser {
             }
         }
 
-        // ClickHouse: `from` can be a column name when followed by comma or dot
-        if matches!(
-            self.config.dialect,
-            Some(crate::dialects::DialectType::ClickHouse)
-        ) && self.check(TokenType::From)
-            && (self.check_next(TokenType::Comma) || self.check_next(TokenType::Dot))
+        // ClickHouse keywords are contextual in expression positions.
+        if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+            && self.check(TokenType::From)
         {
             let token = self.advance()?;
-            let name = token.text.to_string();
-            if self.match_token(TokenType::Dot) {
-                // from.col qualified reference
-                let col_name =
-                    self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
-                return Ok(Self::parsed_column(Column {
-                    name: col_name,
-                    table: Some(Identifier::new(name).with_span(token.span)),
-                    join_mark: false,
-                    trailing_comments: Vec::new(),
-                    span: None,
-                    inferred_type: None,
-                }));
-            }
-            return Ok(Self::parsed_column(Column {
-                name: Identifier::new(name).with_span(token.span),
+            return self.maybe_parse_subscript(Self::parsed_column(Column {
+                name: Self::identifier_from_token(token, false),
                 table: None,
                 join_mark: false,
                 trailing_comments: Vec::new(),
@@ -36279,7 +37968,7 @@ impl Parser {
                     let args = if self.check(TokenType::RParen) {
                         Vec::new()
                     } else {
-                        self.parse_expression_list()?
+                        self.parse_method_arguments_for(&col_ident.name)?
                     };
                     self.expect(TokenType::RParen)?;
                     let method_call = self.parse_method_call_expression(
@@ -38001,17 +39690,11 @@ impl Parser {
                 if matches!(
                     self.config.dialect,
                     Some(crate::dialects::DialectType::ClickHouse)
-                ) && (self.check(TokenType::Identifier)
-                    || self.check(TokenType::Var)
-                    || self.peek().token_type.is_keyword()
-                    || self.check(TokenType::String)
-                    || self.check(TokenType::Number))
-                    && (self.check_next(TokenType::Comma)
-                        || self.check_next(TokenType::LParen)
-                        || self.check_next(TokenType::LBracket)
-                        || self.check_next(TokenType::Var)
-                        || self.check_next(TokenType::Identifier))
+                ) && !self.check_next(TokenType::From)
                 {
+                    // ClickHouse extract(haystack, pattern) accepts arbitrary
+                    // expressions, including scalar subqueries, as its input.
+                    // Only EXTRACT(field FROM value) is the date-part syntax.
                     let args = self.parse_function_arguments()?;
                     self.expect(TokenType::RParen)?;
                     return Ok(Some(Expression::Function(Box::new(Function {
@@ -38425,7 +40108,9 @@ impl Parser {
                 if is_tsql {
                     let saved = self.current;
                     let orig_type_text = if self.current < self.tokens.len() {
-                        self.tokens[self.current].text.to_ascii_uppercase()
+                        self.tokens[self.current]
+                            .text(self.source.as_deref().unwrap_or_default())
+                            .to_ascii_uppercase()
                     } else {
                         String::new()
                     };
@@ -38501,6 +40186,7 @@ impl Parser {
                         this,
                         to: DataType::CharacterSet {
                             name: self.format_charset_for_raw_sql(&charset),
+                            length: None,
                         },
                         trailing_comments: Vec::new(),
                         double_colon_syntax: false,
@@ -38509,6 +40195,19 @@ impl Parser {
                         inferred_type: None,
                     }))))
                 } else if self.match_token(TokenType::Comma) {
+                    if self.config.dialect == Some(crate::dialects::DialectType::MySQL) {
+                        let to = self.parse_data_type()?;
+                        self.expect(TokenType::RParen)?;
+                        return Ok(Some(Expression::Cast(Box::new(Cast {
+                            this,
+                            to,
+                            trailing_comments: Vec::new(),
+                            double_colon_syntax: false,
+                            format: None,
+                            default: None,
+                            inferred_type: None,
+                        }))));
+                    }
                     let mut args = vec![this];
                     args.push(self.parse_expression()?);
                     while self.match_token(TokenType::Comma) {
@@ -39982,6 +41681,18 @@ impl Parser {
                     }
                     exprs.push(self.parse_expression()?);
                 }
+                // SQLite's second argument is the separator, not another value.
+                let sqlite_separator = if self.config.dialect
+                    == Some(crate::dialects::DialectType::SQLite)
+                    && exprs.len() > 1
+                {
+                    if exprs.len() > 2 {
+                        return Err(self.parse_error("GROUP_CONCAT expects one or two arguments"));
+                    }
+                    exprs.pop()
+                } else {
+                    None
+                };
                 // If multiple expressions, wrap in CONCAT (matches Python sqlglot behavior)
                 let this = if exprs.len() == 1 {
                     exprs.pop().unwrap()
@@ -39995,7 +41706,9 @@ impl Parser {
                     None
                 };
                 // Parse optional SEPARATOR - can be a string literal or expression (e.g., variable)
-                let separator = if self.match_token(TokenType::Separator) {
+                let separator = if sqlite_separator.is_some() {
+                    sqlite_separator
+                } else if self.match_token(TokenType::Separator) {
                     Some(self.parse_expression()?)
                 } else {
                     None
@@ -40347,6 +42060,13 @@ impl Parser {
             // LEAD / LAG
             "LEAD" | "LAG" => {
                 let this = self.parse_expression()?;
+                let early_nulls = if self.match_keywords(&[TokenType::Ignore, TokenType::Nulls]) {
+                    Some(true)
+                } else if self.match_keywords(&[TokenType::Respect, TokenType::Nulls]) {
+                    Some(false)
+                } else {
+                    None
+                };
                 let (offset, default) = if self.match_token(TokenType::Comma) {
                     let off = self.parse_expression()?;
                     let def = if self.match_token(TokenType::Comma) {
@@ -40359,8 +42079,9 @@ impl Parser {
                     (None, None)
                 };
                 // Check for IGNORE NULLS / RESPECT NULLS inside parens (e.g., Redshift: LAG(x IGNORE NULLS))
-                let ignore_nulls_inside = if self.match_token(TokenType::Ignore)
-                    && self.match_token(TokenType::Nulls)
+                let ignore_nulls_inside = if early_nulls.is_some() {
+                    early_nulls
+                } else if self.match_token(TokenType::Ignore) && self.match_token(TokenType::Nulls)
                 {
                     Some(true)
                 } else if self.match_token(TokenType::Respect) && self.match_token(TokenType::Nulls)
@@ -40499,6 +42220,11 @@ impl Parser {
         upper_name: &str,
         canonical_upper_name: &str,
     ) -> Result<Expression> {
+        if self.config.dialect == Some(crate::dialects::DialectType::Oracle)
+            && canonical_upper_name == "JSON_VALUE"
+        {
+            return self.parse_hana_json("JSON_VALUE");
+        }
         match canonical_upper_name {
             // JSON functions
             "JSON_EXTRACT" | "JSON_EXTRACT_SCALAR" | "JSON_QUERY" | "JSON_VALUE" => {
@@ -41180,7 +42906,7 @@ impl Parser {
                     .unwrap_or(false)
             {
                 // Parse *COLUMNS(...) as a function argument
-                (self.parse_function_arguments()?, false)
+                (self.parse_function_arguments_for(Some(name))?, false)
             } else {
                 // Regular star: parse star modifiers like EXCLUDE/EXCEPT/REPLACE/RENAME
                 // e.g., COLUMNS(* EXCLUDE (empid, dept))
@@ -41189,7 +42915,7 @@ impl Parser {
                 let mut args = vec![Expression::Star(star)];
                 // ClickHouse: func(*, col1, col2) — star followed by more args
                 if self.match_token(TokenType::Comma) {
-                    let rest = self.parse_function_arguments()?;
+                    let rest = self.parse_function_arguments_for(Some(name))?;
                     args.extend(rest);
                 }
                 (args, false)
@@ -41201,12 +42927,12 @@ impl Parser {
             // DISTINCT as aggregate modifier: func(DISTINCT expr)
             // Not when followed by comma or rparen — then DISTINCT is used as an identifier value
             self.skip(); // consume DISTINCT
-            (self.parse_function_arguments()?, true)
+            (self.parse_function_arguments_for(Some(name))?, true)
         } else if is_known_agg && self.match_token(TokenType::All) {
             // ALL is the default quantifier, just consume it
-            (self.parse_function_arguments()?, false)
+            (self.parse_function_arguments_for(Some(name))?, false)
         } else {
-            (self.parse_function_arguments()?, false)
+            (self.parse_function_arguments_for(Some(name))?, false)
         };
 
         // For known aggregate functions, check for IGNORE NULLS, ORDER BY, LIMIT inside parens
@@ -41394,7 +43120,30 @@ impl Parser {
     /// ClickHouse allows: func(expr AS alias, ...) where AS creates a named alias inside function args.
     fn parse_expression_with_clickhouse_alias(&mut self) -> Result<Expression> {
         let expr = self.parse_expression()?;
-        Ok(self.maybe_clickhouse_alias(expr))
+        let expr = self.maybe_clickhouse_alias(expr);
+        if matches!(expr, Expression::Alias(_))
+            && matches!(
+                self.peek().token_type,
+                TokenType::Eq
+                    | TokenType::Neq
+                    | TokenType::Lt
+                    | TokenType::Lte
+                    | TokenType::Gt
+                    | TokenType::Gte
+                    | TokenType::In
+                    | TokenType::Is
+            )
+        {
+            self.parse_comparison_tail(
+                Expression::Paren(Box::new(Paren {
+                    this: expr,
+                    trailing_comments: Vec::new(),
+                })),
+                Vec::new(),
+            )
+        } else {
+            Ok(expr)
+        }
     }
 
     fn parse_single_function_argument(&mut self) -> Result<Expression> {
@@ -41497,7 +43246,11 @@ impl Parser {
                     self.current = saved_pos;
                     self.parse_expression()?
                 }
-            } else if self.match_token(TokenType::Arrow) {
+            } else if !matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::SQLite | crate::dialects::DialectType::DuckDB)
+            ) && self.match_token(TokenType::Arrow)
+            {
                 let body = self.parse_expression()?;
                 Expression::Lambda(Box::new(LambdaExpr {
                     parameters: vec![Self::identifier_from_token(ident_token, quoted)],
@@ -41608,6 +43361,69 @@ impl Parser {
     /// Parse function arguments, handling named arguments (name => value, name := value)
     /// and TABLE/MODEL prefixed arguments (BigQuery)
     fn parse_function_arguments(&mut self) -> Result<Vec<Expression>> {
+        self.parse_function_arguments_for(None)
+    }
+
+    fn parse_function_arguments_for(&mut self, function: Option<&str>) -> Result<Vec<Expression>> {
+        self.parse_function_arguments_in_context(function, false)
+    }
+
+    fn parse_method_arguments_for(&mut self, method: &str) -> Result<Vec<Expression>> {
+        self.parse_function_arguments_in_context(Some(method), true)
+    }
+
+    fn lambda_argument(mut expression: &Expression) -> Option<&LambdaExpr> {
+        while let Expression::Paren(paren) = expression {
+            expression = &paren.this;
+        }
+        match expression {
+            Expression::Lambda(lambda) => Some(lambda),
+            _ => None,
+        }
+    }
+
+    fn parse_function_arguments_in_context(
+        &mut self,
+        function: Option<&str>,
+        receiver: bool,
+    ) -> Result<Vec<Expression>> {
+        if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+            && function.is_some_and(|f| f.eq_ignore_ascii_case("view"))
+            && self.check(TokenType::From)
+        {
+            return Ok(vec![self.parse_from_first_query()?]);
+        }
+        // DuckDB uses -> for both JSON paths and function lambdas. A dot call
+        // can supply the list as its receiver instead of its first argument.
+        let lambda_index = if self.config.dialect == Some(crate::dialects::DialectType::DuckDB) {
+            function.and_then(|name| {
+                if name.eq_ignore_ascii_case("COLUMNS") {
+                    Some(0)
+                } else if [
+                    "APPLY",
+                    "ARRAY_APPLY",
+                    "ARRAY_FILTER",
+                    "ARRAY_REDUCE",
+                    "ARRAY_TRANSFORM",
+                    "FILTER",
+                    "LIST_APPLY",
+                    "LIST_FILTER",
+                    "LIST_REDUCE",
+                    "LIST_TRANSFORM",
+                    "REDUCE",
+                ]
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                {
+                    Some(1)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let start = self.current;
         let mut args = Vec::new();
 
         loop {
@@ -41639,7 +43455,22 @@ impl Parser {
                 continue;
             }
 
-            args.push(self.parse_single_function_argument()?);
+            let receiver_reduction = receiver
+                && args
+                    .first()
+                    .and_then(Self::lambda_argument)
+                    .is_some_and(|lambda| lambda.parameters.len() > 1);
+            let lambda = if (lambda_index == Some(args.len()) && !receiver_reduction)
+                || (receiver && lambda_index == Some(1) && args.is_empty())
+            {
+                self.parse_function_lambda()?
+            } else {
+                None
+            };
+            args.push(match lambda {
+                Some(lambda) => lambda,
+                None => self.parse_single_function_argument()?,
+            });
 
             if !self.match_token(TokenType::Comma) {
                 break;
@@ -41675,6 +43506,17 @@ impl Parser {
                     break;
                 }
             }
+        }
+
+        // In schema.fn(json -> path, x -> body), the first arrow is JSON.
+        // Reparse without a receiver once the second argument proves that form.
+        if receiver
+            && lambda_index == Some(1)
+            && args.first().and_then(Self::lambda_argument).is_some()
+            && args.get(1).and_then(Self::lambda_argument).is_some()
+        {
+            self.current = start;
+            return self.parse_function_arguments_for(function);
         }
 
         Ok(args)
@@ -41938,7 +43780,11 @@ impl Parser {
             if let Some(sep_pos) = token.text.find("::") {
                 let num_part = &token.text[..sep_pos];
                 let type_name = &token.text[sep_pos + 2..];
-                let num_expr = Expression::Literal(Box::new(Literal::Number(num_part.to_string())));
+                let num_expr = if type_name == "DECIMAL" {
+                    Expression::string(num_part)
+                } else {
+                    Expression::Literal(Box::new(Literal::Number(num_part.to_string())))
+                };
                 let data_type = match type_name {
                     "BIGINT" => crate::expressions::DataType::BigInt { length: None },
                     "SMALLINT" => crate::expressions::DataType::SmallInt { length: None },
@@ -41952,10 +43798,7 @@ impl Parser {
                         scale: None,
                         real_spelling: false,
                     },
-                    "DECIMAL" => crate::expressions::DataType::Decimal {
-                        precision: None,
-                        scale: None,
-                    },
+                    "DECIMAL" => decimal_literal_type(num_part)?,
                     _ => crate::expressions::DataType::Custom {
                         name: type_name.to_string(),
                     },
@@ -42190,7 +44033,10 @@ impl Parser {
                 // ClickHouse: map[key] is always subscript access, not a MAP constructor
                 let is_map_constructor = !matches!(
                     self.config.dialect,
-                    Some(crate::dialects::DialectType::ClickHouse)
+                    Some(
+                        crate::dialects::DialectType::ClickHouse
+                            | crate::dialects::DialectType::StarRocks
+                    )
                 ) && match &expr {
                     Expression::Column(col) => {
                         col.name.name.eq_ignore_ascii_case("MAP") && col.table.is_none()
@@ -42399,13 +44245,7 @@ impl Parser {
                             loop {
                                 if self.check(TokenType::Apply) {
                                     self.skip();
-                                    let apply_expr = if self.match_token(TokenType::LParen) {
-                                        let e = self.parse_expression()?;
-                                        self.expect(TokenType::RParen)?;
-                                        e
-                                    } else {
-                                        self.parse_expression()?
-                                    };
+                                    let apply_expr = self.parse_clickhouse_apply_argument()?;
                                     expr = Expression::Apply(Box::new(crate::expressions::Apply {
                                         this: Box::new(expr),
                                         expression: Box::new(apply_expr),
@@ -42489,7 +44329,7 @@ impl Parser {
                         let args = if self.check(TokenType::RParen) {
                             Vec::new()
                         } else {
-                            self.parse_function_arguments()?
+                            self.parse_method_arguments_for(&ident.name)?
                         };
                         self.expect(TokenType::RParen)?;
                         // Create a method call expression (DotAccess with function call)
@@ -42501,9 +44341,36 @@ impl Parser {
                             inferred_type: None,
                         }));
                     }
+                } else if self.check(TokenType::LBrace)
+                    && self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                {
+                    let field = self.expect_identifier_with_quoted()?;
+                    expr = Expression::Dot(Box::new(DotAccess {
+                        this: expr,
+                        field,
+                        inferred_type: None,
+                    }));
+                } else if self.check(TokenType::LParen)
+                    && self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                {
+                    let index = self.parse_primary()?;
+                    expr = Expression::Function(Box::new(Function::new(
+                        "tupleElement".to_string(),
+                        vec![expr, index],
+                    )));
                 } else if self.check(TokenType::Number) {
-                    // Handle numeric field access like a.0 or x.1
-                    let field = Self::identifier_from_token(self.advance()?, false);
+                    // Numeric-leading BigQuery path components require quoting on output.
+                    let mut field = Self::identifier_from_token(self.advance()?, false);
+                    if self.config.dialect == Some(crate::dialects::DialectType::BigQuery) {
+                        while self.is_connected()
+                            && (self.check(TokenType::Var)
+                                || self.check(TokenType::Identifier)
+                                || self.check_keyword())
+                        {
+                            field.name.push_str(&self.advance_text()?);
+                        }
+                        field.quoted = true;
+                    }
                     expr = Expression::Dot(Box::new(DotAccess {
                         this: expr,
                         field,
@@ -42728,7 +44595,11 @@ impl Parser {
             } else if self.check(TokenType::Arrow)
                 && !matches!(
                     self.config.dialect,
-                    Some(crate::dialects::DialectType::ClickHouse)
+                    Some(
+                        crate::dialects::DialectType::ClickHouse
+                            | crate::dialects::DialectType::SQLite
+                            | crate::dialects::DialectType::DuckDB
+                    )
                 )
             {
                 self.skip(); // consume ->
@@ -42749,7 +44620,11 @@ impl Parser {
                     on_scalar_string: false,
                     on_error: None,
                 }));
-            } else if self.match_token(TokenType::DArrow) {
+            } else if !matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::SQLite | crate::dialects::DialectType::DuckDB)
+            ) && self.match_token(TokenType::DArrow)
+            {
                 // JSON extract text operator: expr ->> path (PostgreSQL, MySQL, DuckDB)
                 // Use parse_json_path_operand to get only the immediate operand for proper left-to-right associativity
                 let path = self.parse_json_path_operand()?;
@@ -42886,7 +44761,18 @@ impl Parser {
                 VerticaExpression::PartitionBest,
             ))]
         } else if self.match_keywords(&[TokenType::Partition, TokenType::By]) {
-            self.parse_expression_list()?
+            let excluding = matches!(
+                self.config.dialect,
+                None | Some(crate::dialects::DialectType::Generic)
+            ) && self.match_identifier("EXCLUDING");
+            let expressions = self.parse_expression_list()?;
+            if excluding {
+                vec![Expression::PartitionByExcluding(Box::new(Tuple {
+                    expressions,
+                }))]
+            } else {
+                expressions
+            }
         } else if self.match_keywords(&[TokenType::Distribute, TokenType::By]) {
             // Hive: DISTRIBUTE BY is equivalent to PARTITION BY in window specs
             self.parse_expression_list()?
@@ -42941,7 +44827,7 @@ impl Parser {
                 ) && self.check(TokenType::With)
                     && self.current + 1 < self.tokens.len()
                     && self.tokens[self.current + 1]
-                        .text
+                        .text(self.source.as_deref().unwrap_or_default())
                         .eq_ignore_ascii_case("FILL")
                 {
                     self.skip(); // consume WITH
@@ -43029,17 +44915,23 @@ impl Parser {
         let (kind, kind_text) = if self.match_token(TokenType::Rows) {
             (
                 WindowFrameKind::Rows,
-                self.tokens[self.current - 1].text.to_string(),
+                self.tokens[self.current - 1]
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .to_string(),
             )
         } else if self.match_token(TokenType::Range) {
             (
                 WindowFrameKind::Range,
-                self.tokens[self.current - 1].text.to_string(),
+                self.tokens[self.current - 1]
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .to_string(),
             )
         } else if self.match_token(TokenType::Groups) {
             (
                 WindowFrameKind::Groups,
-                self.tokens[self.current - 1].text.to_string(),
+                self.tokens[self.current - 1]
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .to_string(),
             )
         } else {
             return Ok(None);
@@ -43094,16 +44986,22 @@ impl Parser {
             Ok((WindowFrameBound::CurrentRow, None))
         } else if self.match_token(TokenType::Unbounded) {
             if self.match_token(TokenType::Preceding) {
-                let text = self.tokens[self.current - 1].text.to_string();
+                let text = self.tokens[self.current - 1]
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .to_string();
                 Ok((WindowFrameBound::UnboundedPreceding, Some(text)))
             } else if self.match_token(TokenType::Following) {
-                let text = self.tokens[self.current - 1].text.to_string();
+                let text = self.tokens[self.current - 1]
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .to_string();
                 Ok((WindowFrameBound::UnboundedFollowing, Some(text)))
             } else {
                 Err(self.parse_error("Expected PRECEDING or FOLLOWING after UNBOUNDED"))
             }
         } else if self.match_token(TokenType::Preceding) {
-            let text = self.tokens[self.current - 1].text.to_string();
+            let text = self.tokens[self.current - 1]
+                .text(self.source.as_deref().unwrap_or_default())
+                .to_string();
             // PRECEDING [value] (inverted syntax for some dialects)
             // If no value follows (e.g., just "PRECEDING" or "PRECEDING)"), use BarePreceding
             if self.check(TokenType::RParen) || self.check(TokenType::Comma) {
@@ -43113,7 +45011,9 @@ impl Parser {
                 Ok((WindowFrameBound::Preceding(Box::new(expr)), Some(text)))
             }
         } else if self.match_token(TokenType::Following) {
-            let text = self.tokens[self.current - 1].text.to_string();
+            let text = self.tokens[self.current - 1]
+                .text(self.source.as_deref().unwrap_or_default())
+                .to_string();
             // FOLLOWING [value] (inverted syntax for some dialects)
             // If no value follows (e.g., just "FOLLOWING" or "FOLLOWING)"), use BareFollowing
             if self.check(TokenType::RParen) || self.check(TokenType::Comma) {
@@ -43127,10 +45027,14 @@ impl Parser {
             // Use parse_addition to handle expressions like 1 + 1 PRECEDING
             let expr = self.parse_addition()?;
             if self.match_token(TokenType::Preceding) {
-                let text = self.tokens[self.current - 1].text.to_string();
+                let text = self.tokens[self.current - 1]
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .to_string();
                 Ok((WindowFrameBound::Preceding(Box::new(expr)), Some(text)))
             } else if self.match_token(TokenType::Following) {
-                let text = self.tokens[self.current - 1].text.to_string();
+                let text = self.tokens[self.current - 1]
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .to_string();
                 Ok((WindowFrameBound::Following(Box::new(expr)), Some(text)))
             } else {
                 // Bare numeric bounds without PRECEDING/FOLLOWING
@@ -43837,7 +45741,9 @@ impl Parser {
             }
             let token = &self.tokens[self.current + i];
             if Self::text_match_excludes_token(token.token_type)
-                || !token.text.eq_ignore_ascii_case(kw)
+                || !token
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case(kw)
             {
                 return false;
             }
@@ -43854,7 +45760,9 @@ impl Parser {
             }
             let token = &self.tokens[self.current + i];
             if Self::text_match_excludes_token(token.token_type)
-                || !token.text.eq_ignore_ascii_case(kw)
+                || !token
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case(kw)
             {
                 return false;
             }
@@ -43936,14 +45844,21 @@ impl Parser {
         })))
     }
 
+    /// Parse a cast operand without consuming its AS/type separator. A cast
+    /// starts a nested expression context even when it occurs inside a JSON
+    /// path, so its arrows must not continue the surrounding extraction chain.
+    fn parse_cast_operand(&mut self) -> Result<Expression> {
+        let outer_path = std::mem::take(&mut self.parsing_duckdb_json_path);
+        let result = self.with_recursive_stack(|parser| parser.parse_duckdb_json_arrow());
+        self.parsing_duckdb_json_path = outer_path;
+        result
+    }
+
     /// Parse CAST expression
     fn parse_cast(&mut self) -> Result<Expression> {
         self.expect(TokenType::Cast)?;
         self.expect(TokenType::LParen)?;
-        // Use parse_or() instead of parse_expression() to avoid consuming AS
-        // as an alias (e.g. CAST((1, 2) AS Tuple(a Int8, b Int16)))
-        // Python sqlglot uses _parse_disjunction() here, which is equivalent.
-        let expr = self.parse_or()?;
+        let expr = self.parse_cast_operand()?;
 
         // ClickHouse: ternary operator inside CAST: CAST(cond ? true_val : false_val AS Type)
         let expr = if matches!(
@@ -44113,9 +46028,25 @@ impl Parser {
     fn parse_try_cast(&mut self) -> Result<Expression> {
         self.expect(TokenType::TryCast)?;
         self.expect(TokenType::LParen)?;
-        let expr = self.parse_or()?;
-        self.expect(TokenType::As)?;
-        let data_type = self.parse_data_type()?;
+        let mut expr = self.parse_cast_operand()?;
+        let clickhouse = self.config.dialect == Some(crate::dialects::DialectType::ClickHouse);
+        if clickhouse
+            && self.check(TokenType::As)
+            && self
+                .peek_nth(2)
+                .is_some_and(|t| t.token_type == TokenType::As)
+        {
+            self.skip();
+            let alias = self.expect_identifier_or_keyword_with_quoted()?;
+            expr = Expression::Alias(Box::new(Alias::new(expr, alias)));
+        }
+        let data_type = if clickhouse && self.match_token(TokenType::Comma) {
+            let type_name = self.expect_string()?;
+            self.parse_data_type_from_text(&type_name)?
+        } else {
+            self.expect(TokenType::As)?;
+            self.parse_data_type()?
+        };
 
         // Parse optional FORMAT clause
         let format = if self.match_token(TokenType::Format) {
@@ -44142,7 +46073,7 @@ impl Parser {
     fn parse_safe_cast(&mut self) -> Result<Expression> {
         self.expect(TokenType::SafeCast)?;
         self.expect(TokenType::LParen)?;
-        let expr = self.parse_or()?;
+        let expr = self.parse_cast_operand()?;
         self.expect(TokenType::As)?;
         let data_type = self.parse_data_type()?;
 
@@ -44454,6 +46385,22 @@ impl Parser {
             let _token = self.advance()?;
             let (subtype, srid) = self.parse_spatial_type_args()?;
             return Ok(DataType::Geometry { subtype, srid });
+        }
+        // PostgreSQL's quoted internal "char" is not the SQL CHAR type.
+        if self.check(TokenType::QuotedIdentifier)
+            && self.peek_text() == "char"
+            && matches!(
+                self.config.dialect,
+                Some(
+                    crate::dialects::DialectType::PostgreSQL
+                        | crate::dialects::DialectType::Redshift
+                )
+            )
+        {
+            self.skip();
+            return self.finish_data_type(DataType::Custom {
+                name: "\"char\"".into(),
+            });
         }
         // Data types can be keywords (DATE, TIMESTAMP, etc.) or identifiers
         let mut raw_name = self.expect_identifier_or_keyword()?;
@@ -44810,12 +46757,14 @@ impl Parser {
                     // CHAR CHARACTER SET charset (MySQL CAST context, no length)
                     // When length is specified (e.g., CHAR(4) CHARACTER SET LATIN),
                     // CHARACTER SET is a column attribute handled at the column def level
-                    if length.is_none()
-                        && self.match_identifier("CHARACTER")
-                        && self.match_token(TokenType::Set)
+                    if (self.match_identifier("CHARACTER") && self.match_token(TokenType::Set))
+                        || self.match_identifier("CHARSET")
                     {
                         let charset = self.expect_identifier_or_keyword()?;
-                        return Ok(DataType::CharacterSet { name: charset });
+                        return Ok(DataType::CharacterSet {
+                            name: charset,
+                            length,
+                        });
                     }
                     // Preserve NCHAR as Custom DataType so target dialects can map it properly
                     // (Oracle keeps NCHAR, TSQL keeps NCHAR, others map to CHAR)
@@ -45782,6 +47731,20 @@ impl Parser {
         let is_quoted = self.check(TokenType::QuotedIdentifier);
         let raw_name = self.expect_identifier_or_keyword()?;
         if is_quoted {
+            // PostgreSQL's internal single-byte "char" is distinct from SQL CHAR.
+            if raw_name == "char"
+                && matches!(
+                    self.config.dialect,
+                    Some(
+                        crate::dialects::DialectType::PostgreSQL
+                            | crate::dialects::DialectType::Redshift
+                    )
+                )
+            {
+                return self.maybe_parse_array_dimensions(DataType::Custom {
+                    name: "\"char\"".into(),
+                });
+            }
             // Check if the quoted name matches a known type — if so, normalize it
             let known_type = self.convert_name_to_type(&raw_name);
             if let Ok(ref dt) = known_type {
@@ -45956,12 +47919,14 @@ impl Parser {
                         None
                     };
                     // CHAR CHARACTER SET charset (MySQL CAST context, no length)
-                    if length.is_none()
-                        && self.match_identifier("CHARACTER")
-                        && self.match_token(TokenType::Set)
+                    if (self.match_identifier("CHARACTER") && self.match_token(TokenType::Set))
+                        || self.match_identifier("CHARSET")
                     {
                         let charset = self.expect_identifier_or_keyword()?;
-                        return Ok(DataType::CharacterSet { name: charset });
+                        return Ok(DataType::CharacterSet {
+                            name: charset,
+                            length,
+                        });
                     }
                     if is_nchar {
                         let name = if let Some(len) = length {
@@ -47216,32 +49181,7 @@ impl Parser {
             if self.match_token(TokenType::LParen) {
                 // EXCLUDE (col1, col2) or EXCEPT (A.COL_1, B.COL_2)
                 loop {
-                    let start = self.peek().span;
-                    // ClickHouse: allow string literals in EXCEPT ('col_regex')
-                    // and keywords like 'key', 'index' as column names
-                    let col = if self.check(TokenType::String) {
-                        self.advance_text()?
-                    } else if self.is_safe_keyword_as_identifier() {
-                        self.advance_text()?
-                    } else {
-                        self.expect_identifier()?
-                    };
-                    // Handle qualified column names like A.COL_1
-                    if self.match_token(TokenType::Dot) {
-                        let subcol = if self.is_safe_keyword_as_identifier() {
-                            self.advance_text()?
-                        } else {
-                            self.expect_identifier()?
-                        };
-                        columns.push(
-                            Identifier::new(format!("{}.{}", col, subcol))
-                                .with_span(start.through(self.previous().span)),
-                        );
-                    } else {
-                        columns.push(
-                            Identifier::new(col).with_span(start.through(self.previous().span)),
-                        );
-                    }
+                    columns.push(self.parse_star_except_name(true)?);
                     if !self.match_token(TokenType::Comma) {
                         break;
                     }
@@ -47251,16 +49191,7 @@ impl Parser {
                 // EXCLUDE col (single column, Snowflake) or EXCEPT col1, col2 (ClickHouse)
                 // or EXCEPT 'regex' (ClickHouse)
                 loop {
-                    let start = self.peek().span;
-                    let col = if self.check(TokenType::String) {
-                        self.advance_text()?
-                    } else if self.is_safe_keyword_as_identifier() {
-                        self.advance_text()?
-                    } else {
-                        self.expect_identifier()?
-                    };
-                    columns
-                        .push(Identifier::new(col).with_span(start.through(self.previous().span)));
+                    columns.push(self.parse_star_except_name(false)?);
                     // ClickHouse allows comma-separated columns without parens: EXCEPT col1, col2
                     // But only if the next token after comma looks like a column name
                     if !matches!(
@@ -47292,8 +49223,7 @@ impl Parser {
                 loop {
                     let expr = self.parse_expression()?;
                     self.expect(TokenType::As)?;
-                    let alias =
-                        self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
+                    let alias = self.expect_identifier_or_keyword_with_quoted()?;
                     replacements.push(Alias::new(expr, alias));
                     if !self.match_token(TokenType::Comma) {
                         break;
@@ -47308,7 +49238,7 @@ impl Parser {
                 // Multiple entries require parens: REPLACE(expr1 AS name1, expr2 AS name2)
                 let expr = self.parse_expression()?;
                 self.expect(TokenType::As)?;
-                let alias = self.parse_unquoted_identifier(Self::expect_identifier_or_keyword)?;
+                let alias = self.expect_identifier_or_keyword_with_quoted()?;
                 replacements.push(Alias::new(expr, alias));
             } else {
                 return Err(self.parse_error("Expected LParen after REPLACE"));
@@ -47321,9 +49251,9 @@ impl Parser {
             let mut renames = Vec::new();
             if self.match_token(TokenType::LParen) {
                 loop {
-                    let old_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
+                    let old_name = self.expect_identifier_with_quoted()?;
                     self.expect(TokenType::As)?;
-                    let new_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
+                    let new_name = self.expect_identifier_with_quoted()?;
                     renames.push((old_name, new_name));
                     if !self.match_token(TokenType::Comma) {
                         break;
@@ -47332,9 +49262,9 @@ impl Parser {
                 self.expect(TokenType::RParen)?;
             } else {
                 // Single rename without parens
-                let old_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
+                let old_name = self.expect_identifier_with_quoted()?;
                 self.expect(TokenType::As)?;
-                let new_name = self.parse_unquoted_identifier(Self::expect_identifier)?;
+                let new_name = self.expect_identifier_with_quoted()?;
                 renames.push((old_name, new_name));
             }
             rename = Some(renames);
@@ -47348,6 +49278,34 @@ impl Parser {
             trailing_comments: star_trailing_comments,
             span: None,
         })
+    }
+
+    /// Parse one EXCEPT / EXCLUDE name. A single name keeps its quotes. A
+    /// qualified name (`A.COL_1`, only inside parentheses) and a ClickHouse
+    /// pattern string (`'col_regex'`) keep their source text, quotes included.
+    fn parse_star_except_name(&mut self, allow_qualified: bool) -> Result<Identifier> {
+        let start = self.peek().span;
+        if self.check(TokenType::String) {
+            let token = self.advance()?;
+            let text = if self.source.is_some() {
+                self.source_text_range(token.span.start, token.span.end)
+            } else {
+                format!("'{}'", token.text.replace('\'', "''"))
+            };
+            return Ok(Identifier::new(text).with_span(token.span));
+        }
+        let first = self.expect_identifier_or_safe_keyword_with_quoted()?;
+        if !allow_qualified || !self.match_token(TokenType::Dot) {
+            return Ok(first);
+        }
+        let column = self.expect_identifier_or_safe_keyword_with_quoted()?;
+        let span = start.through(self.previous().span);
+        let text = if self.source.is_some() {
+            self.source_text_range(span.start, span.end)
+        } else {
+            format!("{}.{}", first.name, column.name)
+        };
+        Ok(Identifier::new(text).with_span(span))
     }
 
     // === Helper methods ===
@@ -47459,7 +49417,7 @@ impl Parser {
         if self.is_at_end() {
             return Err(self.end_of_input_error());
         }
-        let text = self.tokens[self.current].text_owned();
+        let text = self.tokens[self.current].text_owned(self.source.as_deref().unwrap_or_default());
         self.current += 1;
         Ok(text)
     }
@@ -47483,21 +49441,22 @@ impl Parser {
 
     #[inline]
     fn peek_text(&self) -> &str {
-        self.peek().text()
+        self.peek().text(self.source.as_deref().unwrap_or_default())
     }
 
     #[inline]
     fn previous_text(&self) -> &str {
-        self.previous().text()
+        self.previous()
+            .text(self.source.as_deref().unwrap_or_default())
     }
 
     fn materialize_token(&self, token: &ParserToken) -> Token {
         Token {
             token_type: token.token_type,
-            text: token.text_owned(),
+            text: token.text_owned(self.source.as_deref().unwrap_or_default()),
             span: token.span,
-            comments: token.comments.clone(),
-            trailing_comments: token.trailing_comments.clone(),
+            comments: token.comments.to_vec(),
+            trailing_comments: token.trailing_comments.to_vec(),
         }
     }
 
@@ -47625,7 +49584,10 @@ impl Parser {
                 // Preserve original indentation
                 // span.column is the column AFTER the last character (1-based),
                 // so start column = span.column - text.chars().count()
-                let text_len = t.text.chars().count();
+                let text_len = t
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .chars()
+                    .count();
                 let start_col = t.span.column.saturating_sub(text_len);
                 // For string tokens, add 2 for the quotes that were stripped
                 let start_col = if t.token_type == TokenType::String {
@@ -47645,13 +49607,20 @@ impl Parser {
                 }
             }
 
-            if t.token_type == TokenType::String {
+            if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+                && Self::text_match_excludes_token(t.token_type)
+            {
+                result.push_str(&self.source_text_range(t.span.start, t.span.end));
+            } else if t.token_type == TokenType::String {
                 // Re-add quotes around string literals
                 result.push('\'');
-                result.push_str(&t.text.replace('\'', "''"));
+                result.push_str(
+                    &t.text(self.source.as_deref().unwrap_or_default())
+                        .replace('\'', "''"),
+                );
                 result.push('\'');
             } else {
-                result.push_str(&t.text);
+                result.push_str(&t.text(self.source.as_deref().unwrap_or_default()));
             }
 
             prev_line = Some(t.span.line);
@@ -47744,7 +49713,8 @@ impl Parser {
             // Check for FILE_FORMAT= pattern that needs normalization
             // FILE_FORMAT must be followed by = and then NOT by (
             if (t.token_type == TokenType::Var || t.token_type == TokenType::Identifier)
-                && t.text.eq_ignore_ascii_case("FILE_FORMAT")
+                && t.text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("FILE_FORMAT")
                 && i + 1 < end
                 && self.tokens[i + 1].token_type == TokenType::Eq
                 && (i + 2 >= end || self.tokens[i + 2].token_type != TokenType::LParen)
@@ -47764,7 +49734,10 @@ impl Parser {
                     if val.token_type == TokenType::String {
                         // String literal: 'format1'
                         result.push('\'');
-                        result.push_str(&val.text.replace('\'', "''"));
+                        result.push_str(
+                            &val.text(self.source.as_deref().unwrap_or_default())
+                                .replace('\'', "''"),
+                        );
                         result.push('\'');
                         i += 1;
                         break;
@@ -47772,7 +49745,7 @@ impl Parser {
                         || val.token_type == TokenType::Identifier
                     {
                         // Identifier: schema1 or format1
-                        result.push_str(&val.text);
+                        result.push_str(&val.text(self.source.as_deref().unwrap_or_default()));
                         i += 1;
                         // Check for dot (qualified name)
                         if i < end && self.tokens[i].token_type == TokenType::Dot {
@@ -47780,7 +49753,9 @@ impl Parser {
                             i += 1;
                             // Expect identifier after dot
                             if i < end {
-                                result.push_str(&self.tokens[i].text);
+                                result.push_str(
+                                    self.tokens[i].text(self.source.as_deref().unwrap_or_default()),
+                                );
                                 i += 1;
                             }
                         }
@@ -47811,10 +49786,13 @@ impl Parser {
 
             if t.token_type == TokenType::String {
                 result.push('\'');
-                result.push_str(&t.text.replace('\'', "''"));
+                result.push_str(
+                    &t.text(self.source.as_deref().unwrap_or_default())
+                        .replace('\'', "''"),
+                );
                 result.push('\'');
             } else {
-                result.push_str(&t.text);
+                result.push_str(&t.text(self.source.as_deref().unwrap_or_default()));
             }
 
             prev_token_type = Some(t.token_type);
@@ -47887,18 +49865,27 @@ impl Parser {
             if t.token_type == TokenType::String {
                 // Re-add quotes around string literals
                 result.push('\'');
-                result.push_str(&t.text.replace('\'', "''"));
+                result.push_str(
+                    &t.text(self.source.as_deref().unwrap_or_default())
+                        .replace('\'', "''"),
+                );
                 result.push('\'');
             } else if t.token_type.is_keyword() {
                 // Uppercase keyword tokens
-                result.push_str(&t.text.to_ascii_uppercase());
+                result.push_str(
+                    &t.text(self.source.as_deref().unwrap_or_default())
+                        .to_ascii_uppercase(),
+                );
             } else {
                 // For non-keyword tokens, preserve original text
-                result.push_str(&t.text);
+                result.push_str(&t.text(self.source.as_deref().unwrap_or_default()));
             }
 
             prev_token_type = Some(t.token_type);
-            prev_token_text = Some(t.text.to_string());
+            prev_token_text = Some(
+                t.text(self.source.as_deref().unwrap_or_default())
+                    .to_string(),
+            );
         }
         result
     }
@@ -47964,7 +49951,9 @@ impl Parser {
             return true;
         }
         // UNPIVOT INCLUDE NULLS (...) or UNPIVOT EXCLUDE NULLS (...)
-        let next_text = next.text.to_ascii_uppercase();
+        let next_text = next
+            .text(self.source.as_deref().unwrap_or_default())
+            .to_ascii_uppercase();
         next_text == "INCLUDE" || next_text == "EXCLUDE"
     }
 
@@ -47998,7 +49987,9 @@ impl Parser {
         } else {
             let token = &self.tokens[self.current + 1];
             (token.token_type == TokenType::Var || token.token_type == TokenType::Identifier)
-                && token.text.eq_ignore_ascii_case(name)
+                && token
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case(name)
         }
     }
 
@@ -48175,7 +50166,9 @@ impl Parser {
         let token = self.peek();
         // Check for common type keywords that might appear in lambda annotations
         // Use text comparison to avoid depending on specific TokenType variants
-        let text_upper = token.text.to_ascii_uppercase();
+        let text_upper = token
+            .text(self.source.as_deref().unwrap_or_default())
+            .to_ascii_uppercase();
         DataType::from_unsigned_name(&text_upper).is_some()
             || matches!(
                 text_upper.as_str(),
@@ -48231,6 +50224,34 @@ impl Parser {
             return false;
         }
 
+        if self.config.dialect == Some(crate::dialects::DialectType::DuckDB)
+            && !self.check(TokenType::QuotedIdentifier)
+            && ((self.check_identifier("NEAREST")
+                && !matches!(
+                    self.peek_nth(1).map(|t| t.token_type),
+                    Some(
+                        TokenType::Join
+                            | TokenType::On
+                            | TokenType::Using
+                            | TokenType::Where
+                            | TokenType::Comma
+                            | TokenType::RParen
+                            | TokenType::Semicolon
+                            | TokenType::Eof
+                    )
+                ))
+                || (self.check_identifier("APPROX") && self.check_next_identifier("NEAREST")))
+        {
+            return false;
+        }
+
+        if self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+            && self.check_identifier("STREAM")
+            && !self.check(TokenType::QuotedIdentifier)
+        {
+            return false;
+        }
+
         let dialect_keyword_alias = match self.config.dialect {
             // These shared tokenizer keywords are valid unquoted DuckDB identifiers.
             // Keep the allowance local to relation aliases: FIRST/LAST still have
@@ -48242,10 +50263,15 @@ impl Parser {
                     | TokenType::Last
                     | TokenType::Begin
                     | TokenType::Type
+                    | TokenType::Owned
+                    | TokenType::Match
+                    | TokenType::Final
             ),
             Some(crate::dialects::DialectType::ClickHouse) => {
                 matches!(self.peek().token_type, TokenType::First | TokenType::Last)
+                    || (self.check(TokenType::Select) && self.check_next(TokenType::On))
             }
+            Some(crate::dialects::DialectType::Snowflake) => self.check(TokenType::Rollback),
             _ => false,
         };
 
@@ -48466,7 +50492,7 @@ impl Parser {
                     line: token.span.line,
                     column: token.span.column,
                 },
-                comments: token.comments,
+                comments: token.comments.into_vec(),
                 trailing_comments: Vec::new(),
             })
         } else {
@@ -48499,9 +50525,16 @@ impl Parser {
 
     /// Check if the current token is any kind of identifier (regular, quoted, or var)
     fn is_identifier_token(&self) -> bool {
+        if self.config.dialect == Some(crate::dialects::DialectType::Snowflake)
+            && self.check(TokenType::Rollback)
+        {
+            return true;
+        }
         self.check(TokenType::Var)
             || self.check(TokenType::Identifier)
             || self.check(TokenType::QuotedIdentifier)
+            || (self.config.dialect == Some(crate::dialects::DialectType::Redshift)
+                && self.check(TokenType::Qualify))
     }
 
     /// Check if current token is a stage reference (starts with @)
@@ -48935,6 +50968,11 @@ impl Parser {
     }
 
     fn expect_identifier_or_alias_keyword_with_quoted(&mut self) -> Result<Identifier> {
+        if self.check(TokenType::LBrace)
+            && self.config.dialect == Some(crate::dialects::DialectType::ClickHouse)
+        {
+            return self.expect_identifier_with_quoted();
+        }
         // ClickHouse: any keyword can be used as a table alias after explicit AS
         let ch_keyword = matches!(
             self.config.dialect,
@@ -49576,10 +51614,11 @@ impl Parser {
         Ok(identifiers)
     }
 
-    /// Parse a comma-separated list of identifiers for index columns.
-    /// Supports MySQL prefix lengths: col(16) and sort order: col DESC
-    fn parse_index_identifier_list(&mut self) -> Result<Vec<Identifier>> {
+    /// Keep literal constraint column names separate from prefix/order syntax.
+    /// Simple unquoted keys retain their established identifier-only JSON shape.
+    fn parse_constraint_index_columns(&mut self) -> Result<(Vec<Identifier>, Vec<IndexKeyPart>)> {
         let mut identifiers = Vec::new();
+        let mut key_parts = Vec::new();
 
         loop {
             let start = self.peek().span;
@@ -49587,36 +51626,47 @@ impl Parser {
             let name = self.expect_identifier_or_safe_keyword()?;
             let trailing_comments = self.previous_trailing_comments().to_vec();
 
-            // Check for prefix length: col(16)
-            let mut display_name = name.clone();
-            if self.match_token(TokenType::LParen) {
-                if self.check(TokenType::Number) {
-                    let len = self.advance_text()?;
-                    display_name = format!("{}({})", name, len);
-                }
-                self.expect(TokenType::RParen)?;
-            }
-
-            // Check for DESC/ASC sort order
-            if self.match_token(TokenType::Desc) {
-                display_name = format!("{} DESC", display_name);
-            } else if self.match_token(TokenType::Asc) {
-                display_name = format!("{} ASC", display_name);
-            }
-
-            identifiers.push(Identifier {
-                name: display_name,
+            let identifier = Identifier {
+                name,
                 quoted,
                 trailing_comments,
                 span: Some(start.through(self.previous().span)),
+            };
+            let prefix_length = if self.match_token(TokenType::LParen) {
+                if !self.check(TokenType::Number) {
+                    return Err(self.parse_error("Expected a numeric index prefix length"));
+                }
+                let length = self.advance_text()?;
+                self.expect(TokenType::RParen)?;
+                Some(length)
+            } else {
+                None
+            };
+            let desc = self.match_token(TokenType::Desc);
+            let asc = !desc && self.match_token(TokenType::Asc);
+            key_parts.push(IndexKeyPart {
+                expression: Box::new(Expression::Identifier(identifier.clone())),
+                prefix_length,
+                desc,
+                asc,
+                nulls_first: None,
+                opclass: None,
             });
+            identifiers.push(identifier);
 
             if !self.match_token(TokenType::Comma) {
                 break;
             }
         }
 
-        Ok(identifiers)
+        if !identifiers.iter().any(|column| column.quoted)
+            && key_parts
+                .iter()
+                .all(|part| part.prefix_length.is_none() && !part.desc && !part.asc)
+        {
+            key_parts.clear();
+        }
+        Ok((identifiers, key_parts))
     }
 
     /// Parse MySQL index key parts.
@@ -49792,7 +51842,9 @@ impl Parser {
             Some(if self.source.is_some() {
                 self.source_text_range(token.span.start, token.span.end)
             } else {
-                token.text.to_string()
+                token
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .to_string()
             })
         } else {
             None
@@ -50607,6 +52659,7 @@ impl Parser {
                 expression: None,
                 properties: Vec::new(),
                 columns: Vec::new(),
+                tables: Vec::new(),
             }))));
         }
 
@@ -50712,6 +52765,24 @@ impl Parser {
         } else {
             Vec::new()
         };
+
+        let mut tables = Vec::new();
+        while this.is_some() && self.match_token(TokenType::Comma) {
+            let table = self
+                .parse_table_parts()?
+                .ok_or_else(|| self.parse_error("Expected ANALYZE table"))?;
+            let table = if self.match_token(TokenType::LParen) {
+                let expressions = self.parse_expression_list()?;
+                self.expect(TokenType::RParen)?;
+                Expression::Schema(Box::new(Schema {
+                    this: Some(Box::new(table)),
+                    expressions,
+                }))
+            } else {
+                table
+            };
+            tables.push(table);
+        }
 
         // Parse optional PARTITION
         let partition = self.parse_partition()?;
@@ -50833,6 +52904,7 @@ impl Parser {
             expression: inner_expression.map(Box::new),
             properties,
             columns,
+            tables,
         }))))
     }
 
@@ -51323,7 +53395,10 @@ impl Parser {
         let start_text = if self.current > 0 {
             self.tokens
                 .get(self.current - 1)
-                .map(|t| t.text.to_string())
+                .map(|t| {
+                    t.text(self.source.as_deref().unwrap_or_default())
+                        .to_string()
+                })
                 .unwrap_or_default()
         } else {
             String::new()
@@ -51390,9 +53465,18 @@ impl Parser {
             let mut parts = Vec::new();
             for i in start_pos..self.current {
                 if self.tokens[i].token_type == TokenType::String {
-                    parts.push(format!("'{}'", self.tokens[i].text.replace('\'', "''")));
+                    parts.push(format!(
+                        "'{}'",
+                        self.tokens[i]
+                            .text(self.source.as_deref().unwrap_or_default())
+                            .replace('\'', "''")
+                    ));
                 } else {
-                    parts.push(self.tokens[i].text.to_string());
+                    parts.push(
+                        self.tokens[i]
+                            .text(self.source.as_deref().unwrap_or_default())
+                            .to_string(),
+                    );
                 }
             }
             parts.join(" ")
@@ -52566,6 +54650,16 @@ impl Parser {
             tokens.push((text, token.token_type));
         }
 
+        if tokens
+            .first()
+            .is_some_and(|(text, _)| text.eq_ignore_ascii_case("MSCK"))
+        {
+            if let Some((text, _)) = tokens.get_mut(1) {
+                if text.eq_ignore_ascii_case("REPAIR") {
+                    *text = "REPAIR".into();
+                }
+            }
+        }
         Ok(Some(Expression::Command(Box::new(Command {
             this: self.join_command_tokens(tokens),
         }))))
@@ -52975,6 +55069,7 @@ impl Parser {
                 this,
                 to: DataType::CharacterSet {
                     name: self.format_charset_for_raw_sql(&charset),
+                    length: None,
                 },
                 trailing_comments: Vec::new(),
                 double_colon_syntax: false,
@@ -53743,37 +55838,26 @@ impl Parser {
                 } else {
                     None
                 };
-                // ClickHouse: STRUCTURE (...) contains column defs without commas — consume balanced parens
-                let is_structure = key.as_ref().map_or(false, |k| {
-                    matches!(k, Expression::Identifier(id) if id.name.eq_ignore_ascii_case("STRUCTURE"))
-                });
-                let value = if is_structure && self.check(TokenType::LParen) {
-                    let mut raw = String::new();
-                    let mut depth = 0i32;
-                    while !self.is_at_end() {
-                        let tok = self.advance()?;
-                        match tok.token_type {
-                            TokenType::LParen => {
-                                depth += 1;
-                                raw.push('(');
-                            }
-                            TokenType::RParen => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    raw.push(')');
-                                    break;
-                                }
-                                raw.push(')');
-                            }
-                            _ => {
-                                if !raw.is_empty() && !raw.ends_with('(') {
-                                    raw.push(' ');
-                                }
-                                raw.push_str(&tok.text);
-                            }
+                // Nested configuration groups (CREDENTIALS, HEADERS, STRUCTURE)
+                // have a space-separated grammar of their own. Preserve their
+                // source text including quoted values and escapes.
+                let value = if key.is_some() && self.check(TokenType::LParen) {
+                    let start = self.peek().span.start;
+                    self.skip();
+                    let mut depth = 1;
+                    while depth > 0 {
+                        if self.is_at_end() {
+                            return Err(self.parse_error("Unclosed dictionary configuration group"));
+                        }
+                        match self.advance()?.token_type {
+                            TokenType::LParen => depth += 1,
+                            TokenType::RParen => depth -= 1,
+                            _ => {}
                         }
                     }
-                    Some(Expression::Var(Box::new(Var { this: raw })))
+                    Some(Expression::Var(Box::new(Var {
+                        this: self.source_text_range(start, self.previous().span.end),
+                    })))
                 } else {
                     self.parse_primary_or_var()?
                 };
@@ -54450,7 +56534,10 @@ impl Parser {
         // Check for ODBC escape syntax: {fn function_call}
         let fn_syntax = if self.check(TokenType::LBrace) {
             if let Some(next) = self.tokens.get(self.current + 1) {
-                if next.text.eq_ignore_ascii_case("FN") {
+                if next
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .eq_ignore_ascii_case("FN")
+                {
                     self.skip(); // consume {
                     self.skip(); // consume FN
                     true
@@ -54576,7 +56663,9 @@ impl Parser {
 
         let token = self.peek().clone();
         let token_type = token.token_type.clone();
-        let name = token.text.to_string();
+        let name = token
+            .text(self.source.as_deref().unwrap_or_default())
+            .to_string();
         let _upper_name = name.to_ascii_uppercase();
 
         // Check for no-paren functions like CURRENT_DATE, CURRENT_TIMESTAMP
@@ -55457,7 +57546,9 @@ impl Parser {
                 if self.source.is_some() {
                     self.source_text_range(token.span.start, token.span.end)
                 } else {
-                    token.text.to_string()
+                    token
+                        .text(self.source.as_deref().unwrap_or_default())
+                        .to_string()
                 }
             });
 
@@ -55632,6 +57723,8 @@ impl Parser {
                             }
                             return Ok(Some(Expression::DropTable(Box::new(
                                 crate::expressions::DropTable {
+                                    temporary: false,
+                                    force: false,
                                     names,
                                     if_exists: true,
                                     cascade: false,
@@ -55924,7 +58017,9 @@ impl Parser {
             Expression::Null(_) => {
                 // Just return as an identifier
                 Ok(Some(Expression::Identifier(Identifier {
-                    name: token.text.to_string(),
+                    name: token
+                        .text(self.source.as_deref().unwrap_or_default())
+                        .to_string(),
                     quoted: false,
                     trailing_comments: Vec::new(),
                     span: None,
@@ -55932,7 +58027,9 @@ impl Parser {
             }
             _ => Ok(Some(Expression::Introducer(Box::new(Introducer {
                 this: Box::new(Expression::Identifier(Identifier {
-                    name: token.text.to_string(),
+                    name: token
+                        .text(self.source.as_deref().unwrap_or_default())
+                        .to_string(),
                     quoted: false,
                     trailing_comments: Vec::new(),
                     span: None,
@@ -55986,6 +58083,7 @@ impl Parser {
                     comments: Vec::new(),
                     nesting_group: 0,
                     directed: false,
+                    nearest: None,
                 }))));
             }
             return Ok(None);
@@ -56042,6 +58140,7 @@ impl Parser {
                 comments: join_comments,
                 nesting_group: 0,
                 directed: false,
+                nearest: None,
             }))));
         }
 
@@ -56067,6 +58166,7 @@ impl Parser {
                 comments: Vec::new(),
                 nesting_group: 0,
                 directed: false,
+                nearest: None,
             }))));
         }
 
@@ -56635,6 +58735,34 @@ impl Parser {
         Ok(None)
     }
 
+    fn parse_function_lambda(&mut self) -> Result<Option<Expression>> {
+        let start = self.current;
+        let mut parentheses: Vec<Vec<String>> = Vec::new();
+        let mut depths = Vec::new();
+        loop {
+            if let Some(mut expression) = self.parse_lambda()? {
+                for mut comments in parentheses.into_iter().rev() {
+                    if !self.match_token(TokenType::RParen) {
+                        self.current = start;
+                        return Ok(None);
+                    }
+                    comments.extend_from_slice(self.previous_trailing_comments());
+                    expression = Expression::Paren(Box::new(Paren {
+                        this: expression,
+                        trailing_comments: comments,
+                    }));
+                }
+                return Ok(Some(expression));
+            }
+            if !self.match_token(TokenType::LParen) {
+                self.current = start;
+                return Ok(None);
+            }
+            depths.push(self.enter_parser_depth(1)?);
+            parentheses.push(self.previous_trailing_comments().to_vec());
+        }
+    }
+
     /// parse_lambda - Ported from Python _parse_lambda
     /// Parses lambda expressions: x -> x + 1 or (x, y) -> x + y
     /// Also supports DuckDB syntax: LAMBDA x : x + 1
@@ -56684,41 +58812,24 @@ impl Parser {
             }))));
         }
 
-        // Try to parse lambda parameters
-        let parameters = if self.match_token(TokenType::LParen) {
-            // Parenthesized parameters: (x, y) -> ...
-            let mut params = Vec::new();
-            if !self.check(TokenType::RParen) {
-                loop {
-                    if let Some(ident) = self.parse_identifier()? {
-                        if let Expression::Identifier(id) = ident {
-                            params.push(id);
-                        }
-                    }
-                    if !self.match_token(TokenType::Comma) {
-                        break;
-                    }
-                }
-            }
-            if !self.match_token(TokenType::RParen) {
-                // Not a lambda, retreat
+        let parenthesized = self.match_token(TokenType::LParen);
+        let mut parameters = Vec::new();
+        while !(parenthesized && self.check(TokenType::RParen)) {
+            if !self.is_identifier_token() {
                 self.current = start_index;
                 return Ok(None);
             }
-            params
-        } else {
-            // Single parameter: x -> ...
-            if let Some(ident) = self.parse_identifier()? {
-                if let Expression::Identifier(id) = ident {
-                    vec![id]
-                } else {
-                    self.current = start_index;
-                    return Ok(None);
-                }
-            } else {
-                return Ok(None);
+            let token = self.advance()?;
+            let quoted = token.token_type == TokenType::QuotedIdentifier;
+            parameters.push(Self::identifier_from_token(token, quoted));
+            if !parenthesized || !self.match_token(TokenType::Comma) {
+                break;
             }
-        };
+        }
+        if parenthesized && !self.match_token(TokenType::RParen) {
+            self.current = start_index;
+            return Ok(None);
+        }
 
         // Check for arrow operator
         if self.match_token(TokenType::Arrow) || self.match_token(TokenType::FArrow) {
@@ -56775,22 +58886,28 @@ impl Parser {
 
         // Parse optional alias
         let alias = if self.match_token(TokenType::As) {
-            Some(self.expect_identifier()?)
-        } else if self.check(TokenType::Identifier) && !self.check_keyword() {
-            Some(self.expect_identifier()?)
+            Some(self.expect_identifier_or_keyword_with_quoted()?)
+        } else if (self.check(TokenType::Identifier) && !self.check_keyword())
+            || self.check(TokenType::QuotedIdentifier)
+        {
+            Some(self.expect_identifier_or_keyword_with_quoted()?)
         } else {
             None
         };
+        let alias_quoted = alias.as_ref().is_some_and(|alias| alias.quoted);
+        let alias = alias.map(|alias| alias.name);
 
         // Parse optional column aliases: AS alias(col1, col2, ...)
+        let mut column_aliases_quoted = Vec::new();
         let column_aliases = if alias.is_some() && self.match_token(TokenType::LParen) {
             let mut cols = Vec::new();
             loop {
                 if self.check(TokenType::RParen) {
                     break;
                 }
-                let col = self.expect_identifier()?;
-                cols.push(col);
+                let column = self.expect_identifier_or_keyword_with_quoted()?;
+                column_aliases_quoted.push(column.quoted);
+                cols.push(column.name);
                 if !self.match_token(TokenType::Comma) {
                     break;
                 }
@@ -56800,6 +58917,9 @@ impl Parser {
         } else {
             Vec::new()
         };
+        if !column_aliases_quoted.iter().any(|quoted| *quoted) {
+            column_aliases_quoted.clear();
+        }
 
         Ok(Some(Expression::Lateral(Box::new(Lateral {
             this: Box::new(this),
@@ -56818,10 +58938,11 @@ impl Parser {
                 None
             },
             alias,
-            alias_quoted: false,
+            alias_quoted,
             cross_apply: None,
             ordinality: None,
             column_aliases,
+            column_aliases_quoted,
         }))))
     }
 
@@ -57441,7 +59562,13 @@ impl Parser {
                 }))];
 
                 // Spark/Databricks: INSERT * (insert all columns)
-                if self.match_token(TokenType::Star) {
+                if self.config.dialect == Some(crate::dialects::DialectType::Snowflake)
+                    && self.match_text_seq(&["ALL", "BY", "NAME"])
+                {
+                    elements.push(Expression::Var(Box::new(Var {
+                        this: "ALL BY NAME".into(),
+                    })));
+                } else if self.match_token(TokenType::Star) {
                     elements.push(Expression::Star(crate::expressions::Star {
                         table: None,
                         except: None,
@@ -57530,7 +59657,13 @@ impl Parser {
                 }))];
 
                 // Spark/Databricks: UPDATE * (update all columns)
-                if self.match_token(TokenType::Star) {
+                if self.config.dialect == Some(crate::dialects::DialectType::Snowflake)
+                    && self.match_text_seq(&["ALL", "BY", "NAME"])
+                {
+                    elements.push(Expression::Var(Box::new(Var {
+                        this: "ALL BY NAME".into(),
+                    })));
+                } else if self.match_token(TokenType::Star) {
                     elements.push(Expression::Star(crate::expressions::Star {
                         table: None,
                         except: None,
@@ -57758,7 +59891,15 @@ impl Parser {
         overwrite: bool,
     ) -> Result<Option<Expression>> {
         // Get kind from previous token (ALL or FIRST)
-        let kind = self.previous_text().to_ascii_uppercase();
+        let kind = if self.check(TokenType::When)
+            && !matches!(
+                self.previous_text().to_ascii_uppercase().as_str(),
+                "ALL" | "FIRST"
+            ) {
+            "ALL".to_string()
+        } else {
+            self.previous_text().to_ascii_uppercase()
+        };
 
         let mut expressions = Vec::new();
 
@@ -57836,6 +59977,7 @@ impl Parser {
                 conflict_action: None,
                 is_replace: false,
                 replace_where: None,
+                replace_using: Vec::new(),
                 source: None,
                 hint: None,
                 function_target: None,
@@ -58147,7 +60289,11 @@ impl Parser {
                 let num_part = &text[..sep_pos];
                 let type_name = &text[sep_pos + 2..];
                 // Create a TryCast expression: TRY_CAST(number AS TYPE)
-                let num_expr = Expression::Literal(Box::new(Literal::Number(num_part.to_string())));
+                let num_expr = if type_name == "DECIMAL" {
+                    Expression::string(num_part)
+                } else {
+                    Expression::Literal(Box::new(Literal::Number(num_part.to_string())))
+                };
                 let data_type = match type_name {
                     "BIGINT" => crate::expressions::DataType::BigInt { length: None },
                     "SMALLINT" => crate::expressions::DataType::SmallInt { length: None },
@@ -58161,10 +60307,7 @@ impl Parser {
                         scale: None,
                         real_spelling: false,
                     },
-                    "DECIMAL" => crate::expressions::DataType::Decimal {
-                        precision: None,
-                        scale: None,
-                    },
+                    "DECIMAL" => decimal_literal_type(num_part)?,
                     _ => crate::expressions::DataType::Custom {
                         name: type_name.to_string(),
                     },
@@ -61361,6 +63504,14 @@ impl Parser {
             return Err(self.parse_error("Expected SET in CYCLE/SEARCH clause"));
         };
 
+        let (mark_value, default_value) = if kind == "CYCLE" && self.match_token(TokenType::To) {
+            let mark = self.parse_primary()?;
+            self.expect(TokenType::Default)?;
+            (Some(Box::new(mark)), Some(Box::new(self.parse_primary()?)))
+        } else {
+            (None, None)
+        };
+
         // USING column (optional for SEARCH, required for CYCLE)
         let using = if self.match_token(TokenType::Using) {
             let using_col = self.expect_identifier()?;
@@ -61369,12 +63520,16 @@ impl Parser {
             None
         };
 
+        let next = self.parse_recursive_with_search()?;
         Ok(Some(Box::new(Expression::RecursiveWithSearch(Box::new(
             RecursiveWithSearch {
                 kind,
                 this: Box::new(this_expr),
                 expression: Box::new(expression),
                 using,
+                mark_value,
+                default_value,
+                next,
             },
         )))))
     }
@@ -61479,31 +63634,133 @@ impl Parser {
     /// parse_refresh - Parses REFRESH TABLE or REFRESH MATERIALIZED VIEW
     /// Python: parser.py:7656-7668
     pub fn parse_refresh(&mut self) -> Result<Option<Expression>> {
+        let starrocks = self.config.dialect == Some(crate::dialects::DialectType::StarRocks);
         let kind = if self.match_token(TokenType::Table) {
-            "TABLE".to_string()
+            "TABLE"
         } else if self.match_text_seq(&["MATERIALIZED", "VIEW"]) {
-            "MATERIALIZED VIEW".to_string()
+            "MATERIALIZED VIEW"
+        } else if starrocks && self.match_text_seq(&["EXTERNAL", "TABLE"]) {
+            "EXTERNAL TABLE"
+        } else if starrocks && self.match_identifier("DICTIONARY") {
+            "DICTIONARY"
+        } else if self.match_token(TokenType::Function) {
+            "FUNCTION"
         } else {
-            String::new()
-        };
-
-        // Parse the object name (string literal or table name)
-        // First try a string literal, then fall back to table reference
-        if let Some(s) = self.parse_string()? {
-            return Ok(Some(Expression::Refresh(Box::new(Refresh {
-                this: Box::new(s),
-                kind,
-            }))));
+            ""
         }
-
-        // Parse as a table reference (schema.table format)
-        let table_ref = self.parse_table_ref()?;
-        let table_expr = Expression::Table(Box::new(table_ref));
-
-        Ok(Some(Expression::Refresh(Box::new(Refresh {
-            this: Box::new(table_expr),
+        .to_string();
+        let this = if starrocks && self.match_identifier("CONNECTIONS") {
+            Expression::Var(Box::new(Var {
+                this: "CONNECTIONS".into(),
+            }))
+        } else if let Some(s) = self.parse_string()? {
+            s
+        } else {
+            Expression::Table(Box::new(self.parse_table_ref()?))
+        };
+        let mut refresh = Refresh {
+            this: Box::new(this),
             kind,
-        }))))
+            partitions: Vec::new(),
+            partition_range: None,
+            force: false,
+            mode: None,
+        };
+        if starrocks && self.match_token(TokenType::Partition) {
+            if self.match_token(TokenType::Start) || self.match_identifier("START") {
+                self.expect(TokenType::LParen)?;
+                let start = self.parse_expression()?;
+                self.expect(TokenType::RParen)?;
+                self.expect(TokenType::End)?;
+                self.expect(TokenType::LParen)?;
+                let end = self.parse_expression()?;
+                self.expect(TokenType::RParen)?;
+                refresh.partition_range = Some((start, end));
+            } else {
+                self.expect(TokenType::LParen)?;
+                refresh.partitions = self.parse_expression_list()?;
+                self.expect(TokenType::RParen)?;
+            }
+        }
+        refresh.force = starrocks && self.match_identifier("FORCE");
+        if starrocks && self.match_token(TokenType::With) {
+            if !self.check_identifier("SYNC") && !self.check_identifier("ASYNC") {
+                return Err(self.parse_error("Expected SYNC or ASYNC in REFRESH"));
+            }
+            refresh.mode = Some(self.advance_text()?.to_ascii_uppercase());
+            if !self.match_identifier("MODE") {
+                return Err(self.parse_error("Expected MODE in REFRESH"));
+            }
+        }
+        Ok(Some(Expression::Refresh(Box::new(refresh))))
+    }
+
+    fn parse_clickhouse_refresh_intervals(&mut self) -> Result<Vec<(Expression, Identifier)>> {
+        let mut values = Vec::new();
+        while self.check(TokenType::Number) {
+            let value = self.parse_primary()?;
+            let unit = self.expect_identifier_or_keyword()?.to_ascii_uppercase();
+            Self::parse_interval_unit_from_string(&unit)
+                .ok_or_else(|| self.parse_error("Invalid REFRESH interval unit"))?;
+            values.push((value, Identifier::new(unit)));
+        }
+        Ok(values)
+    }
+
+    fn parse_clickhouse_refresh(&mut self) -> Result<ClickHouseRefresh> {
+        let schedule = if self.match_identifier("EVERY") || self.match_token(TokenType::After) {
+            Some(self.previous_text().to_ascii_uppercase())
+        } else {
+            None
+        };
+        let intervals = if schedule.is_some() {
+            let values = self.parse_clickhouse_refresh_intervals()?;
+            if values.is_empty() {
+                return Err(self.parse_error("Expected REFRESH interval"));
+            }
+            values
+        } else {
+            Vec::new()
+        };
+        let offset = if self.match_token(TokenType::Offset) {
+            if schedule.as_deref() != Some("EVERY") {
+                return Err(self.parse_error("REFRESH OFFSET requires EVERY"));
+            }
+            self.parse_clickhouse_refresh_intervals()?
+        } else {
+            Vec::new()
+        };
+        let randomize = if self.match_identifier("RANDOMIZE") {
+            self.expect(TokenType::For)?;
+            self.parse_clickhouse_refresh_intervals()?
+        } else {
+            Vec::new()
+        };
+        let mut depends_on = Vec::new();
+        if self.match_identifier("DEPENDS") {
+            self.expect(TokenType::On)?;
+            loop {
+                depends_on.push(self.parse_table_ref()?);
+                if !self.match_token(TokenType::Comma) {
+                    break;
+                }
+            }
+        }
+        let settings = if self.match_token(TokenType::Settings) {
+            self.parse_expression_list()?
+        } else {
+            Vec::new()
+        };
+        let append = self.match_identifier("APPEND");
+        Ok(ClickHouseRefresh {
+            schedule,
+            intervals,
+            offset,
+            randomize,
+            depends_on,
+            settings,
+            append,
+        })
     }
 
     /// parse_refresh_trigger_property - Doris REFRESH clause for materialized views
@@ -61554,6 +63811,7 @@ impl Parser {
         };
 
         Ok(RefreshTriggerProperty {
+            clickhouse: None,
             method,
             kind,
             every,
@@ -62531,11 +64789,13 @@ impl Parser {
         if self.check(TokenType::Colon) || self.check(TokenType::RBracket) {
             return Ok(None);
         }
-        // Handle special case: -: means -1 (from the end)
-        // This is used in slicing like [:-:-1] where the first -: means end=-1
+        // DuckDB's -: spelling omits the bound when a step follows. It is
+        // distinct from -1, particularly with negative steps.
         if self.check(TokenType::Dash) && self.check_next(TokenType::Colon) {
-            self.skip(); // consume dash
-                         // Don't consume the colon - let the caller handle it
+            self.skip(); // consume dash, leaving the colon for the caller
+            if self.config.dialect == Some(crate::dialects::DialectType::DuckDB) {
+                return Ok(None);
+            }
             return Ok(Some(Expression::Neg(Box::new(UnaryOp::new(
                 Expression::Literal(Box::new(Literal::Number("1".to_string()))),
             )))));
@@ -62892,7 +65152,11 @@ impl Parser {
         if self.match_text_seq(&["COLUMNS"]) && self.check(TokenType::LParen) {
             // Parse the COLUMNS function arguments
             self.expect(TokenType::LParen)?;
-            let this = self.parse_expression()?;
+            let this = if let Some(lambda) = self.parse_function_lambda()? {
+                lambda
+            } else {
+                self.parse_expression()?
+            };
             self.expect(TokenType::RParen)?;
 
             // Return a Columns expression with unpack=true (since it came from * COLUMNS())
@@ -63581,18 +65845,67 @@ impl Parser {
     /// parse_table_hints - Ported from Python _parse_table_hints
     /// Parses table hints (SQL Server WITH (...) or MySQL USE/IGNORE/FORCE INDEX)
     #[allow(unused_variables, unused_mut)]
+    fn is_tsql_legacy_table_hint(&self) -> bool {
+        matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::TSQL | crate::dialects::DialectType::Fabric)
+        ) && self.check(TokenType::LParen)
+            && self.tokens.get(self.current + 1).is_some_and(|token| {
+                matches!(
+                    token
+                        .text(self.source.as_deref().unwrap_or_default())
+                        .to_ascii_uppercase()
+                        .as_str(),
+                    "NOLOCK"
+                        | "READUNCOMMITTED"
+                        | "UPDLOCK"
+                        | "REPEATABLEREAD"
+                        | "SERIALIZABLE"
+                        | "READCOMMITTED"
+                        | "TABLOCK"
+                        | "TABLOCKX"
+                        | "PAGLOCK"
+                        | "ROWLOCK"
+                        | "NOWAIT"
+                        | "READPAST"
+                        | "XLOCK"
+                        | "SNAPSHOT"
+                        | "NOEXPAND"
+                        | "HOLDLOCK"
+                )
+            })
+    }
+
+    fn parse_tsql_target_hints(&mut self, table: &mut TableRef) -> Result<()> {
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::TSQL | crate::dialects::DialectType::Fabric)
+        ) && ((self.check(TokenType::With) && self.check_next(TokenType::LParen))
+            || self.is_tsql_legacy_table_hint())
+        {
+            if let Some(Expression::Tuple(hints)) = self.parse_table_hints()? {
+                table.hints.extend(hints.expressions);
+            }
+        }
+        Ok(())
+    }
+
     pub fn parse_table_hints(&mut self) -> Result<Option<Expression>> {
         let mut hints = Vec::new();
 
         // SQL Server style: WITH (hint1, hint2, ...)
-        if self.match_text_seq(&["WITH"]) && self.match_token(TokenType::LParen) {
+        if (self.is_tsql_legacy_table_hint() || self.match_text_seq(&["WITH"]))
+            && self.match_token(TokenType::LParen)
+        {
             let mut expressions = Vec::new();
             loop {
                 // Parse function or variable as hint
                 if let Some(func) = self.parse_function()? {
                     expressions.push(func);
-                } else if let Some(var) = self.parse_var()? {
-                    expressions.push(var);
+                } else if self.is_identifier_token() {
+                    let mut id = self.expect_identifier_with_quoted()?;
+                    id.trailing_comments = self.previous_trailing_comments().to_vec();
+                    expressions.push(Expression::Identifier(id));
                 } else {
                     break;
                 }
@@ -63948,6 +66261,7 @@ impl Parser {
             table_sample: None,
             hints: Vec::new(),
             system_time: None,
+            subpartition: false,
             partitions: Vec::new(),
             identifier_func: None,
             changes: None,
@@ -64758,7 +67072,9 @@ impl Parser {
         if token.token_type == TokenType::Identifier || token.token_type == TokenType::Var {
             self.skip();
             return Ok(Some(Expression::Var(Box::new(Var {
-                this: token.text.to_ascii_uppercase(),
+                this: token
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .to_ascii_uppercase(),
             }))));
         }
 
@@ -64805,6 +67121,87 @@ impl Parser {
         }
 
         Ok(Some(Expression::Tuple(Box::new(Tuple { expressions }))))
+    }
+
+    /// at_oracle_flashback - whether an Oracle flashback clause starts here.
+    ///
+    /// Consumes nothing, so a caller can decide whether the clause is allowed
+    /// where it appears before committing to parsing it.
+    fn at_oracle_flashback(&self) -> bool {
+        self.oracle_flashback_kind().is_some()
+    }
+
+    /// oracle_flashback_kind - the keyword after `AS OF`, when this really is
+    /// a flashback clause on the Oracle dialect.
+    ///
+    /// Returns None without consuming anything otherwise, so a plain
+    /// `AS alias` still reaches the alias parser: an `AS` followed by anything
+    /// other than `SCN` or `TIMESTAMP` is an alias, which is what keeps
+    /// `FROM t AS OFFICE` working.
+    fn oracle_flashback_kind(&self) -> Option<&'static str> {
+        if !matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::Oracle)
+        ) {
+            return None;
+        }
+        if !self.check(TokenType::As) || !self.check_next(TokenType::Of) {
+            return None;
+        }
+        match self
+            .peek_nth(2)
+            .map(|token| {
+                token
+                    .text(self.source.as_deref().unwrap_or_default())
+                    .to_ascii_uppercase()
+            })
+            .as_deref()
+        {
+            Some("SCN") => Some("SCN"),
+            Some("TIMESTAMP") => Some("TIMESTAMP"),
+            _ => None,
+        }
+    }
+
+    /// parse_oracle_flashback - Oracle `AS OF SCN` / `AS OF TIMESTAMP`.
+    ///
+    /// Oracle's flashback query reads a table as of an earlier point in time,
+    /// named either by a system change number or by a timestamp:
+    ///
+    /// ```sql
+    /// SELECT * FROM orders AS OF SCN 12345
+    /// SELECT * FROM orders AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '1' HOUR
+    /// ```
+    ///
+    /// Returns None without consuming anything unless the clause is really
+    /// there, so a plain `AS alias` still reaches the alias parser.
+    ///
+    /// `VERSIONS BETWEEN ...`, Oracle's other flashback form, is not handled
+    /// here: it returns version pseudo-columns and so is a larger feature
+    /// than a clause on a table reference.
+    fn parse_oracle_flashback(&mut self) -> Result<Option<Version>> {
+        let Some(kind) = self.oracle_flashback_kind() else {
+            return Ok(None);
+        };
+
+        self.skip(); // AS
+        self.skip(); // OF
+        self.skip(); // SCN | TIMESTAMP
+
+        let expression = self.parse_bitwise()?.ok_or_else(|| {
+            self.parse_error(format!(
+                "Expected an expression after Oracle AS OF {}",
+                kind
+            ))
+        })?;
+
+        Ok(Some(Version {
+            this: Box::new(Expression::Var(Box::new(Var {
+                this: kind.to_string(),
+            }))),
+            kind: "AS OF".to_string(),
+            expression: Some(Box::new(expression)),
+        }))
     }
 
     /// parse_version - Implemented from Python _parse_version
@@ -65307,7 +67704,7 @@ impl Parser {
             || self.check(TokenType::Var)
             || self
                 .peek()
-                .text
+                .text(self.source.as_deref().unwrap_or_default())
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
@@ -66032,9 +68429,18 @@ impl Parser {
             for i in 0..self.current {
                 if self.tokens[i].span.start >= start_pos && self.tokens[i].span.end <= end_pos {
                     if self.tokens[i].token_type == TokenType::String {
-                        parts.push(format!("'{}'", self.tokens[i].text.replace('\'', "''")));
+                        parts.push(format!(
+                            "'{}'",
+                            self.tokens[i]
+                                .text(self.source.as_deref().unwrap_or_default())
+                                .replace('\'', "''")
+                        ));
                     } else {
-                        parts.push(self.tokens[i].text.to_string());
+                        parts.push(
+                            self.tokens[i]
+                                .text(self.source.as_deref().unwrap_or_default())
+                                .to_string(),
+                        );
                     }
                     if i + 1 < self.current {
                         parts.push(" ".to_string());
@@ -67407,6 +69813,228 @@ mod tests {
     }
 
     #[test]
+    fn test_sqlite_concat_precedence() {
+        use crate::DialectType;
+        use Expression::{Add, BitwiseAnd, Concat, Div, Mod, Mul, Sub};
+
+        fn binary(
+            kind: fn(Box<BinaryOp>) -> Expression,
+            l: Expression,
+            r: Expression,
+        ) -> Expression {
+            kind(Box::new(BinaryOp::new(l, r)))
+        }
+        let n = Expression::number;
+        let cases = [
+            ("1 || 2 * 3", binary(Mul, binary(Concat, n(1), n(2)), n(3))),
+            ("1 * 2 || 3", binary(Mul, n(1), binary(Concat, n(2), n(3)))),
+            ("1 + 2 || 3", binary(Add, n(1), binary(Concat, n(2), n(3)))),
+            ("1 || 2 + 3", binary(Add, binary(Concat, n(1), n(2)), n(3))),
+            ("1 - 2 || 3", binary(Sub, n(1), binary(Concat, n(2), n(3)))),
+            (
+                "12 || 3 / 3",
+                binary(Div, binary(Concat, n(12), n(3)), n(3)),
+            ),
+            ("1 || 2 % 5", binary(Mod, binary(Concat, n(1), n(2)), n(5))),
+            (
+                "1 || 2 & 4",
+                binary(BitwiseAnd, binary(Concat, n(1), n(2)), n(4)),
+            ),
+            (
+                "1 || 2 || 3 * 4",
+                binary(Mul, binary(Concat, binary(Concat, n(1), n(2)), n(3)), n(4)),
+            ),
+            (
+                "-1 || 2 * 3",
+                binary(
+                    Mul,
+                    binary(Concat, Expression::Neg(Box::new(UnaryOp::new(n(1)))), n(2)),
+                    n(3),
+                ),
+            ),
+        ];
+        for (sql, expected) in cases {
+            let parsed = crate::parse_one(&format!("SELECT {sql}"), DialectType::SQLite).unwrap();
+            assert_eq!(
+                parsed.as_select().unwrap().expressions[0],
+                expected,
+                "{sql}"
+            );
+        }
+
+        let parsed =
+            crate::parse_one("SELECT 1 || 2 COLLATE NOCASE * 3", DialectType::SQLite).unwrap();
+        let Expression::Mul(mul) = &parsed.as_select().unwrap().expressions[0] else {
+            panic!("expected multiplication")
+        };
+        let Expression::Concat(concat) = &mul.left else {
+            panic!("expected concatenation")
+        };
+        assert!(matches!(&concat.right, Expression::Collation(c) if c.this == n(2)));
+
+        // Dialects with lower-precedence concatenation retain their parsing.
+        for dialect in [DialectType::PostgreSQL, DialectType::DuckDB] {
+            let parsed = crate::parse_one("SELECT 1 || 2 * 3", dialect).unwrap();
+            assert_eq!(
+                parsed.as_select().unwrap().expressions[0],
+                binary(Concat, n(1), binary(Mul, n(2), n(3)))
+            );
+        }
+    }
+
+    #[test]
+    fn test_sqlite_concat_json_precedence() {
+        use crate::DialectType;
+        for sql in [
+            "SELECT '[' || 1 || ']' ->> 0",
+            "SELECT '[' || 1 || ']' -> 0 ->> 0",
+        ] {
+            let parsed = crate::parse_one(sql, DialectType::SQLite).unwrap();
+            let Expression::JsonExtractScalar(extract) =
+                &parsed.as_select().unwrap().expressions[0]
+            else {
+                panic!("expected JSON extraction: {sql}")
+            };
+            let document = if let Expression::JsonExtract(inner) = &extract.this {
+                &inner.this
+            } else {
+                &extract.this
+            };
+            assert!(matches!(document, Expression::Concat(_)), "{sql}");
+            assert_eq!(extract.path, Expression::number(0));
+        }
+        for sql in [
+            "SELECT j -> i || 'x'",
+            "SELECT (j) -> i || 'x'",
+            "SELECT '[1]' ->> 0 || 'x'",
+        ] {
+            let parsed = crate::parse_one(sql, DialectType::SQLite).unwrap();
+            let Expression::Concat(concat) = &parsed.as_select().unwrap().expressions[0] else {
+                panic!("expected concatenation: {sql}")
+            };
+            assert!(
+                matches!(
+                    &concat.left,
+                    Expression::JsonExtract(_) | Expression::JsonExtractScalar(_)
+                ),
+                "{sql}"
+            );
+        }
+        let parsed =
+            crate::parse_one("SELECT ('[' || 1 || ']') -> 0", DialectType::SQLite).unwrap();
+        assert!(
+            matches!(&parsed.as_select().unwrap().expressions[0], Expression::JsonExtract(f) if matches!(&f.this, Expression::Paren(_)))
+        );
+        let parsed = crate::parse_one("SELECT ABS(j -> i || 'x')", DialectType::SQLite).unwrap();
+        let Expression::Abs(abs) = &parsed.as_select().unwrap().expressions[0] else {
+            panic!("expected ABS");
+        };
+        assert!(
+            matches!(&abs.this, Expression::Concat(c) if matches!(&c.left, Expression::JsonExtract(_)))
+        );
+    }
+
+    #[test]
+    fn test_bitwise_precedence_sqlite_and_postgres() {
+        use crate::DialectType;
+        use Expression::{BitwiseAnd, BitwiseLeftShift, BitwiseOr, BitwiseRightShift};
+
+        fn binary(
+            kind: fn(Box<BinaryOp>) -> Expression,
+            left: Expression,
+            right: Expression,
+        ) -> Expression {
+            kind(Box::new(BinaryOp::new(left, right)))
+        }
+        let n = Expression::number;
+        let cases = [
+            (
+                "1 | 2 & 4",
+                binary(BitwiseAnd, binary(BitwiseOr, n(1), n(2)), n(4)),
+            ),
+            (
+                "1 | 2 << 1",
+                binary(BitwiseLeftShift, binary(BitwiseOr, n(1), n(2)), n(1)),
+            ),
+            (
+                "8 | 1 >> 1",
+                binary(BitwiseRightShift, binary(BitwiseOr, n(8), n(1)), n(1)),
+            ),
+            (
+                "8 & 3 << 1",
+                binary(BitwiseLeftShift, binary(BitwiseAnd, n(8), n(3)), n(1)),
+            ),
+            (
+                "8 >> 1 & 3",
+                binary(BitwiseAnd, binary(BitwiseRightShift, n(8), n(1)), n(3)),
+            ),
+            (
+                "1 | 2 & 4 << 1",
+                binary(
+                    BitwiseLeftShift,
+                    binary(BitwiseAnd, binary(BitwiseOr, n(1), n(2)), n(4)),
+                    n(1),
+                ),
+            ),
+            (
+                "1 + 2 | 4 * 3",
+                binary(
+                    BitwiseOr,
+                    binary(Expression::Add, n(1), n(2)),
+                    binary(Expression::Mul, n(4), n(3)),
+                ),
+            ),
+        ];
+        for dialect in [DialectType::SQLite, DialectType::PostgreSQL] {
+            for (sql, expected) in &cases {
+                let tokens = Tokenizer::default()
+                    .tokenize(&format!("SELECT {sql}"))
+                    .unwrap();
+                let result = Parser::with_config(
+                    tokens,
+                    ParserConfig {
+                        dialect: Some(dialect),
+                        ..Default::default()
+                    },
+                )
+                .parse()
+                .unwrap();
+                assert_eq!(
+                    &result[0].as_select().unwrap().expressions[0],
+                    expected,
+                    "{dialect:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bitwise_precedence_postgres_xor_and_power() {
+        let tokens = Tokenizer::default()
+            .tokenize("SELECT 1 | 2 # 3, 1 # 2 & 4, 1 | 2 ^ 3")
+            .unwrap();
+        let result = Parser::with_config(
+            tokens,
+            ParserConfig {
+                dialect: Some(crate::DialectType::PostgreSQL),
+                ..Default::default()
+            },
+        )
+        .parse()
+        .unwrap();
+        let expressions = &result[0].as_select().unwrap().expressions;
+        assert!(
+            matches!(&expressions[0], Expression::BitwiseXor(op) if matches!(&op.left, Expression::BitwiseOr(_)))
+        );
+        assert!(
+            matches!(&expressions[1], Expression::BitwiseAnd(op) if matches!(&op.left, Expression::BitwiseXor(_)))
+        );
+        assert!(
+            matches!(&expressions[2], Expression::BitwiseOr(op) if matches!(&op.right, Expression::Power(_)))
+        );
+    }
+
+    #[test]
     fn test_parse_function() {
         // COUNT(*) is now a typed Count expression
         let result = Parser::parse_sql("SELECT COUNT(*)").unwrap();
@@ -68579,6 +71207,54 @@ OPTIONS (
         } else {
             panic!("Expected Star expression");
         }
+    }
+
+    #[test]
+    fn test_star_modifiers_keep_quotes() {
+        for (dialect, sql) in [
+            (
+                crate::DialectType::Snowflake,
+                r#"SELECT * EXCLUDE ("Mixed", "a.b", o."payload", o.col) FROM t AS o"#,
+            ),
+            (
+                crate::DialectType::BigQuery,
+                "SELECT * EXCEPT (`Mixed`, o.col) FROM t AS o",
+            ),
+            (
+                crate::DialectType::DuckDB,
+                r#"SELECT * EXCLUDE ("Mixed") FROM t"#,
+            ),
+            (
+                crate::DialectType::ClickHouse,
+                "SELECT * EXCEPT ('^pay.*') FROM t",
+            ),
+            (
+                crate::DialectType::ClickHouse,
+                r#"SELECT * EXCEPT (payload, "Mixed") FROM t"#,
+            ),
+            (
+                crate::DialectType::Snowflake,
+                r#"SELECT * RENAME (a AS "Mixed", "B" AS c) FROM t"#,
+            ),
+            (
+                crate::DialectType::Snowflake,
+                r#"SELECT * REPLACE (a + 1 AS "A") FROM t"#,
+            ),
+        ] {
+            let ast = crate::parse_one(sql, dialect).unwrap();
+            assert_eq!(crate::generate(&ast, dialect).unwrap(), sql);
+        }
+
+        // A pattern without parentheses stays a pattern.
+        let ast = crate::parse_one(
+            "SELECT * EXCEPT '^pay.*' FROM t",
+            crate::DialectType::ClickHouse,
+        )
+        .unwrap();
+        let Expression::Star(star) = &ast.as_select().unwrap().expressions[0] else {
+            panic!("Expected Star expression");
+        };
+        assert!(star.has_except_pattern());
     }
 
     #[test]
@@ -70719,4 +73395,42 @@ mod explicit_eof_token_tests {
 /// FACTORIAL(x), produced by Vertica's `x!` and `!! x` operators.
 fn factorial(expr: Expression) -> Expression {
     Expression::Function(Box::new(Function::new("FACTORIAL".to_string(), vec![expr])))
+}
+
+// HiveDecimal stores no fractional trailing zeroes; a bare DECIMAL would default
+// to scale zero and truncate a BD literal with a fractional value.
+fn decimal_literal_type(text: &str) -> Result<DataType> {
+    let (mantissa, exponent) = text.split_once(['e', 'E']).unwrap_or((text, "0"));
+    let exponent: i32 = exponent
+        .parse()
+        .map_err(|_| Error::unsupported("Decimal literal exponent", "parser"))?;
+    let unsigned = mantissa.trim_start_matches(['+', '-']);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let digits = format!("{whole}{fraction}");
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return Ok(DataType::Decimal {
+            precision: Some(1),
+            scale: Some(0),
+        });
+    }
+    let mut scale = (fraction.len() as i64)
+        .checked_sub(i64::from(exponent))
+        .ok_or_else(|| Error::unsupported("Decimal literal exponent", "parser"))?;
+    let fractional_zeroes = significant.len() - significant.trim_end_matches('0').len();
+    let removed = fractional_zeroes.min(scale.max(0) as usize);
+    scale -= removed as i64;
+    let precision = ((significant.len() - removed) as i64 - scale.min(0))
+        .max(scale)
+        .max(1);
+    if precision > 38 {
+        return Err(Error::unsupported(
+            "Decimal literal precision exceeds 38",
+            "Hive",
+        ));
+    }
+    Ok(DataType::Decimal {
+        precision: Some(precision as u32),
+        scale: Some(scale.max(0) as u32),
+    })
 }

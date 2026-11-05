@@ -20,7 +20,6 @@ pub(super) enum Action {
     DollarParamConvert,
     AnyToExists,
     RespectNullsConvert,
-    MysqlNullsOrdering,
     BigQueryNullsOrdering,
     PipeConcatToConcat,
     PostgresPipeConcatToTsql,
@@ -691,57 +690,6 @@ pub(super) fn rewrite(
                 }
             }
 
-            Action::MysqlNullsOrdering => {
-                // MySQL doesn't support NULLS FIRST/LAST - strip or rewrite
-                if let Expression::Ordered(mut o) = e {
-                    let nulls_last = o.nulls_first == Some(false);
-                    let desc = o.desc;
-                    // MySQL default: ASC -> NULLS LAST, DESC -> NULLS FIRST
-                    // If requested ordering matches default, just strip NULLS clause
-                    let matches_default = if desc {
-                        // DESC default is NULLS FIRST, so nulls_first=true matches
-                        o.nulls_first == Some(true)
-                    } else {
-                        // ASC default is NULLS LAST, so nulls_first=false matches
-                        nulls_last
-                    };
-                    if matches_default {
-                        o.nulls_first = None;
-                        Ok(Expression::Ordered(o))
-                    } else {
-                        // Need CASE WHEN x IS NULL THEN 0/1 ELSE 0/1 END, x
-                        // For ASC NULLS FIRST: ORDER BY CASE WHEN x IS NULL THEN 0 ELSE 1 END, x ASC
-                        // For DESC NULLS LAST: ORDER BY CASE WHEN x IS NULL THEN 1 ELSE 0 END, x DESC
-                        let null_val = if desc { 1 } else { 0 };
-                        let non_null_val = if desc { 0 } else { 1 };
-                        let _case_expr = Expression::Case(Box::new(Case {
-                            operand: None,
-                            whens: vec![(
-                                Expression::IsNull(Box::new(crate::expressions::IsNull {
-                                    this: o.this.clone(),
-                                    not: false,
-                                    postfix_form: false,
-                                })),
-                                Expression::number(null_val),
-                            )],
-                            else_: Some(Expression::number(non_null_val)),
-                            comments: Vec::new(),
-                            inferred_type: None,
-                        }));
-                        o.nulls_first = None;
-                        // Return a tuple of [case_expr, ordered_expr]
-                        // We need to return both as part of the ORDER BY
-                        // But since transform_recursive processes individual expressions,
-                        // we can't easily add extra ORDER BY items here.
-                        // Instead, strip the nulls_first
-                        o.nulls_first = None;
-                        Ok(Expression::Ordered(o))
-                    }
-                } else {
-                    Ok(e)
-                }
-            }
-
             Action::BigQueryNullsOrdering => {
                 // BigQuery doesn't support NULLS FIRST/LAST in window function ORDER BY
                 if let Expression::WindowFunction(mut wf) = e {
@@ -1241,7 +1189,7 @@ pub(super) fn rewrite(
                         inferred_type: None,
                     }));
                     let condition = Expression::Eq(Box::new(BinaryOp::new(
-                        effective_pattern,
+                        pattern,
                         Expression::Literal(Box::new(Literal::String(String::new()))),
                     )));
                     Ok(Expression::Case(Box::new(Case {
@@ -1369,7 +1317,7 @@ pub(super) fn rewrite(
 
                     // WHEN pattern = '' THEN 0
                     let empty_pattern_check = Expression::Eq(Box::new(BinaryOp::new(
-                        effective_pattern.clone(),
+                        pattern.clone(),
                         Expression::Literal(Box::new(Literal::String(String::new()))),
                     )));
 

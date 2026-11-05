@@ -20,6 +20,9 @@ use crate::guard::{enforce_generate_ast, ComplexityGuardOptions};
 use crate::DialectType;
 use serde::{Deserialize, Serialize};
 
+mod pipes;
+mod routines;
+
 /// SQL code generator that converts an AST (`Expression`) back into a SQL string.
 ///
 /// The generator walks the expression tree and emits dialect-specific SQL text.
@@ -147,22 +150,65 @@ enum InfixOperator {
     Or,
     Xor,
     And,
+    Comparison,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseAnd,
+    BitwiseLeftShift,
+    BitwiseRightShift,
     Add,
     Sub,
     Mul,
     Div,
     Mod,
+    Concat,
+    JsonExtract,
 }
 
 impl InfixOperator {
-    fn precedence(self) -> u8 {
+    fn precedence(self, dialect: Option<DialectType>) -> u8 {
+        if self.is_bitwise() {
+            match dialect {
+                Some(DialectType::SQLite | DialectType::PostgreSQL | DialectType::DuckDB) => {
+                    return 5;
+                }
+                // TSQL's bitwise operators share the additive tier.
+                Some(DialectType::TSQL | DialectType::Fabric) => return 9,
+                // MySQL's XOR binds more tightly than multiplication.
+                Some(DialectType::MySQL) if self == Self::BitwiseXor => return 11,
+                _ => {}
+            }
+        }
         match self {
             Self::Or => 1,
             Self::Xor => 2,
             Self::And => 3,
-            Self::Add | Self::Sub => 4,
-            Self::Mul | Self::Div | Self::Mod => 5,
+            Self::Comparison => 4,
+            Self::BitwiseOr => 5,
+            Self::BitwiseXor => 6,
+            Self::BitwiseAnd => 7,
+            Self::BitwiseLeftShift | Self::BitwiseRightShift => 8,
+            Self::Add | Self::Sub => 9,
+            Self::Mul | Self::Div | Self::Mod => 10,
+            Self::Concat => match dialect {
+                Some(DialectType::SQLite) => 11,
+                Some(DialectType::PostgreSQL | DialectType::DuckDB) => 5,
+                _ => 9,
+            },
+            // Only SQLite arrows participate in this precedence table.
+            Self::JsonExtract => 11,
         }
+    }
+
+    fn is_bitwise(self) -> bool {
+        matches!(
+            self,
+            Self::BitwiseOr
+                | Self::BitwiseXor
+                | Self::BitwiseAnd
+                | Self::BitwiseLeftShift
+                | Self::BitwiseRightShift
+        )
     }
 
     fn is_arithmetic(self) -> bool {
@@ -1136,6 +1182,12 @@ mod reserved_keywords {
     pub static DORIS_RESERVED: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         let mut set = MYSQL_RESERVED.clone();
         set.extend([
+            "match_any",
+            "match_all",
+            "match_phrase",
+            "match_phrase_prefix",
+            "match_phrase_edge",
+            "match_regexp",
             "aggregate",
             "anti",
             "array",
@@ -1303,6 +1355,8 @@ mod reserved_keywords {
         set.remove("default");
         set.remove("interval");
         set.remove("match");
+        set.remove("if");
+        set.remove("view");
         set.remove("offset");
         set.remove("table");
         set
@@ -2409,7 +2463,8 @@ impl Generator {
         match self.config.dialect {
             Some(DialectType::BigQuery) => reserved_keywords::BIGQUERY_RESERVED.contains(lower_ref),
             Some(DialectType::MySQL) | Some(DialectType::TiDB) => {
-                reserved_keywords::MYSQL_RESERVED.contains(lower_ref)
+                !matches!(lower_ref, "view" | "any")
+                    && reserved_keywords::MYSQL_RESERVED.contains(lower_ref)
             }
             Some(DialectType::Doris) => reserved_keywords::DORIS_RESERVED.contains(lower_ref),
             Some(DialectType::SingleStore) => {
@@ -2442,9 +2497,13 @@ impl Generator {
             | Some(DialectType::Hive)
             | Some(DialectType::Solr) => false,
             Some(DialectType::Presto) | Some(DialectType::Trino) | Some(DialectType::Athena) => {
-                reserved_keywords::PRESTO_TRINO_RESERVED.contains(lower_ref)
+                !(self.config.dialect == Some(DialectType::Trino)
+                    && matches!(lower_ref, "function" | "current" | "set"))
+                    && reserved_keywords::PRESTO_TRINO_RESERVED.contains(lower_ref)
             }
-            Some(DialectType::SQLite) => reserved_keywords::SQLITE_RESERVED.contains(lower_ref),
+            Some(DialectType::SQLite) => {
+                lower_ref != "key" && reserved_keywords::SQLITE_RESERVED.contains(lower_ref)
+            }
             // For Generic dialect or None, don't add extra quoting to preserve identity
             Some(DialectType::Generic) | None => false,
             // For other dialects, use standard SQL reserved keywords
@@ -3254,7 +3313,7 @@ impl Generator {
                     // DuckDB: ARRAY_COMPACT(arr) -> LIST_FILTER(arr, _u -> NOT _u IS NULL)
                     self.write("LIST_FILTER(");
                     self.generate_expression(&f.this)?;
-                    self.write(", _u -> NOT _u IS NULL)");
+                    self.write(", LAMBDA _u : NOT _u IS NULL)");
                     Ok(())
                 } else {
                     self.generate_simple_func("ARRAY_COMPACT", &f.this)
@@ -3316,6 +3375,16 @@ impl Generator {
             Expression::JsonKeys(f) => self.generate_simple_func("JSON_KEYS", &f.this),
             Expression::JsonType(f) => self.generate_simple_func("JSON_TYPE", &f.this),
             Expression::ParseJson(f) => {
+                if self.config.dialect == Some(DialectType::BigQuery)
+                    && f.original_name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("JSON"))
+                    && matches!(f.this, Expression::Literal(_))
+                {
+                    self.write_keyword("JSON");
+                    self.write_space();
+                    return self.generate_expression(&f.this);
+                }
                 let name = match self.config.dialect {
                     Some(DialectType::Presto)
                     | Some(DialectType::Trino)
@@ -3400,7 +3469,7 @@ impl Generator {
                     self.write(")");
                     Ok(())
                 } else {
-                    self.generate_binary_op(op, "<<")
+                    self.generate_precedence_binary_op(op, "<<", InfixOperator::BitwiseLeftShift)
                 }
             }
             Expression::BitwiseRightShift(op) => {
@@ -3427,7 +3496,7 @@ impl Generator {
                     self.write(")");
                     Ok(())
                 } else {
-                    self.generate_binary_op(op, ">>")
+                    self.generate_precedence_binary_op(op, ">>", InfixOperator::BitwiseRightShift)
                 }
             }
             Expression::BitwiseAndAgg(f) => self.generate_agg_func("BIT_AND", f),
@@ -3517,15 +3586,46 @@ impl Generator {
                     self.generate_precedence_binary_op(op, "%", InfixOperator::Mod)
                 }
             }
-            Expression::Eq(op) => self.generate_binary_op(op, "="),
-            Expression::Neq(op) => self.generate_binary_op(op, "<>"),
-            Expression::Lt(op) => self.generate_binary_op(op, "<"),
-            Expression::Lte(op) => self.generate_binary_op(op, "<="),
-            Expression::Gt(op) => self.generate_binary_op(op, ">"),
-            Expression::Gte(op) => self.generate_binary_op(op, ">="),
+            Expression::Eq(op) => {
+                self.generate_precedence_binary_op(op, "=", InfixOperator::Comparison)
+            }
+            Expression::Neq(op) => {
+                self.generate_precedence_binary_op(op, "<>", InfixOperator::Comparison)
+            }
+            Expression::Lt(op) => {
+                self.generate_precedence_binary_op(op, "<", InfixOperator::Comparison)
+            }
+            Expression::Lte(op) => {
+                self.generate_precedence_binary_op(op, "<=", InfixOperator::Comparison)
+            }
+            Expression::Gt(op) => {
+                self.generate_precedence_binary_op(op, ">", InfixOperator::Comparison)
+            }
+            Expression::Gte(op) => {
+                self.generate_precedence_binary_op(op, ">=", InfixOperator::Comparison)
+            }
             Expression::Like(op) => self.generate_like_op(op, "LIKE"),
             Expression::ILike(op) => self.generate_like_op(op, "ILIKE"),
             Expression::Match(op) => self.generate_binary_op(op, "MATCH"),
+            Expression::WithFunction(query) => self.generate_inline_functions(query),
+            Expression::DorisMatch(predicate) => {
+                if !matches!(self.config.dialect, Some(DialectType::Doris) | None) {
+                    return Err(crate::error::Error::unsupported(
+                        "Doris full-text MATCH predicate",
+                        "target dialect",
+                    ));
+                }
+                self.generate_expression(&predicate.this)?;
+                self.write_space();
+                self.write_keyword(&predicate.kind);
+                self.write_space();
+                self.generate_expression(&predicate.expression)?;
+                if let Some(analyzer) = &predicate.analyzer {
+                    self.write_keyword(" USING ANALYZER ");
+                    self.generate_expression(analyzer)?;
+                }
+                Ok(())
+            }
             Expression::Concat(op) => {
                 // In Solr, || is OR, not string concatenation (DPIPE_IS_STRING_CONCAT = False)
                 if self.config.dialect == Some(DialectType::Solr) {
@@ -3533,7 +3633,7 @@ impl Generator {
                 } else if self.config.dialect == Some(DialectType::MySQL) {
                     self.generate_mysql_concat_from_concat(op)
                 } else {
-                    self.generate_binary_op(op, "||")
+                    self.generate_precedence_binary_op(op, "||", InfixOperator::Concat)
                 }
             }
             Expression::BitwiseAnd(op) => {
@@ -3550,7 +3650,7 @@ impl Generator {
                     self.write(")");
                     Ok(())
                 } else {
-                    self.generate_binary_op(op, "&")
+                    self.generate_precedence_binary_op(op, "&", InfixOperator::BitwiseAnd)
                 }
             }
             Expression::BitwiseOr(op) => {
@@ -3567,7 +3667,7 @@ impl Generator {
                     self.write(")");
                     Ok(())
                 } else {
-                    self.generate_binary_op(op, "|")
+                    self.generate_precedence_binary_op(op, "|", InfixOperator::BitwiseOr)
                 }
             }
             Expression::BitwiseXor(op) => {
@@ -3584,9 +3684,9 @@ impl Generator {
                     self.write(")");
                     Ok(())
                 } else if matches!(self.config.dialect, Some(DialectType::PostgreSQL)) {
-                    self.generate_binary_op(op, "#")
+                    self.generate_precedence_binary_op(op, "#", InfixOperator::BitwiseXor)
                 } else {
-                    self.generate_binary_op(op, "^")
+                    self.generate_precedence_binary_op(op, "^", InfixOperator::BitwiseXor)
                 }
             }
             Expression::Adjacent(op) => self.generate_binary_op(op, "-|-"),
@@ -3670,6 +3770,30 @@ impl Generator {
             Expression::Array(arr) => self.generate_array(arr),
             Expression::Tuple(tuple) => self.generate_tuple(tuple),
             Expression::PipeOperator(pipe) => self.generate_pipe_operator(pipe),
+            Expression::MultiInsert(query) => self.generate_multi_insert(query),
+            Expression::PipeQuery(query) => self.generate_pipe_query(query),
+            Expression::StreamSource(source) => {
+                if self.config.dialect != Some(DialectType::ClickHouse) {
+                    return Err(crate::error::Error::unsupported(
+                        "STREAM table source",
+                        "target dialect",
+                    ));
+                }
+                self.generate_expression(&source.this)?;
+                self.write_keyword(" STREAM");
+                if source.bounded {
+                    self.write_keyword(" BOUNDED");
+                }
+                if let (Some(column), Some(value)) =
+                    (&source.watermark, &source.watermark_expression)
+                {
+                    self.write_keyword(" WATERMARK FOR ");
+                    self.generate_expression(column)?;
+                    self.write_keyword(" AS ");
+                    self.generate_expression(value)?;
+                }
+                Ok(())
+            }
             Expression::Ordered(ordered) => self.generate_ordered(ordered),
             Expression::DataType(dt) => self.generate_data_type(dt),
             Expression::Raw(raw) => {
@@ -4083,6 +4207,7 @@ impl Generator {
             Expression::Lateral(e) => self.generate_lateral(e),
             Expression::LikeProperty(e) => self.generate_like_property(e),
             Expression::Limit(e) => self.generate_limit(e),
+            Expression::LimitRange(e) => self.generate_limit_range(e),
             Expression::LimitOptions(e) => self.generate_limit_options(e),
             Expression::List(e) => self.generate_list(e),
             Expression::ToMap(e) => self.generate_tomap(e),
@@ -4326,6 +4451,35 @@ impl Generator {
             Expression::Uniform(e) => self.generate_uniform(e),
             Expression::UniqueColumnConstraint(e) => self.generate_unique_column_constraint(e),
             Expression::UniqueKeyProperty(e) => self.generate_unique_key_property(e),
+            Expression::AggregateKeyProperty(e) => self.generate_aggregate_key_property(e),
+            Expression::Per(e) => {
+                if !matches!(self.config.dialect, None | Some(DialectType::Generic)) {
+                    return Err(crate::error::Error::unsupported(
+                        "Semantic PER",
+                        "target dialect",
+                    ));
+                }
+                self.generate_expression(&e.left)?;
+                self.write(" PER ");
+                self.generate_expression(&e.right)
+            }
+            Expression::PartitionByExcluding(e) => {
+                if !matches!(self.config.dialect, None | Some(DialectType::Generic)) {
+                    return Err(crate::error::Error::unsupported(
+                        "PARTITION BY EXCLUDING",
+                        "target dialect",
+                    ));
+                }
+                self.write("EXCLUDING ");
+                for (i, expr) in e.expressions.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.generate_expression(expr)?;
+                }
+                Ok(())
+            }
+            Expression::OracleTableProperty(e) => self.generate_oracle_table_property(e),
             Expression::RollupProperty(e) => self.generate_rollup_property(e),
             Expression::UnixToStr(e) => self.generate_unix_to_str(e),
             Expression::UnixToTime(e) => self.generate_unix_to_time(e),
@@ -4397,7 +4551,7 @@ impl Generator {
     fn should_handle_tsql_distinct_null_ordering(&self, select: &Select) -> bool {
         matches!(
             self.config.dialect,
-            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+            Some(DialectType::TSQL) | Some(DialectType::Fabric) | Some(DialectType::MySQL)
         ) && !self.config.null_ordering_supported
             && select.distinct
             && select.order_by.as_ref().is_some_and(|order_by| {
@@ -4648,7 +4802,7 @@ impl Generator {
     fn resolve_tsql_null_ordering_for_select(&self, select: &Select) -> Option<Select> {
         if !matches!(
             self.config.dialect,
-            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+            Some(DialectType::TSQL) | Some(DialectType::Fabric) | Some(DialectType::MySQL)
         ) || self.config.null_ordering_supported
         {
             return None;
@@ -4671,6 +4825,18 @@ impl Generator {
                             .or_else(|| {
                                 Self::resolve_single_subquery_star_projection(select, index)
                             })
+                    {
+                        if resolved != ordered.this {
+                            ordered.this = resolved;
+                            changed = true;
+                        }
+                    }
+                }
+
+                // MySQL cannot use a select-list alias inside every ordering expression.
+                if self.config.dialect == Some(DialectType::MySQL) {
+                    if let Some(resolved) =
+                        Self::resolve_distinct_order_projection(&select.expressions, &ordered.this)
                     {
                         if resolved != ordered.this {
                             ordered.this = resolved;
@@ -5643,6 +5809,24 @@ impl Generator {
                     regular_expressions.extend(cube_expressions);
                     regular_expressions.extend(rollup_expressions);
 
+                    // Spark/Hive allow grouping operators interleaved with ordinary
+                    // keys. Keep their order, including GROUPING_ID's key order.
+                    if matches!(
+                        self.config.dialect,
+                        Some(DialectType::Spark | DialectType::Hive | DialectType::Databricks)
+                    ) {
+                        regular_expressions = group_by
+                            .expressions
+                            .iter()
+                            .filter(|expr| {
+                                !matches!(expr,
+                            Expression::Cube(c) if c.expressions.is_empty())
+                                    && !matches!(expr,
+                            Expression::Rollup(r) if r.expressions.is_empty())
+                            })
+                            .collect();
+                    }
+
                     if self.config.pretty {
                         self.write_newline();
                         self.indent_level += 1;
@@ -5652,7 +5836,13 @@ impl Generator {
                     }
 
                     for (i, expr) in regular_expressions.iter().enumerate() {
-                        if i > 0 {
+                        if i > 0
+                            && self.config.dialect == Some(DialectType::Hive)
+                            && (matches!(expr, Expression::GroupingSets(_))
+                                || matches!(expr, Expression::Function(f) if f.name == "GROUPING SETS"))
+                        {
+                            self.write_space();
+                        } else if i > 0 {
                             if self.config.pretty {
                                 self.write(",");
                                 self.write_newline();
@@ -5729,6 +5919,23 @@ impl Generator {
             .and_then(|v| v.match_clause.as_ref())
         {
             self.generate_vertica_match(clause)?;
+        }
+
+        let early_sample = self.config.dialect == Some(DialectType::DuckDB)
+            && select.sample.as_ref().is_some_and(|s| s.is_using_sample);
+        if early_sample {
+            if self.config.pretty {
+                self.write_newline();
+            } else {
+                self.write_space();
+            }
+            self.write_keyword("USING SAMPLE");
+            self.generate_sample_body(select.sample.as_ref().unwrap())?;
+            if let Some(seed) = &select.sample.as_ref().unwrap().seed {
+                self.write_keyword(" REPEATABLE (");
+                self.generate_expression(seed)?;
+                self.write(")");
+            }
         }
 
         // DISTRIBUTE BY (Hive/Spark)
@@ -5812,10 +6019,6 @@ impl Generator {
                 self.write_keyword("OFFSET");
                 self.write_space();
                 self.write_limit_expr(&offset.this)?;
-                if offset.rows == Some(true) {
-                    self.write_space();
-                    self.write_keyword("ROWS");
-                }
             }
             if let Some(limit) = &select.limit {
                 if self.config.pretty {
@@ -5961,7 +6164,11 @@ impl Generator {
                     self.write_limit_expr(&offset.this)?;
                     // Output ROWS keyword if it was in the original SQL; the
                     // ANSI row-limiting clause requires it.
-                    if offset.rows == Some(true) || self.uses_fetch_first_limit() {
+                    if offset.rows == Some(true)
+                        || self.uses_fetch_first_limit()
+                        || (self.config.dialect == Some(DialectType::ClickHouse)
+                            && select.fetch.is_some())
+                    {
                         self.write_space();
                         self.write_keyword("ROWS");
                     }
@@ -6057,12 +6264,16 @@ impl Generator {
                     self.write_keyword("OFFSET 0 ROWS");
                     self.write_space();
                 }
-                self.generate_fetch(fetch)?;
+                if select.limit.is_some() && self.config.dialect == Some(DialectType::ClickHouse) {
+                    self.generate_fetch_clause(fetch)?;
+                } else {
+                    self.generate_fetch(fetch)?;
+                }
             }
         }
 
         // SAMPLE / TABLESAMPLE
-        if let Some(sample) = &select.sample {
+        if let Some(sample) = select.sample.as_ref().filter(|_| !early_sample) {
             use crate::dialects::DialectType;
             if self.config.pretty {
                 self.write_newline();
@@ -6502,6 +6713,14 @@ impl Generator {
     }
 
     fn generate_join(&mut self, join: &Join) -> Result<()> {
+        if (join.nearest.is_some() || matches!(join.kind, JoinKind::Mark | JoinKind::Single))
+            && !matches!(self.config.dialect, None | Some(DialectType::DuckDB))
+        {
+            return Err(crate::error::Error::unsupported(
+                "DuckDB nearest and internal joins",
+                "target dialect",
+            ));
+        }
         // Implicit (comma) joins: output as ", table" instead of "CROSS JOIN table"
         if join.kind == JoinKind::Implicit {
             self.write(",");
@@ -6966,6 +7185,8 @@ impl Generator {
                 JoinKind::LeftArray => self.write_keyword("LEFT ARRAY JOIN"),
                 JoinKind::Paste => self.write_keyword("PASTE JOIN"),
                 JoinKind::Positional => self.write_keyword("POSITIONAL JOIN"),
+                JoinKind::Mark => self.write_keyword("JOIN BY (TYPE MARK)"),
+                JoinKind::Single => self.write_keyword("JOIN BY (TYPE SINGLE)"),
             }
         }
 
@@ -6990,6 +7211,21 @@ impl Generator {
         } else {
             self.write_space();
             self.generate_expression(&join.this)?;
+        }
+
+        if let Some(nearest) = &join.nearest {
+            self.write_space();
+            if nearest.approximate {
+                self.write_keyword("APPROX ");
+            }
+            self.write_keyword("NEAREST ");
+            self.generate_expression(&nearest.count)?;
+            self.write_keyword(if nearest.similarity {
+                " BY SIMILARITY "
+            } else {
+                " BY DISTANCE "
+            });
+            self.generate_expression(&nearest.metric)?;
         }
 
         // Only output MATCH_CONDITION/ON/USING inline if the condition wasn't deferred
@@ -7539,7 +7775,9 @@ impl Generator {
         limit: &Option<Box<Expression>>,
         offset: &Option<Box<Expression>>,
     ) -> bool {
-        let has_row_limit = limit.is_some() || offset.is_some();
+        // OFFSET/FETCH is legal on the set operation itself in SQL Server.
+        // Wrapping it hides qualified output names and rejects duplicate columns.
+        let has_row_limit = limit.is_some() && offset.is_none();
         let has_emulated_null_ordering = order_by.as_ref().map_or(false, |order_by| {
             order_by
                 .expressions
@@ -7649,7 +7887,73 @@ impl Generator {
         }
     }
 
+    fn generate_multi_insert(&mut self, query: &MultiInsert) -> Result<()> {
+        if !matches!(
+            self.config.dialect,
+            Some(DialectType::Hive | DialectType::Spark | DialectType::Databricks)
+        ) {
+            return Err(crate::error::Error::unsupported(
+                "multiple inserts sharing a source",
+                "target dialect",
+            ));
+        }
+        for comment in &query.leading_comments {
+            self.write_formatted_comment(comment);
+            self.write_space();
+        }
+        if let Some(with) = &query.with {
+            self.generate_with(with)?;
+            self.write_space();
+        }
+        self.generate_from(&query.from)?;
+        self.generate_joins_with_nesting(&query.joins)?;
+        for (i, lateral) in query.lateral_views.iter().enumerate() {
+            self.generate_lateral_view(lateral, i)?;
+        }
+        for branch in &query.branches {
+            self.write_row_limit_separator();
+            self.generate_expression(branch)?;
+        }
+        Ok(())
+    }
+
+    fn final_set_select_mut(expression: &mut Expression) -> Option<&mut Select> {
+        match expression {
+            Expression::Select(s) => Some(s),
+            Expression::Union(u) => Self::final_set_select_mut(&mut u.right),
+            Expression::Intersect(i) => Self::final_set_select_mut(&mut i.right),
+            Expression::Except(e) => Self::final_set_select_mut(&mut e.right),
+            _ => None,
+        }
+    }
+
     fn generate_union(&mut self, outermost: &Union) -> Result<()> {
+        if self.config.dialect == Some(DialectType::ClickHouse)
+            && matches!(outermost.right, Expression::Intersect(_))
+        {
+            let mut inner = outermost.clone();
+            if let Some(last) = Self::final_set_select_mut(&mut inner.right) {
+                let settings = last.settings.take();
+                let format = last.format.take();
+                if settings.is_some() || format.is_some() {
+                    self.generate_union(&inner)?;
+                    if let Some(settings) = settings {
+                        self.write(" SETTINGS ");
+                        for (i, setting) in settings.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.generate_expression(setting)?;
+                        }
+                    }
+                    if let Some(format) = format {
+                        self.write(" FORMAT ");
+                        self.generate_expression(&format)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
         if self.config.dialect == Some(DialectType::Vertica)
             && outermost
                 .order_by
@@ -7700,7 +8004,7 @@ impl Generator {
         }
 
         // Generate the base (leftmost) expression
-        self.generate_set_operand(leftmost)?;
+        self.generate_set_left_operand(leftmost)?;
 
         // Generate each union step from innermost to outermost
         for union in chain.iter().rev() {
@@ -7740,8 +8044,27 @@ impl Generator {
         // BigQuery: CORRESPONDING/STRICT CORRESPONDING -> BY NAME, BY (cols) -> ON (cols)
         // DuckDB/Snowflake: BY NAME
         if union.corresponding || union.by_name {
+            let native_corresponding =
+                union.corresponding && matches!(self.config.dialect, Some(DialectType::Trino));
+            if !native_corresponding
+                && !matches!(
+                    self.config.dialect,
+                    None | Some(
+                        DialectType::Generic
+                            | DialectType::DuckDB
+                            | DialectType::Snowflake
+                            | DialectType::BigQuery
+                    )
+                )
+            {
+                self.unsupported("BY NAME/CORRESPONDING requires known, unambiguous output columns for positional lowering")?;
+            }
             self.write_space();
-            self.write_keyword("BY NAME");
+            self.write_keyword(if native_corresponding {
+                "CORRESPONDING"
+            } else {
+                "BY NAME"
+            });
         }
         if !union.on_columns.is_empty() {
             self.write_space();
@@ -7762,7 +8085,15 @@ impl Generator {
         } else {
             self.write_space();
         }
+        let wrap_intersect = self.config.dialect == Some(DialectType::ClickHouse)
+            && matches!(union.right, Expression::Intersect(_));
+        if wrap_intersect {
+            self.write("(");
+        }
         self.generate_set_operand(&union.right)?;
+        if wrap_intersect {
+            self.write(")");
+        }
         // ORDER BY, LIMIT, OFFSET for the set operation
         if let Some(order_by) = &union.order_by {
             if self.config.pretty {
@@ -7864,7 +8195,7 @@ impl Generator {
             self.write_space();
         }
 
-        self.generate_set_operand(leftmost)?;
+        self.generate_set_left_operand(leftmost)?;
 
         for intersect in chain.iter().rev() {
             self.generate_intersect_step(intersect)?;
@@ -7906,8 +8237,27 @@ impl Generator {
         // BigQuery: CORRESPONDING/STRICT CORRESPONDING -> BY NAME, BY (cols) -> ON (cols)
         // DuckDB/Snowflake: BY NAME
         if intersect.corresponding || intersect.by_name {
+            let native_corresponding =
+                intersect.corresponding && matches!(self.config.dialect, Some(DialectType::Trino));
+            if !native_corresponding
+                && !matches!(
+                    self.config.dialect,
+                    None | Some(
+                        DialectType::Generic
+                            | DialectType::DuckDB
+                            | DialectType::Snowflake
+                            | DialectType::BigQuery
+                    )
+                )
+            {
+                self.unsupported("BY NAME/CORRESPONDING requires known, unambiguous output columns for positional lowering")?;
+            }
             self.write_space();
-            self.write_keyword("BY NAME");
+            self.write_keyword(if native_corresponding {
+                "CORRESPONDING"
+            } else {
+                "BY NAME"
+            });
         }
         if !intersect.on_columns.is_empty() {
             self.write_space();
@@ -8029,7 +8379,7 @@ impl Generator {
             self.write_space();
         }
 
-        self.generate_set_operand(leftmost)?;
+        self.generate_set_left_operand(leftmost)?;
 
         for except in chain.iter().rev() {
             self.generate_except_step(except)?;
@@ -8105,8 +8455,27 @@ impl Generator {
         // BigQuery: CORRESPONDING/STRICT CORRESPONDING -> BY NAME, BY (cols) -> ON (cols)
         // DuckDB/Snowflake: BY NAME
         if except.corresponding || except.by_name {
+            let native_corresponding =
+                except.corresponding && matches!(self.config.dialect, Some(DialectType::Trino));
+            if !native_corresponding
+                && !matches!(
+                    self.config.dialect,
+                    None | Some(
+                        DialectType::Generic
+                            | DialectType::DuckDB
+                            | DialectType::Snowflake
+                            | DialectType::BigQuery
+                    )
+                )
+            {
+                self.unsupported("BY NAME/CORRESPONDING requires known, unambiguous output columns for positional lowering")?;
+            }
             self.write_space();
-            self.write_keyword("BY NAME");
+            self.write_keyword(if native_corresponding {
+                "CORRESPONDING"
+            } else {
+                "BY NAME"
+            });
         }
         if !except.on_columns.is_empty() {
             self.write_space();
@@ -8374,6 +8743,26 @@ impl Generator {
         }
 
         // Generate PARTITION clause if present
+        if !insert.replace_using.is_empty() {
+            if !matches!(
+                self.config.dialect,
+                None | Some(crate::dialects::DialectType::Databricks)
+            ) {
+                return Err(crate::error::Error::unsupported(
+                    "REPLACE USING",
+                    "target dialect",
+                ));
+            }
+            self.write_keyword(" REPLACE USING (");
+            for (i, column) in insert.replace_using.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.generate_identifier(column)?;
+            }
+            self.write(")");
+        }
+
         if !insert.partition.is_empty() {
             self.write_space();
             self.write_keyword("PARTITION");
@@ -8413,7 +8802,13 @@ impl Generator {
         }
 
         if !insert.columns.is_empty() {
-            if insert.alias.is_some() && insert.alias_explicit_as {
+            if insert.alias.is_some()
+                && insert.alias_explicit_as
+                && !matches!(
+                    self.config.dialect,
+                    Some(DialectType::PostgreSQL | DialectType::SQLite)
+                )
+            {
                 // No space when explicit AS alias is present: INSERT INTO table AS t(a, b, c)
                 self.write("(");
             } else {
@@ -8563,6 +8958,16 @@ impl Generator {
         }
         self.write_space();
         self.generate_table(&update.table)?;
+        if let Some(on_cluster) = &update.on_cluster {
+            if !matches!(self.config.dialect, Some(DialectType::ClickHouse) | None) {
+                return Err(crate::error::Error::unsupported(
+                    "UPDATE ON CLUSTER",
+                    "target dialect",
+                ));
+            }
+            self.write_space();
+            self.generate_on_cluster(on_cluster)?;
+        }
 
         let mysql_like_update_from = matches!(
             self.config.dialect,
@@ -8605,6 +9010,7 @@ impl Generator {
                         comments: Vec::new(),
                         nesting_group: 0,
                         directed: false,
+                        nearest: None,
                     });
                 }
             }
@@ -8653,6 +9059,15 @@ impl Generator {
         self.write_space();
         self.write_keyword("SET");
         self.write_space();
+
+        for (i, assignment) in update.assignments.iter().enumerate() {
+            if i > 0 {
+                self.write(", ");
+            }
+            self.generate_expression(&assignment.left)?;
+            self.write(" = ");
+            self.generate_expression(&assignment.right)?;
+        }
 
         for (i, (col, val)) in set_pairs.iter().enumerate() {
             if i > 0 {
@@ -9240,9 +9655,20 @@ impl Generator {
             Some(crate::dialects::DialectType::SQLite)
         ) {
             for constraint in &ct.constraints {
-                if let TableConstraint::PrimaryKey { columns, name, .. } = constraint {
+                if let TableConstraint::PrimaryKey {
+                    columns,
+                    key_parts,
+                    name,
+                    ..
+                } = constraint
+                {
                     // Only inline if: single column, no constraint name, and column exists in table
-                    if columns.len() == 1 && name.is_none() {
+                    if columns.len() == 1
+                        && name.is_none()
+                        && key_parts
+                            .iter()
+                            .all(|part| part.prefix_length.is_none() && !part.desc && !part.asc)
+                    {
                         let pk_col_name = columns[0].name.to_ascii_lowercase();
                         // Check if this column exists in the table
                         if ct
@@ -9832,6 +10258,10 @@ impl Generator {
     }
 
     fn generate_column_def(&mut self, col: &ColumnDef) -> Result<()> {
+        self.generate_column_def_inner(col, false)
+    }
+
+    fn generate_column_def_inner(&mut self, col: &ColumnDef, type_keyword: bool) -> Result<()> {
         // Check if this is a TSQL computed column (no data type)
         let has_computed_no_type = matches!(&col.data_type, DataType::Custom { name } if name.is_empty())
             && col
@@ -9855,7 +10285,16 @@ impl Generator {
             || (matches!(&col.data_type, DataType::Custom { name } if name.is_empty())
                 && col.constraints.is_empty());
 
-        self.generate_identifier(&col.name)?;
+        if col.name_path.is_empty() {
+            self.generate_identifier(&col.name)?;
+        } else {
+            for (i, part) in col.name_path.iter().enumerate() {
+                if i > 0 {
+                    self.write(".");
+                }
+                self.generate_identifier(part)?;
+            }
+        }
 
         // Check for SERIAL/BIGSERIAL/SMALLSERIAL expansion for Materialize and PostgreSQL
         let serial_expansion = if matches!(
@@ -9882,6 +10321,9 @@ impl Generator {
         if !has_computed_no_type && !omit_computed_type && !is_partition_column_spec && !has_no_type
         {
             self.write_space();
+            if type_keyword {
+                self.write("TYPE ");
+            }
             // ClickHouse CREATE TABLE column types: suppress automatic Nullable wrapping
             // since ClickHouse uses explicit Nullable() in its type system.
             let saved_nullable_depth = self.clickhouse_nullable_depth;
@@ -9911,6 +10353,11 @@ impl Generator {
             self.clickhouse_nullable_depth = saved_nullable_depth;
         }
 
+        if let Some(aggregation) = &col.aggregation {
+            self.write_space();
+            self.write_keyword(aggregation);
+        }
+
         // MySQL type modifiers (must come right after data type)
         // Skip UNSIGNED for DuckDB (already mapped to unsigned type above)
         if col.unsigned && !matches!(self.config.dialect, Some(DialectType::DuckDB)) {
@@ -9925,6 +10372,9 @@ impl Generator {
         // Teradata column attributes (must come right after data type, in specific order)
         // ORDER: CHARACTER SET, UPPERCASE, CASESPECIFIC, FORMAT, TITLE, INLINE LENGTH, COMPRESS
 
+        if col.binary && col.binary_before_charset {
+            self.write_keyword(" BINARY");
+        }
         if let Some(ref charset) = col.character_set {
             self.write_space();
             self.write_keyword("CHARACTER SET");
@@ -9932,6 +10382,9 @@ impl Generator {
             self.write(charset);
         }
 
+        if col.binary && !col.binary_before_charset {
+            self.write_keyword(" BINARY");
+        }
         if col.uppercase {
             self.write_space();
             self.write_keyword("UPPERCASE");
@@ -10222,6 +10675,10 @@ impl Generator {
                                         self.write("1");
                                     }
                                     self.write(")");
+                                } else if self.config.dialect
+                                    == Some(crate::dialects::DialectType::SQLite)
+                                {
+                                    self.write_keyword("AUTOINCREMENT");
                                 } else {
                                     self.write_keyword("GENERATED");
                                     if gen.always {
@@ -10515,6 +10972,9 @@ impl Generator {
                                 self.write("1");
                             }
                             self.write(")");
+                        } else if self.config.dialect == Some(crate::dialects::DialectType::SQLite)
+                        {
+                            self.write_keyword("AUTOINCREMENT");
                         } else {
                             self.write_keyword("GENERATED");
                             if gen.always {
@@ -10689,6 +11149,25 @@ impl Generator {
         }
 
         // BigQuery: OPTIONS (key=value, ...) on column - comes after all constraints
+        if let Some(position) = &col.position {
+            match position {
+                ColumnPosition::First => self.write_keyword(" FIRST"),
+                ColumnPosition::After(column) => {
+                    self.write_keyword(" AFTER ");
+                    self.generate_identifier(column)?;
+                }
+            }
+        }
+        if let Some(rollup) = &col.rollup {
+            self.write_keyword(" TO ");
+            self.generate_identifier(rollup)?;
+        }
+        for (name, value) in &col.engine_attributes {
+            self.write_space();
+            self.write_keyword(name);
+            self.write("=");
+            self.generate_expression(value)?;
+        }
         if !col.options.is_empty() {
             self.write_space();
             self.generate_options_clause(&col.options)?;
@@ -10729,6 +11208,7 @@ impl Generator {
             TableConstraint::PrimaryKey {
                 name,
                 columns,
+                key_parts,
                 timeseries_columns,
                 include_columns,
                 modifiers,
@@ -10756,18 +11236,7 @@ impl Generator {
                     }
                 }
                 self.write(" (");
-                for (i, col) in columns.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.generate_identifier(col)?;
-                    if matches!(self.config.dialect, Some(DialectType::Databricks))
-                        && timeseries_columns.iter().any(|candidate| candidate == col)
-                    {
-                        self.write_space();
-                        self.write_keyword("TIMESERIES");
-                    }
-                }
+                self.generate_constraint_index_columns(columns, key_parts, timeseries_columns)?;
                 self.write(")");
                 if !include_columns.is_empty() {
                     self.write_space();
@@ -10786,6 +11255,7 @@ impl Generator {
             TableConstraint::Unique {
                 name,
                 columns,
+                key_parts,
                 columns_parenthesized,
                 modifiers,
                 has_constraint_keyword,
@@ -10818,12 +11288,7 @@ impl Generator {
                 }
                 if *columns_parenthesized {
                     self.write(" (");
-                    for (i, col) in columns.iter().enumerate() {
-                        if i > 0 {
-                            self.write(", ");
-                        }
-                        self.generate_identifier(col)?;
-                    }
+                    self.generate_constraint_index_columns(columns, key_parts, &[])?;
                     self.write(")");
                 } else {
                     // UNIQUE without parentheses (e.g., UNIQUE idx_name)
@@ -10836,6 +11301,7 @@ impl Generator {
             }
             TableConstraint::ForeignKey {
                 name,
+                index_name,
                 columns,
                 references,
                 on_delete,
@@ -10849,6 +11315,10 @@ impl Generator {
                     self.write_space();
                 }
                 self.write_keyword("FOREIGN KEY");
+                if let Some(index_name) = index_name {
+                    self.write_space();
+                    self.generate_identifier(index_name)?;
+                }
                 self.write(" (");
                 for (i, col) in columns.iter().enumerate() {
                     if i > 0 {
@@ -11294,6 +11764,7 @@ impl Generator {
             self.write_space();
             let _ = self.generate_identifier(fg);
         }
+        self.generate_index_specific_modifiers(modifiers);
     }
 
     /// Generate constraint modifiers without USING (for Index constraints where USING is handled separately)
@@ -11353,6 +11824,10 @@ impl Generator {
 
     /// Generate MySQL index-specific modifiers (COMMENT, VISIBLE, ENGINE_ATTRIBUTE, WITH PARSER)
     fn generate_index_specific_modifiers(&mut self, modifiers: &ConstraintModifiers) {
+        if let Some(size) = &modifiers.key_block_size {
+            self.write_keyword(" KEY_BLOCK_SIZE = ");
+            self.write(size);
+        }
         if let Some(ref comment) = modifiers.comment {
             self.write_space();
             self.write_keyword("COMMENT");
@@ -11507,6 +11982,8 @@ impl Generator {
         }
         if dt.iceberg {
             self.write_keyword("DROP ICEBERG TABLE");
+        } else if dt.temporary {
+            self.write_keyword("DROP TEMPORARY TABLE");
         } else {
             self.write_keyword("DROP TABLE");
         }
@@ -11545,6 +12022,19 @@ impl Generator {
         if dt.sync {
             self.write_space();
             self.write_keyword("SYNC");
+        }
+
+        if dt.force {
+            if !matches!(
+                self.config.dialect,
+                Some(DialectType::Doris | DialectType::StarRocks) | None
+            ) {
+                return Err(crate::error::Error::unsupported(
+                    "DROP TABLE FORCE",
+                    "target dialect",
+                ));
+            }
+            self.write_keyword(" FORCE");
         }
 
         // Restore Athena Hive context
@@ -11800,6 +12290,49 @@ impl Generator {
         is_continuation: bool,
     ) -> Result<()> {
         match action {
+            AlterTableAction::ModifyTtl { ttl } => {
+                if self.config.dialect != Some(DialectType::ClickHouse) {
+                    return Err(crate::error::Error::unsupported(
+                        "MODIFY TTL",
+                        "target dialect",
+                    ));
+                }
+                self.write("MODIFY ");
+                self.generate_expression(ttl)?;
+            }
+            AlterTableAction::PartitionBy {
+                partition,
+                distribution,
+            } => {
+                self.generate_expression(partition)?;
+                if let Some(distribution) = distribution {
+                    self.write_space();
+                    self.generate_expression(distribution)?;
+                }
+            }
+            AlterTableAction::TableOptions {
+                options,
+                partition_by,
+            } => {
+                for (i, (name, value)) in options.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.write_keyword(name);
+                    self.write("=");
+                    self.generate_expression(value)?;
+                }
+                if let Some(partition) = partition_by {
+                    self.write_space();
+                    self.generate_expression(partition)?;
+                }
+            }
+            AlterTableAction::Force => self.write_keyword("FORCE"),
+            AlterTableAction::DropCheck { name } => {
+                self.write_keyword("DROP CHECK ");
+                self.generate_identifier(name)?;
+            }
+
             AlterTableAction::AddColumn {
                 column,
                 if_not_exists,
@@ -11863,6 +12396,7 @@ impl Generator {
                 name,
                 if_exists,
                 cascade,
+                restrict,
             } => {
                 self.write_keyword("DROP COLUMN");
                 if *if_exists {
@@ -11874,18 +12408,29 @@ impl Generator {
                 if *cascade {
                     self.write_space();
                     self.write_keyword("CASCADE");
+                } else if *restrict {
+                    self.write_keyword(" RESTRICT");
                 }
             }
             AlterTableAction::DropColumns { names } => {
-                self.write_keyword("DROP COLUMNS");
-                self.write(" (");
+                let parens = !matches!(
+                    self.config.dialect,
+                    Some(DialectType::TSQL | DialectType::Fabric | DialectType::Snowflake)
+                );
+                self.write_keyword(if parens {
+                    "DROP COLUMNS ("
+                } else {
+                    "DROP COLUMN "
+                });
                 for (i, name) in names.iter().enumerate() {
                     if i > 0 {
                         self.write(", ");
                     }
                     self.generate_identifier(name)?;
                 }
-                self.write(")");
+                if parens {
+                    self.write(")");
+                }
             }
             AlterTableAction::RenameColumn {
                 old_name,
@@ -11913,8 +12458,10 @@ impl Generator {
                 // MySQL uses MODIFY COLUMN for type changes (SetDataType)
                 // but ALTER COLUMN for SET DEFAULT, DROP DEFAULT, etc.
                 let use_modify = *use_modify_keyword
-                    || (matches!(self.config.dialect, Some(DialectType::MySQL))
-                        && matches!(action, AlterColumnAction::SetDataType { .. }));
+                    || (matches!(
+                        self.config.dialect,
+                        Some(DialectType::MySQL | DialectType::StarRocks | DialectType::Doris)
+                    ) && matches!(action, AlterColumnAction::SetDataType { .. }));
                 if use_modify {
                     self.write_keyword("MODIFY COLUMN");
                     self.write_space();
@@ -11924,10 +12471,14 @@ impl Generator {
                         data_type,
                         using: _,
                         collate,
+                        nullable,
                     } = action
                     {
                         self.write_space();
                         self.generate_data_type(data_type)?;
+                        if let Some(nullable) = nullable {
+                            self.write(if *nullable { " NULL" } else { " NOT NULL" });
+                        }
                         // Output COLLATE clause if present
                         if let Some(collate_name) = collate {
                             self.write_space();
@@ -11968,19 +12519,35 @@ impl Generator {
             } => {
                 if !matches!(
                     self.config.dialect,
-                    Some(DialectType::TiDB) | Some(DialectType::MySQL)
+                    Some(DialectType::TiDB)
+                        | Some(DialectType::MySQL)
+                        | Some(DialectType::ClickHouse)
                 ) {
                     return self.write_unsupported_comment(
                         "MODIFY COLUMN is only supported by MySQL-compatible dialects",
                     );
                 }
-                self.write_keyword("MODIFY COLUMN");
+                // ClickHouse's ALTER spelling requires TYPE. An alias-only
+                // column change has no type and must keep the MODIFY spelling.
+                let alter_with_type = self.config.dialect == Some(DialectType::ClickHouse)
+                    && !column.no_type
+                    && !matches!(&column.data_type, DataType::Unknown)
+                    && !matches!(&column.data_type, DataType::Custom { name } if name.is_empty());
+                self.write_keyword(if alter_with_type {
+                    "ALTER COLUMN"
+                } else {
+                    "MODIFY COLUMN"
+                });
                 self.write_space();
                 if *if_exists {
                     self.write_keyword("IF EXISTS");
                     self.write_space();
                 }
-                self.generate_column_def(column)?;
+                if self.config.dialect == Some(DialectType::ClickHouse) {
+                    self.generate_column_def_inner(column, true)?;
+                } else {
+                    self.generate_column_def(column)?;
+                }
                 if let Some(position) = position {
                     self.write_space();
                     match position {
@@ -12033,6 +12600,31 @@ impl Generator {
                     self.write_space();
                 }
                 self.generate_table_constraint(constraint)?;
+            }
+            AlterTableAction::AlterConstraint {
+                constraint,
+                modify,
+                conditional,
+            } => {
+                if self.config.dialect != Some(DialectType::ClickHouse) {
+                    return Err(crate::error::Error::unsupported(
+                        "conditional constraint alteration",
+                        "target dialect",
+                    ));
+                }
+                self.write_keyword(if *modify { "MODIFY " } else { "ADD " });
+                let start = self.output.len();
+                self.generate_table_constraint(constraint)?;
+                if *conditional {
+                    self.output.insert_str(
+                        start + "CONSTRAINT ".len(),
+                        if *modify {
+                            "IF EXISTS "
+                        } else {
+                            "IF NOT EXISTS "
+                        },
+                    );
+                }
             }
             AlterTableAction::DropConstraint { name, if_exists } => {
                 self.write_keyword("DROP CONSTRAINT");
@@ -12223,14 +12815,17 @@ impl Generator {
                 }
                 self.write(")");
             }
-            AlterTableAction::AddColumns { columns, cascade } => {
+            AlterTableAction::AddColumns { columns, cascade }
+            | AlterTableAction::ReplaceColumns { columns, cascade } => {
                 // Oracle uses ADD (...) without COLUMNS keyword
                 // Hive/Spark uses ADD COLUMNS (...)
                 let is_oracle = matches!(
                     self.config.dialect,
                     Some(DialectType::Oracle | DialectType::HANA)
                 );
-                if is_oracle {
+                if matches!(action, AlterTableAction::ReplaceColumns { .. }) {
+                    self.write_keyword("REPLACE COLUMNS");
+                } else if is_oracle {
                     self.write_keyword("ADD");
                 } else {
                     self.write_keyword("ADD COLUMNS");
@@ -12457,6 +13052,7 @@ impl Generator {
                 data_type,
                 using,
                 collate,
+                nullable,
             } => {
                 use crate::dialects::DialectType;
                 // Dialect-specific type change syntax:
@@ -12487,12 +13083,44 @@ impl Generator {
                     self.write_space();
                     self.write(collation);
                 }
+                if let Some(nullable) = nullable {
+                    self.write(if *nullable { " NULL" } else { " NOT NULL" });
+                }
                 if let Some(ref using_expr) = using {
                     self.write_space();
                     self.write_keyword("USING");
                     self.write_space();
                     self.generate_expression(using_expr)?;
                 }
+            }
+            AlterColumnAction::SetStatistics(expr) => {
+                self.write_keyword("SET STATISTICS ");
+                self.generate_expression(expr)?;
+            }
+            AlterColumnAction::Restart(value) => {
+                self.write_keyword("RESTART");
+                if let Some(value) = value {
+                    self.write_keyword(" WITH ");
+                    self.generate_expression(value)?;
+                }
+            }
+            AlterColumnAction::Options(options) => {
+                self.write_keyword("OPTIONS (");
+                for (i, option) in options.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    if let Some(action) = &option.action {
+                        self.write_keyword(action);
+                        self.write_space();
+                    }
+                    self.generate_identifier(&option.name)?;
+                    if let Some(value) = &option.value {
+                        self.write_space();
+                        self.generate_expression(value)?;
+                    }
+                }
+                self.write(")");
             }
             AlterColumnAction::SetDefault(expr) => {
                 self.write_keyword("SET DEFAULT");
@@ -12664,6 +13292,42 @@ impl Generator {
             self.write(on_fg);
         }
 
+        Ok(())
+    }
+
+    fn generate_constraint_index_columns(
+        &mut self,
+        columns: &[Identifier],
+        key_parts: &[IndexKeyPart],
+        timeseries_columns: &[Identifier],
+    ) -> Result<()> {
+        let count = if key_parts.is_empty() {
+            columns.len()
+        } else {
+            key_parts.len()
+        };
+        for i in 0..count {
+            if i > 0 {
+                self.write(", ");
+            }
+            let column = if let Some(part) = key_parts.get(i) {
+                self.generate_index_key_parts(std::slice::from_ref(part))?;
+                match part.expression.as_ref() {
+                    Expression::Identifier(column) => Some(column),
+                    _ => None,
+                }
+            } else {
+                // Legacy ASTs stored prefix/order syntax in the identifier text.
+                self.generate_index_identifier(&columns[i])?;
+                Some(&columns[i])
+            };
+            if self.config.dialect == Some(DialectType::Databricks)
+                && column.is_some_and(|column| timeseries_columns.contains(column))
+            {
+                self.write_space();
+                self.write_keyword("TIMESERIES");
+            }
+        }
         Ok(())
     }
 
@@ -12959,6 +13623,32 @@ impl Generator {
             self.generate_options_clause(&cv.options)?;
         }
 
+        if !cv.with_options.is_empty() {
+            self.write_keyword(" WITH ");
+            let parens = !matches!(
+                self.config.dialect,
+                Some(DialectType::TSQL | DialectType::Fabric)
+            );
+            if parens {
+                self.write("(");
+            }
+            for (i, option) in cv.with_options.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                if let Expression::Eq(eq) = option {
+                    self.generate_expression(&eq.left)?;
+                    self.write("=");
+                    self.generate_expression(&eq.right)?;
+                } else {
+                    self.generate_expression(option)?;
+                }
+            }
+            if parens {
+                self.write(")");
+            }
+        }
+
         // Doris: BUILD IMMEDIATE/DEFERRED for materialized views
         if let Some(ref build) = cv.build {
             self.write_space();
@@ -13026,6 +13716,15 @@ impl Generator {
             }
         }
 
+        if let Some(mode) = &cv.check_option {
+            self.write_keyword(" WITH ");
+            if !mode.is_empty() {
+                self.write_keyword(mode);
+                self.write_space();
+            }
+            self.write_keyword("CHECK OPTION");
+        }
+
         // Redshift: WITH NO SCHEMA BINDING (after query)
         if cv.no_schema_binding {
             self.write_space();
@@ -13054,6 +13753,10 @@ impl Generator {
         self.write_space();
         self.generate_table(&dv.name)?;
 
+        for name in &dv.additional_names {
+            self.write(", ");
+            self.generate_table(name)?;
+        }
         Ok(())
     }
 
@@ -14023,10 +14726,19 @@ impl Generator {
         for option in &cd.options {
             self.write_space();
             match option {
-                DatabaseOption::CharacterSet(charset) => {
+                DatabaseOption::CharacterSet(charset)
+                | DatabaseOption::DefaultCharacterSet(charset) => {
+                    if matches!(option, DatabaseOption::DefaultCharacterSet(_)) {
+                        self.write_keyword("DEFAULT ");
+                    }
                     self.write_keyword("CHARACTER SET");
-                    self.write(" = ");
-                    self.write(&format!("'{}'", charset));
+                    if self.config.dialect == Some(DialectType::MySQL) {
+                        self.write("=");
+                        self.write(charset);
+                    } else {
+                        self.write(" = ");
+                        self.generate_string_literal(charset)?;
+                    }
                 }
                 DatabaseOption::Collate(collate) => {
                     self.write_keyword("COLLATE");
@@ -14047,6 +14759,10 @@ impl Generator {
                     self.write_keyword("ENCODING");
                     self.write(" = ");
                     self.write(&format!("'{}'", encoding));
+                }
+                DatabaseOption::Comment(comment) => {
+                    self.write_keyword("COMMENT ");
+                    self.generate_string_literal(comment)?;
                 }
                 DatabaseOption::Location(location) => {
                     self.write_keyword("LOCATION");
@@ -14717,7 +15433,12 @@ impl Generator {
             self.write_space();
             if matches!(
                 self.config.dialect,
-                Some(crate::dialects::DialectType::BigQuery)
+                Some(
+                    crate::dialects::DialectType::BigQuery
+                        | crate::dialects::DialectType::Spark
+                        | crate::dialects::DialectType::Databricks
+                        | crate::dialects::DialectType::Trino
+                )
             ) {
                 // BigQuery uses DETERMINISTIC/NOT DETERMINISTIC
                 if det {
@@ -16195,9 +16916,11 @@ impl Generator {
                 } else {
                     std::borrow::Cow::Borrowed(n.as_str())
                 };
-                // Normalize numbers starting with decimal point to have leading zero
-                // e.g., .25 -> 0.25 (matches sqlglot behavior)
-                if n.starts_with('.') {
+                // DuckDB counts a leading zero toward DECIMAL precision; at 39
+                // digits, adding it can even turn an exact decimal into DOUBLE.
+                if matches!(self.config.dialect, Some(DialectType::DuckDB)) {
+                    self.write(&n);
+                } else if n.starts_with('.') {
                     self.write("0");
                     self.write(&n);
                 } else if n.starts_with("-.") {
@@ -16370,6 +17093,9 @@ impl Generator {
                 use crate::dialects::DialectType;
                 // Extract content from tag\x00content format
                 let (_tag, content) = crate::tokens::parse_dollar_string_token(s);
+                if self.config.dialect == Some(DialectType::ClickHouse) {
+                    return self.generate_literal(&Literal::String(content.to_string()));
+                }
                 // Step 1: Escape backslashes if the dialect uses backslash as a string escape
                 let escape_backslash = matches!(
                     self.config.dialect,
@@ -16421,7 +17147,6 @@ impl Generator {
                         | Some(DialectType::Hive)
                         | Some(DialectType::Spark)
                         | Some(DialectType::Databricks)
-                        | Some(DialectType::Drill)
                         | Some(DialectType::Snowflake)
                         | Some(DialectType::Redshift)
                         | Some(DialectType::ClickHouse)
@@ -16582,6 +17307,7 @@ impl Generator {
         use crate::dialects::DialectType;
 
         match self.config.dialect {
+            Some(DialectType::Trino) => self.generate_trino_temporal_literal(t, "TIME")?,
             // SQL Server uses CONVERT or CAST
             Some(DialectType::TSQL) => {
                 self.write("CAST('");
@@ -16673,7 +17399,8 @@ impl Generator {
                 self.write("', 'YYYY-MM-DD HH24:MI:SS.FF6')");
             }
             // Presto/Trino: always use CAST for TIMESTAMP literals
-            Some(DialectType::Presto) | Some(DialectType::Trino) => {
+            Some(DialectType::Trino) => self.generate_trino_temporal_literal(ts, "TIMESTAMP")?,
+            Some(DialectType::Presto) => {
                 if Self::timestamp_has_timezone(ts) {
                     self.write("CAST('");
                     self.write(ts);
@@ -16742,6 +17469,23 @@ impl Generator {
                 self.write("'");
             }
         }
+        Ok(())
+    }
+
+    /// Trino infers literal precision; an unqualified cast defaults to milliseconds.
+    fn generate_trino_temporal_literal(&mut self, value: &str, kind: &str) -> Result<()> {
+        let precision = value.split_once('.').map_or(0, |(_, fraction)| {
+            fraction.bytes().take_while(u8::is_ascii_digit).count()
+        });
+        self.write_keyword("CAST(");
+        self.generate_string_literal(value)?;
+        self.write_keyword(" AS ");
+        self.write_keyword(kind);
+        self.write(&format!("({precision})"));
+        if Self::timestamp_has_timezone(value) {
+            self.write_keyword(" WITH TIME ZONE");
+        }
+        self.write(")");
         Ok(())
     }
 
@@ -16860,24 +17604,20 @@ impl Generator {
                         '\r' => self.write("\\r"),
                         '\t' => self.write("\\t"),
                         '\0' => self.write("\\0"),
+                        c if (c as u32) < 32 => self.write(&format!("\\{:03o}", c as u32)),
                         _ => self.output.push(c),
                     }
                 }
                 self.write("'");
             }
             Some(DialectType::Drill) => {
-                // Drill uses SQL-standard quote doubling ('') for quotes,
-                // but backslash escaping for special characters
+                // Drill uses SQL-standard string literals; backslashes are literal.
                 self.write("'");
                 for c in s.chars() {
-                    match c {
-                        '\'' => self.write("''"),
-                        '\\' => self.write("\\\\"),
-                        '\n' => self.write("\\n"),
-                        '\r' => self.write("\\r"),
-                        '\t' => self.write("\\t"),
-                        '\0' => self.write("\\0"),
-                        _ => self.output.push(c),
+                    if c == '\'' {
+                        self.write("''");
+                    } else {
+                        self.output.push(c);
                     }
                 }
                 self.write("'");
@@ -16892,8 +17632,7 @@ impl Generator {
                         '\n' => self.write("\\n"),
                         '\r' => self.write("\\r"),
                         '\t' => self.write("\\t"),
-                        // sqlglot writes a literal NUL for this case
-                        '\0' => self.output.push('\0'),
+                        '\0' => self.write("\\0"),
                         _ => self.output.push(c),
                     }
                 }
@@ -17059,6 +17798,14 @@ impl Generator {
                 '\'' => self.write("\\'"),
                 // Escape backslashes
                 '\\' => self.write("\\\\"),
+                '\n' => self.write("\\n"),
+                '\r' => self.write("\\r"),
+                '\t' => self.write("\\t"),
+                _ if !c.is_ascii() && self.config.dialect == Some(DialectType::BigQuery) => {
+                    for byte in c.to_string().as_bytes() {
+                        self.write(&format!("\\x{byte:02x}"));
+                    }
+                }
                 // Keep all printable characters (including non-ASCII) as-is
                 _ if !c.is_control() => self.output.push(c),
                 // Escape control characters as hex
@@ -17145,6 +17892,18 @@ impl Generator {
     }
 
     fn generate_identifier(&mut self, id: &Identifier) -> Result<()> {
+        self.generate_identifier_with_index_suffix(id, false)
+    }
+
+    fn generate_index_identifier(&mut self, id: &Identifier) -> Result<()> {
+        self.generate_identifier_with_index_suffix(id, true)
+    }
+
+    fn generate_identifier_with_index_suffix(
+        &mut self,
+        id: &Identifier,
+        index_suffix: bool,
+    ) -> Result<()> {
         use crate::dialects::DialectType;
 
         let name = &id.name;
@@ -17191,7 +17950,7 @@ impl Generator {
 
         // Check for MySQL index column prefix length: name(16) or name(16) ASC/DESC
         // When quoted, we need to output `name`(16) not `name(16)`
-        let (base_name, suffix) = if needs_quoting {
+        let (base_name, suffix) = if index_suffix && needs_quoting {
             // Try to extract prefix length from identifier: name(number) or name(number) ASC/DESC
             if let Some(paren_pos) = name.find('(') {
                 let base = &name[..paren_pos];
@@ -18130,7 +18889,11 @@ impl Generator {
         // Output MySQL PARTITION clause: t1 PARTITION(p0, p1)
         if !table.partitions.is_empty() {
             self.write_space();
-            self.write_keyword("PARTITION");
+            self.write_keyword(if table.subpartition {
+                "SUBPARTITION"
+            } else {
+                "PARTITION"
+            });
             self.write("(");
             for (i, partition) in table.partitions.iter().enumerate() {
                 if i > 0 {
@@ -18161,9 +18924,11 @@ impl Generator {
         }
 
         // Output Presto/Trino time travel: FOR VERSION AS OF / FOR TIMESTAMP AS OF
-        if let Some(ref version) = table.version {
-            self.write_space();
-            self.generate_version(version)?;
+        if self.config.dialect != Some(DialectType::Oracle) {
+            if let Some(ref version) = table.version {
+                self.write_space();
+                self.generate_version(version)?;
+            }
         }
 
         // When alias_post_tablesample is true, the order is: table TABLESAMPLE (...) alias
@@ -18176,6 +18941,13 @@ impl Generator {
             self.generate_table_sample_clause(table)?;
         }
 
+        if self.config.dialect == Some(DialectType::Oracle) {
+            if let Some(version) = &table.version {
+                self.write_space();
+                self.generate_version(version)?;
+            }
+        }
+
         // Output table hints (TSQL: WITH (TABLOCK, INDEX(myindex), ...))
         // For SQLite, INDEXED BY hints come after the alias, so skip here
         let is_sqlite_hint = matches!(self.config.dialect, Some(DialectType::SQLite))
@@ -18186,7 +18958,12 @@ impl Generator {
                     false
                 }
             });
-        if !table.hints.is_empty() && !is_sqlite_hint {
+        let hints_after_alias = is_sqlite_hint
+            || matches!(
+                self.config.dialect,
+                Some(DialectType::TSQL | DialectType::Fabric)
+            );
+        if !table.hints.is_empty() && !hints_after_alias {
             for hint in &table.hints {
                 self.write_space();
                 self.generate_expression(hint)?;
@@ -18260,7 +19037,7 @@ impl Generator {
         }
 
         // Output SQLite INDEXED BY / NOT INDEXED hints after alias
-        if is_sqlite_hint {
+        if hints_after_alias {
             for hint in &table.hints {
                 self.write_space();
                 self.generate_expression(hint)?;
@@ -18681,6 +19458,19 @@ impl Generator {
     }
 
     fn generate_cast(&mut self, cast: &Cast) -> Result<()> {
+        if self.config.dialect == Some(DialectType::ClickHouse)
+            && self
+                .config
+                .source_dialect
+                .is_some_and(|source| source != DialectType::ClickHouse)
+            && matches!(cast.this, Expression::Null(_))
+            && matches!(
+                cast.to,
+                DataType::Array { .. } | DataType::Map { .. } | DataType::Struct { .. }
+            )
+        {
+            self.unsupported("ClickHouse cannot represent a NULL Array/Map/Tuple using Nullable")?;
+        }
         self.validate_cast_to_hana(cast)?;
         if self.config.dialect == Some(DialectType::Vertica) {
             Self::validate_vertica_cast_type(&cast.to)?;
@@ -19417,12 +20207,19 @@ impl Generator {
         source: Option<DialectType>,
         options: Option<&JsonOptions>,
     ) -> Result<()> {
-        if source == Some(DialectType::HANA) && self.config.dialect != source {
+        if matches!(source, Some(DialectType::HANA | DialectType::Oracle))
+            && self.config.dialect != source
+        {
             return Err(self.hana_unsupported(
                 "SQL/JSON path and error semantics have no verified target mapping",
             ));
         }
-        if options.is_some() && self.config.dialect != Some(DialectType::HANA) {
+        if options.is_some()
+            && !matches!(
+                self.config.dialect,
+                Some(DialectType::HANA | DialectType::Oracle)
+            )
+        {
             return Err(
                 self.hana_unsupported("SQL/JSON behavior options have no verified target mapping")
             );
@@ -19436,10 +20233,18 @@ impl Generator {
             self.write(wrapper);
             self.write(" WRAPPER");
         }
-        for (behavior, suffix) in [
-            (&options.on_empty, " ON EMPTY"),
-            (&options.on_error, " ON ERROR"),
-        ] {
+        let behaviors = if self.config.dialect == Some(DialectType::Oracle) {
+            [
+                (&options.on_error, " ON ERROR"),
+                (&options.on_empty, " ON EMPTY"),
+            ]
+        } else {
+            [
+                (&options.on_empty, " ON EMPTY"),
+                (&options.on_error, " ON ERROR"),
+            ]
+        };
+        for (behavior, suffix) in behaviors {
             if let Some(behavior) = behavior {
                 self.write(" ");
                 self.write(&behavior.kind);
@@ -20216,6 +21021,38 @@ impl Generator {
     }
 
     fn generate_function(&mut self, func: &Function) -> Result<()> {
+        if func.qualified_name.len() <= 1 && func.name.eq_ignore_ascii_case("REGEXP_FULL_MATCH") {
+            self.validate_regexp_full_match_target()?;
+        }
+        if func.source_dialect == Some(DialectType::SQLite)
+            && func.name.eq_ignore_ascii_case("CONCAT")
+        {
+            self.write("CONCAT(");
+            let propagate = matches!(
+                self.config.dialect,
+                Some(
+                    DialectType::MySQL
+                        | DialectType::Snowflake
+                        | DialectType::ClickHouse
+                        | DialectType::Presto
+                        | DialectType::Trino
+                )
+            );
+            for (i, arg) in func.args.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                if propagate {
+                    self.write("COALESCE(");
+                }
+                self.generate_expression(arg)?;
+                if propagate {
+                    self.write(", '')");
+                }
+            }
+            self.write(")");
+            return Ok(());
+        }
         if self.config.dialect == Some(DialectType::Vertica) {
             Self::validate_vertica_function(
                 func,
@@ -20231,6 +21068,37 @@ impl Generator {
             for (i, component) in func.qualified_name.iter().enumerate() {
                 if i > 0 {
                     self.write(".");
+                }
+                if self.config.dialect == Some(DialectType::ClickHouse)
+                    && i + 1 == func.qualified_name.len()
+                {
+                    if crate::function_registry::is_aggregate_function_name(&component.name)
+                        || [
+                            "uniq",
+                            "uniqExact",
+                            "uniqCombined",
+                            "uniqCombined64",
+                            "uniqHLL12",
+                            "uniqTheta",
+                        ]
+                        .iter()
+                        .any(|base| {
+                            component.name.strip_prefix(base).is_some_and(|suffix| {
+                                matches!(
+                                    suffix,
+                                    "" | "If"
+                                        | "Array"
+                                        | "ArrayIf"
+                                        | "State"
+                                        | "Merge"
+                                        | "MergeState"
+                                )
+                            })
+                        })
+                    {
+                        self.write(&component.name);
+                        continue;
+                    }
                 }
                 self.generate_identifier(component)?;
             }
@@ -20342,7 +21210,7 @@ impl Generator {
                 }
                 self.generate_expression(arg)?;
             }
-            self.write("], _u -> NOT _u IS NULL)");
+            self.write("], LAMBDA _u : NOT _u IS NULL)");
             return Ok(());
         }
 
@@ -20430,6 +21298,27 @@ impl Generator {
         {
             self.write("dateTrunc('DAY', ");
             self.generate_expression(&func.args[0])?;
+            self.write(")");
+            return Ok(());
+        }
+
+        if self.config.dialect == Some(DialectType::Exasol)
+            && func.name.eq_ignore_ascii_case("DATE_TRUNC")
+            && func.args.len() == 2
+        {
+            self.write("DATE_TRUNC(");
+            self.generate_expression(&func.args[0])?;
+            self.write(", ");
+            if let Expression::Literal(literal) = &func.args[1] {
+                if let Literal::Timestamp(value) = literal.as_ref() {
+                    self.write("TIMESTAMP ");
+                    self.generate_string_literal(value)?;
+                } else {
+                    self.generate_expression(&func.args[1])?;
+                }
+            } else {
+                self.generate_expression(&func.args[1])?;
+            }
             self.write(")");
             return Ok(());
         }
@@ -20719,8 +21608,10 @@ impl Generator {
                     let crate::expressions::Literal::String(s) = lit.as_ref() else {
                         unreachable!()
                     };
-                    self.write(&s.to_ascii_lowercase());
+                    self.write_keyword(&s.to_ascii_uppercase());
                 }
+                Expression::Identifier(id) => self.write_keyword(&id.name.to_ascii_uppercase()),
+                Expression::Var(v) => self.write_keyword(&v.this.to_ascii_uppercase()),
                 _ => self.generate_expression(&func.args[0])?,
             }
             self.write_space();
@@ -21318,13 +22209,33 @@ impl Generator {
                 if i > 0 {
                     self.write(", ");
                 }
-                self.generate_ordered(ordered)?;
+                if self.config.dialect == Some(DialectType::MySQL)
+                    && over.frame.as_ref().is_some_and(|frame| {
+                        matches!(frame.kind, WindowFrameKind::Range | WindowFrameKind::Groups)
+                    })
+                    && Self::ordered_requires_tsql_null_ordering_emulation(ordered)
+                {
+                    self.unsupported(
+                        "NULL ordering emulation is not supported with RANGE/GROUPS window frames",
+                    )?;
+                    let mut fallback = ordered.clone();
+                    fallback.nulls_first = None;
+                    self.generate_ordered(&fallback)?;
+                } else {
+                    self.generate_ordered(ordered)?;
+                }
             }
             has_content = true;
         }
 
         // Window frame
-        if let Some(frame) = &over.frame {
+        if let Some(frame) = over.frame.as_ref().filter(|frame| {
+            !(self.config.dialect == Some(DialectType::Teradata)
+                && matches!(frame.kind, WindowFrameKind::Rows)
+                && matches!(frame.start, WindowFrameBound::UnboundedPreceding)
+                && matches!(frame.end, Some(WindowFrameBound::UnboundedFollowing))
+                && frame.exclude.is_none())
+        }) {
             if has_content {
                 self.write_space();
             }
@@ -22169,9 +23080,24 @@ impl Generator {
         match self.config.dialect {
             Some(DialectType::Teradata) => {
                 // Teradata uses ** operator for exponentiation
+                let grouped_left = Self::infix_operator(self.config.dialect, &f.this).is_some();
+                let grouped_right =
+                    Self::infix_operator(self.config.dialect, &f.expression).is_some();
+                if grouped_left {
+                    self.write("(");
+                }
                 self.generate_expression(&f.this)?;
+                if grouped_left {
+                    self.write(")");
+                }
                 self.write(" ** ");
+                if grouped_right {
+                    self.write("(");
+                }
                 self.generate_expression(&f.expression)?;
+                if grouped_right {
+                    self.write(")");
+                }
                 Ok(())
             }
             _ => {
@@ -22467,6 +23393,11 @@ impl Generator {
 
     fn generate_regexp_like(&mut self, f: &RegexpFunc) -> Result<()> {
         use crate::dialects::DialectType;
+        if self.config.dialect == Some(DialectType::SQLite) && f.flags.is_none() {
+            self.generate_expression(&f.this)?;
+            self.write_keyword(" REGEXP ");
+            return self.generate_expression(&f.pattern);
+        }
         // PostgreSQL uses ~ operator for regex matching
         if matches!(self.config.dialect, Some(DialectType::PostgreSQL)) && f.flags.is_none() {
             self.generate_expression(&f.this)?;
@@ -22510,7 +23441,12 @@ impl Generator {
             }
             self.write(")");
         } else {
-            self.write_keyword("REGEXP_LIKE");
+            let name = if self.config.dialect == Some(DialectType::DuckDB) {
+                "REGEXP_MATCHES"
+            } else {
+                "REGEXP_LIKE"
+            };
+            self.write_keyword(name);
             self.write("(");
             self.generate_expression(&f.this)?;
             self.write(", ");
@@ -22766,7 +23702,14 @@ impl Generator {
             return Ok(());
         }
 
+        let grouped = Self::infix_operator(self.config.dialect, &f.this).is_some();
+        if grouped {
+            self.write("(");
+        }
         self.generate_expression(&f.this)?;
+        if grouped {
+            self.write(")");
+        }
         self.write_space();
         self.write_keyword("AT TIME ZONE");
         self.write_space();
@@ -22957,7 +23900,8 @@ impl Generator {
             // BigQuery: strip week-start modifier from WEEK(SUNDAY), WEEK(MONDAY), etc.
             // WEEK(SUNDAY) -> WEEK
             if matches!(self.config.dialect, Some(DialectType::BigQuery)) {
-                if let DateTimeField::WeekWithModifier(_) = unit {
+                if matches!(unit, DateTimeField::WeekWithModifier(day) if day.eq_ignore_ascii_case("SUNDAY"))
+                {
                     self.write_keyword("WEEK");
                 } else {
                     self.write_datetime_field(unit);
@@ -23418,6 +24362,19 @@ impl Generator {
             self.write_space();
         }
         self.generate_expression(&f.this)?;
+        let sqlite = self.config.dialect == Some(DialectType::SQLite);
+        if sqlite && f.distinct && f.separator.is_some() {
+            return Err(crate::error::Error::unsupported(
+                "SQLite DISTINCT aggregates require exactly one argument",
+                "SQLite",
+            ));
+        }
+        if sqlite {
+            if let Some(separator) = &f.separator {
+                self.write(", ");
+                self.generate_expression(separator)?;
+            }
+        }
         if let Some(ref order_by) = f.order_by {
             self.write_space();
             self.write_keyword("ORDER BY");
@@ -23429,7 +24386,7 @@ impl Generator {
                 self.generate_ordered(ord)?;
             }
         }
-        if let Some(ref sep) = f.separator {
+        if let Some(sep) = f.separator.as_ref().filter(|_| !sqlite) {
             // SQLite uses GROUP_CONCAT(x, sep) syntax (comma-separated)
             // MySQL and others use GROUP_CONCAT(x SEPARATOR sep) syntax
             if matches!(
@@ -23783,6 +24740,14 @@ impl Generator {
         self.write_keyword(name);
         self.write("(");
         self.generate_expression(&f.this)?;
+        let nulls_after_value = self.config.dialect == Some(DialectType::StarRocks);
+        if nulls_after_value {
+            match f.ignore_nulls {
+                Some(true) => self.write_keyword(" IGNORE NULLS"),
+                Some(false) => self.write_keyword(" RESPECT NULLS"),
+                None => {}
+            }
+        }
         if let Some(ref offset) = f.offset {
             self.write(", ");
             self.generate_expression(offset)?;
@@ -23792,7 +24757,7 @@ impl Generator {
             }
         }
         // IGNORE NULLS / RESPECT NULLS inside parens for dialects like BigQuery
-        if self.config.ignore_nulls_in_func {
+        if self.config.ignore_nulls_in_func && !nulls_after_value {
             match f.ignore_nulls {
                 Some(true) => {
                     self.write_space();
@@ -23807,7 +24772,7 @@ impl Generator {
         }
         self.write(")");
         // IGNORE NULLS / RESPECT NULLS outside parens for other dialects
-        if !self.config.ignore_nulls_in_func {
+        if !self.config.ignore_nulls_in_func && !nulls_after_value {
             match f.ignore_nulls {
                 Some(true) => {
                     self.write_space();
@@ -23914,7 +24879,7 @@ impl Generator {
         // FROM FIRST / FROM LAST (Snowflake-specific, before IGNORE/RESPECT NULLS)
         if matches!(
             self.config.dialect,
-            Some(crate::dialects::DialectType::Snowflake)
+            Some(crate::dialects::DialectType::Snowflake | crate::dialects::DialectType::Oracle)
         ) {
             match f.from_first {
                 Some(true) => {
@@ -24812,7 +25777,9 @@ impl Generator {
             // Curly brace syntax: MAP {'a': 1, 'b': 2} or just {'a': 1, 'b': 2}
             if f.with_map_keyword {
                 self.write_keyword("MAP");
-                self.write(" ");
+                if self.config.dialect != Some(DialectType::StarRocks) {
+                    self.write(" ");
+                }
             }
             self.write("{");
             for (i, (key, val)) in f.keys.iter().zip(f.values.iter()).enumerate() {
@@ -24820,7 +25787,11 @@ impl Generator {
                     self.write(", ");
                 }
                 self.generate_expression(key)?;
-                self.write(": ");
+                self.write(if self.config.dialect == Some(DialectType::StarRocks) {
+                    ":"
+                } else {
+                    ": "
+                });
                 self.generate_expression(val)?;
             }
             self.write("}");
@@ -24887,13 +25858,13 @@ impl Generator {
 
         if use_arrow {
             // Output arrow syntax: expr -> path or expr ->> path
-            self.generate_expression(&f.this)?;
+            self.generate_json_arrow_operand(&f.this, OperandSide::Left)?;
             if name == "JSON_EXTRACT_SCALAR" || name == "JSON_EXTRACT_PATH_TEXT" {
                 self.write(" ->> ");
             } else {
                 self.write(" -> ");
             }
-            self.generate_expression(&f.path)?;
+            self.generate_json_arrow_operand(&f.path, OperandSide::Right)?;
             return Ok(());
         }
 
@@ -24997,6 +25968,28 @@ impl Generator {
         }
 
         self.write(")");
+        Ok(())
+    }
+
+    fn generate_json_arrow_operand(
+        &mut self,
+        expression: &Expression,
+        side: OperandSide,
+    ) -> Result<()> {
+        if self.config.dialect == Some(DialectType::SQLite) {
+            return self.generate_infix_operand(InfixOperator::JsonExtract, expression, side);
+        }
+        // Arrow precedence varies by dialect. Explicitly retain a concatenated
+        // document or path when leaving SQLite's shared operator tier.
+        let wrap =
+            Self::infix_operator(self.config.dialect, expression) == Some(InfixOperator::Concat);
+        if wrap {
+            self.write("(");
+        }
+        self.generate_expression(expression)?;
+        if wrap {
+            self.write(")");
+        }
         Ok(())
     }
 
@@ -25218,7 +26211,9 @@ impl Generator {
     // Additional expression generators
 
     fn generate_lambda(&mut self, f: &LambdaExpr) -> Result<()> {
-        if f.colon {
+        if self.config.dialect == Some(DialectType::DuckDB)
+            || (f.colon && self.config.dialect.is_none())
+        {
             // DuckDB syntax: LAMBDA x : expr
             self.write_keyword("LAMBDA");
             self.write_space();
@@ -25566,7 +26561,6 @@ impl Generator {
                 | Some(DialectType::MySQL)
                 | Some(DialectType::SQLite)
                 | Some(DialectType::Oracle)
-                | Some(DialectType::ClickHouse)
                 | Some(DialectType::Redshift)
                 | Some(DialectType::PostgreSQL)
                 | Some(DialectType::StarRocks)
@@ -25726,6 +26720,23 @@ impl Generator {
         Ok(())
     }
 
+    fn is_low_precedence_json_arrow(dialect: Option<DialectType>, expression: &Expression) -> bool {
+        dialect == Some(DialectType::DuckDB)
+            && matches!(expression, Expression::JsonExtract(f) | Expression::JsonExtractScalar(f) if f.arrow_syntax)
+    }
+
+    fn generate_duckdb_json_arrow_operand(&mut self, expression: &Expression) -> Result<()> {
+        let wrap = Self::is_low_precedence_json_arrow(self.config.dialect, expression);
+        if wrap {
+            self.write("(");
+        }
+        self.generate_expression(expression)?;
+        if wrap {
+            self.write(")");
+        }
+        Ok(())
+    }
+
     fn generate_binary_op(&mut self, op: &BinaryOp, operator: &str) -> Result<()> {
         self.generate_binary_op_with_precedence(op, operator, None)
     }
@@ -25745,14 +26756,15 @@ impl Generator {
         operator: &str,
         infix_operator: Option<InfixOperator>,
     ) -> Result<()> {
-        let wrap_left = infix_operator.is_some_and(|parent| {
-            Self::infix_operand_needs_parentheses(
-                self.config.dialect,
-                parent,
-                &op.left,
-                OperandSide::Left,
-            )
-        });
+        let wrap_left = Self::is_low_precedence_json_arrow(self.config.dialect, &op.left)
+            || infix_operator.is_some_and(|parent| {
+                Self::infix_operand_needs_parentheses(
+                    self.config.dialect,
+                    parent,
+                    &op.left,
+                    OperandSide::Left,
+                )
+            });
         if wrap_left {
             self.write("(");
         }
@@ -25779,6 +26791,9 @@ impl Generator {
                         self.write_formatted_comment(comment);
                     }
                 }
+            }
+            Expression::Concat(inner_op) if self.config.dialect == Some(DialectType::MySQL) => {
+                self.generate_mysql_concat_from_concat(inner_op)?;
             }
             Expression::Add(inner_op)
             | Expression::Sub(inner_op)
@@ -25828,14 +26843,15 @@ impl Generator {
             self.write_formatted_comment(comment);
         }
         self.write_space();
-        let wrap_right = infix_operator.is_some_and(|parent| {
-            Self::infix_operand_needs_parentheses(
-                self.config.dialect,
-                parent,
-                &op.right,
-                OperandSide::Right,
-            )
-        });
+        let wrap_right = Self::is_low_precedence_json_arrow(self.config.dialect, &op.right)
+            || infix_operator.is_some_and(|parent| {
+                Self::infix_operand_needs_parentheses(
+                    self.config.dialect,
+                    parent,
+                    &op.right,
+                    OperandSide::Right,
+                )
+            });
         if wrap_right {
             self.write("(");
         }
@@ -25947,7 +26963,30 @@ impl Generator {
         dialect: Option<DialectType>,
         expression: &Expression,
     ) -> Option<InfixOperator> {
+        // These dialects render bitwise nodes as function calls, which are atomic.
+        if matches!(dialect, Some(DialectType::Presto | DialectType::Trino))
+            && matches!(
+                expression,
+                Expression::BitwiseAnd(_)
+                    | Expression::BitwiseOr(_)
+                    | Expression::BitwiseXor(_)
+                    | Expression::BitwiseLeftShift(_)
+                    | Expression::BitwiseRightShift(_)
+            )
+        {
+            return None;
+        }
         match expression {
+            Expression::Concat(_) | Expression::DPipe(_) => match dialect {
+                Some(DialectType::MySQL) => None,
+                Some(DialectType::Solr) => Some(InfixOperator::Or),
+                _ => Some(InfixOperator::Concat),
+            },
+            Expression::JsonExtract(f) | Expression::JsonExtractScalar(f)
+                if dialect == Some(DialectType::SQLite) && f.arrow_syntax =>
+            {
+                Some(InfixOperator::JsonExtract)
+            }
             // `MOD(x, y)` lowered to `x % y` binds like the infix operator, so as an
             // operand it needs the same parentheses (`2 * MOD(5, 3)` -> `2 * (5 % 3)`).
             Expression::ModFunc(_) if Self::mod_func_uses_percent_for(dialect) => {
@@ -25972,7 +27011,33 @@ impl Generator {
             Expression::Or(_) => Some(InfixOperator::Or),
             Expression::Xor(_) => Some(InfixOperator::Xor),
             Expression::And(_) => Some(InfixOperator::And),
+            Expression::BitwiseAnd(_) => Some(InfixOperator::BitwiseAnd),
+            Expression::BitwiseOr(_) => Some(InfixOperator::BitwiseOr),
+            Expression::BitwiseXor(_) => Some(InfixOperator::BitwiseXor),
+            Expression::BitwiseLeftShift(_)
+                if !matches!(dialect, Some(DialectType::Spark | DialectType::Databricks)) =>
+            {
+                Some(InfixOperator::BitwiseLeftShift)
+            }
+            Expression::BitwiseRightShift(_)
+                if !matches!(dialect, Some(DialectType::Spark | DialectType::Databricks)) =>
+            {
+                Some(InfixOperator::BitwiseRightShift)
+            }
             Expression::Add(_) => Some(InfixOperator::Add),
+            Expression::DateAdd(_) if dialect == Some(DialectType::DuckDB) => {
+                Some(InfixOperator::Add)
+            }
+            Expression::DateSub(_) if dialect == Some(DialectType::DuckDB) => {
+                Some(InfixOperator::Sub)
+            }
+            Expression::Function(f)
+                if dialect == Some(DialectType::DuckDB)
+                    && f.name.eq_ignore_ascii_case("DATE_ADD")
+                    && f.args.len() == 2 =>
+            {
+                Some(InfixOperator::Add)
+            }
             Expression::Sub(_) => Some(InfixOperator::Sub),
             Expression::Mul(_) => Some(InfixOperator::Mul),
             Expression::Div(_) => Some(InfixOperator::Div),
@@ -25998,7 +27063,10 @@ impl Generator {
                 },
                 Some(InfixOperator::Mod),
             ),
-            Expression::Concat(_) => ("||", None),
+            Expression::Concat(_) if self.config.dialect == Some(DialectType::Solr) => {
+                ("OR", Some(InfixOperator::Or))
+            }
+            Expression::Concat(_) => ("||", Some(InfixOperator::Concat)),
             _ => unreachable!("nested binary expression variant was checked by the caller"),
         }
     }
@@ -26011,6 +27079,67 @@ impl Generator {
     ) -> bool {
         if matches!(child, Expression::Paren(_)) {
             return false;
+        }
+        if parent == InfixOperator::Add && matches!(side, OperandSide::Right) {
+            fn fixed_interval_sum(expr: &Expression) -> bool {
+                match expr {
+                    Expression::Add(op) => {
+                        fixed_interval_sum(&op.left) && fixed_interval_sum(&op.right)
+                    }
+                    Expression::Interval(i) => {
+                        matches!(
+                            &i.unit,
+                            Some(IntervalUnitSpec::Simple {
+                                unit: IntervalUnit::Hour
+                                    | IntervalUnit::Minute
+                                    | IntervalUnit::Second
+                                    | IntervalUnit::Millisecond
+                                    | IntervalUnit::Microsecond
+                                    | IntervalUnit::Nanosecond,
+                                ..
+                            })
+                        ) && matches!(&i.this, Some(Expression::Literal(_)))
+                    }
+                    _ => false,
+                }
+            }
+            if fixed_interval_sum(child) {
+                return false;
+            }
+        }
+        if parent == InfixOperator::Comparison
+            && matches!(
+                child,
+                Expression::IsNull(_)
+                    | Expression::IsTrue(_)
+                    | Expression::IsFalse(_)
+                    | Expression::NullSafeEq(_)
+                    | Expression::NullSafeNeq(_)
+            )
+        {
+            return true;
+        }
+
+        // Outside SQLite, keep arrow operands of concatenation explicit rather
+        // than assuming the two operators share SQLite's precedence.
+        if parent == InfixOperator::Concat
+            && dialect != Some(DialectType::SQLite)
+            && matches!(child, Expression::JsonExtract(f) | Expression::JsonExtractScalar(f) if f.arrow_syntax)
+        {
+            return true;
+        }
+
+        // Prefix NOT binds below comparisons; transformed function operands may
+        // contain it without the explicit parentheses a SQL parser would retain.
+        if matches!(child, Expression::Not(_))
+            && (parent == InfixOperator::Comparison || parent.is_arithmetic())
+        {
+            return true;
+        }
+
+        // DuckDB JSON -> binds below comparison and boolean operators.
+        if Self::is_low_precedence_json_arrow(dialect, child) {
+            return true;
         }
 
         // Bitwise precedence differs between dialects. Group these operands
@@ -26032,17 +27161,51 @@ impl Generator {
             return false;
         };
 
-        match child_operator.precedence().cmp(&parent.precedence()) {
+        if parent == InfixOperator::Concat
+            && child_operator == InfixOperator::Concat
+            && matches!(side, OperandSide::Right)
+        {
+            // Concatenation is associative, but flattening its right subtree
+            // must not capture the document of a same-tier JSON extraction:
+            // a || (b ->> p || c) is not a || b ->> p || c in SQLite.
+            let mut first = child;
+            loop {
+                first = match first {
+                    Expression::Concat(op) => &op.left,
+                    Expression::DPipe(op) => &op.this,
+                    _ => break,
+                };
+            }
+            if Self::infix_operator(dialect, first)
+                .is_some_and(|op| op.precedence(dialect) == parent.precedence(dialect))
+            {
+                return true;
+            }
+        }
+
+        match child_operator
+            .precedence(dialect)
+            .cmp(&parent.precedence(dialect))
+        {
             std::cmp::Ordering::Less => true,
             std::cmp::Ordering::Greater => false,
             std::cmp::Ordering::Equal => {
                 matches!(side, OperandSide::Right)
-                    && parent.is_arithmetic()
-                    && child_operator.is_arithmetic()
+                    && ((parent.is_arithmetic() && child_operator.is_arithmetic())
+                        || parent.is_bitwise()
+                        || child_operator.is_bitwise()
+                        || matches!(parent, InfixOperator::Concat | InfixOperator::JsonExtract)
+                        || matches!(
+                            child_operator,
+                            InfixOperator::Concat | InfixOperator::JsonExtract
+                        ))
                     && !matches!(
                         (parent, child_operator),
-                        (InfixOperator::Add, InfixOperator::Add)
-                            | (InfixOperator::Mul, InfixOperator::Mul)
+                        (InfixOperator::Mul, InfixOperator::Mul)
+                            | (InfixOperator::BitwiseAnd, InfixOperator::BitwiseAnd)
+                            | (InfixOperator::BitwiseOr, InfixOperator::BitwiseOr)
+                            | (InfixOperator::BitwiseXor, InfixOperator::BitwiseXor)
+                            | (InfixOperator::Concat, InfixOperator::Concat)
                     )
             }
         }
@@ -26206,7 +27369,7 @@ impl Generator {
     /// MySQL uses <=>, other dialects use IS NOT DISTINCT FROM
     fn generate_null_safe_eq(&mut self, op: &BinaryOp) -> Result<()> {
         use crate::dialects::DialectType;
-        self.generate_expression(&op.left)?;
+        self.generate_is_operand(&op.left)?;
         self.write_space();
         if matches!(self.config.dialect, Some(DialectType::MySQL)) {
             self.write("<=>");
@@ -26214,17 +27377,17 @@ impl Generator {
             self.write_keyword("IS NOT DISTINCT FROM");
         }
         self.write_space();
-        self.generate_expression(&op.right)?;
+        self.generate_is_operand(&op.right)?;
         Ok(())
     }
 
     /// Generate IS DISTINCT FROM (null-safe inequality)
     fn generate_null_safe_neq(&mut self, op: &BinaryOp) -> Result<()> {
-        self.generate_expression(&op.left)?;
+        self.generate_is_operand(&op.left)?;
         self.write_space();
         self.write_keyword("IS DISTINCT FROM");
         self.write_space();
-        self.generate_expression(&op.right)?;
+        self.generate_is_operand(&op.right)?;
         Ok(())
     }
 
@@ -26258,6 +27421,9 @@ impl Generator {
                 if col.join_mark && self.config.supports_column_join_marks {
                     self.write(" (+)");
                 }
+            }
+            Expression::Concat(inner_op) if self.config.dialect == Some(DialectType::MySQL) => {
+                self.generate_mysql_concat_from_concat(inner_op)?;
             }
             Expression::Add(inner_op)
             | Expression::Sub(inner_op)
@@ -26346,8 +27512,9 @@ impl Generator {
         }
         // Function-like AST nodes such as MOD and DIV can render as infix
         // operators. Preserve their grouping under a symbolic unary operator.
-        let needs_parens = matches!(operator, "-" | "~")
-            && Self::infix_operator(self.config.dialect, &op.this).is_some();
+        let needs_parens = Self::is_low_precedence_json_arrow(self.config.dialect, &op.this)
+            || (matches!(operator, "-" | "~")
+                && Self::infix_operator(self.config.dialect, &op.this).is_some());
         if needs_parens {
             self.write("(");
         }
@@ -26370,7 +27537,7 @@ impl Generator {
             self.write_keyword("NOT");
             self.write_space();
         }
-        self.generate_expression(&in_expr.this)?;
+        self.generate_duckdb_json_arrow_operand(&in_expr.this)?;
         if in_expr.global {
             self.write_space();
             self.write_keyword("GLOBAL");
@@ -26500,7 +27667,7 @@ impl Generator {
             self.write_keyword("NOT");
             self.write_space();
         }
-        self.generate_expression(&between.this)?;
+        self.generate_duckdb_json_arrow_operand(&between.this)?;
         if between.not && !use_prefix_not {
             self.write_space();
             self.write_keyword("NOT");
@@ -26516,14 +27683,58 @@ impl Generator {
             }
         }
         self.write_space();
-        self.generate_expression(&between.low)?;
+        self.generate_duckdb_json_arrow_operand(&between.low)?;
         self.write_space();
         self.write_keyword("AND");
         self.write_space();
-        self.generate_expression(&between.high)
+        self.generate_duckdb_json_arrow_operand(&between.high)
+    }
+
+    fn generate_is_operand(&mut self, expression: &Expression) -> Result<()> {
+        // IS binds more tightly than boolean connectors, prefix NOT and DuckDB JSON arrows.
+        let grouped = Self::is_low_precedence_json_arrow(self.config.dialect, expression)
+            || matches!(
+                expression,
+                Expression::And(_)
+                    | Expression::Or(_)
+                    | Expression::Xor(_)
+                    | Expression::Not(_)
+                    | Expression::Eq(_)
+                    | Expression::Neq(_)
+                    | Expression::Lt(_)
+                    | Expression::Lte(_)
+                    | Expression::Gt(_)
+                    | Expression::Gte(_)
+                    | Expression::NullSafeEq(_)
+                    | Expression::NullSafeNeq(_)
+            );
+        if grouped {
+            self.write("(");
+        }
+        self.generate_expression(expression)?;
+        if grouped {
+            self.write(")");
+        }
+        Ok(())
     }
 
     fn generate_is_null(&mut self, is_null: &IsNull) -> Result<()> {
+        if self.config.dialect == Some(DialectType::DuckDB) {
+            if let Expression::IsNull(inner) = &is_null.this {
+                self.write("(");
+                if inner.not {
+                    self.write("NOT ");
+                }
+                self.generate_is_operand(&inner.this)?;
+                self.write(" IS NULL)");
+                self.write(if is_null.not {
+                    " IS NOT NULL"
+                } else {
+                    " IS NULL"
+                });
+                return Ok(());
+            }
+        }
         // Generic mode: normalize IS NOT NULL to prefix form: NOT x IS NULL
         let use_prefix_not = is_null.not
             && (self.config.dialect.is_none()
@@ -26533,13 +27744,13 @@ impl Generator {
             // NOT x IS NULL (generic normalization and NOTNULL postfix form)
             self.write_keyword("NOT");
             self.write_space();
-            self.generate_expression(&is_null.this)?;
+            self.generate_is_operand(&is_null.this)?;
             self.write_space();
             self.write_keyword("IS");
             self.write_space();
             self.write_keyword("NULL");
         } else {
-            self.generate_expression(&is_null.this)?;
+            self.generate_is_operand(&is_null.this)?;
             self.write_space();
             self.write_keyword("IS");
             if is_null.not {
@@ -26553,7 +27764,7 @@ impl Generator {
     }
 
     fn generate_is_true(&mut self, is_true: &IsTrueFalse) -> Result<()> {
-        self.generate_expression(&is_true.this)?;
+        self.generate_is_operand(&is_true.this)?;
         self.write_space();
         self.write_keyword("IS");
         if is_true.not {
@@ -26566,7 +27777,7 @@ impl Generator {
     }
 
     fn generate_is_false(&mut self, is_false: &IsTrueFalse) -> Result<()> {
-        self.generate_expression(&is_false.this)?;
+        self.generate_is_operand(&is_false.this)?;
         self.write_space();
         self.write_keyword("IS");
         if is_false.not {
@@ -26579,7 +27790,7 @@ impl Generator {
     }
 
     fn generate_is_json(&mut self, is_json: &IsJson) -> Result<()> {
-        self.generate_expression(&is_json.this)?;
+        self.generate_is_operand(&is_json.this)?;
         self.write_space();
         self.write_keyword("IS");
         if is_json.negated {
@@ -26616,11 +27827,11 @@ impl Generator {
     }
 
     fn generate_is(&mut self, is_expr: &BinaryOp) -> Result<()> {
-        self.generate_expression(&is_expr.left)?;
+        self.generate_is_operand(&is_expr.left)?;
         self.write_space();
         self.write_keyword("IS");
         self.write_space();
-        self.generate_expression(&is_expr.right)
+        self.generate_is_operand(&is_expr.right)
     }
 
     fn generate_exists(&mut self, exists: &Exists) -> Result<()> {
@@ -26950,7 +28161,23 @@ impl Generator {
                         self.write_space();
                     }
                     // field is an In expression: column IN (values)
-                    self.generate_expression(field)?;
+                    if self.config.dialect == Some(DialectType::Oracle) {
+                        let mut unqualified = field.clone();
+                        if let Expression::In(in_list) = &mut unqualified {
+                            in_list.this =
+                                crate::dialects::transform_recursive(in_list.this.clone(), &|e| {
+                                    if let Expression::Column(mut c) = e {
+                                        c.table = None;
+                                        Ok(Expression::Column(c))
+                                    } else {
+                                        Ok(e)
+                                    }
+                                })?;
+                        }
+                        self.generate_expression(&unqualified)?;
+                    } else {
+                        self.generate_expression(field)?;
+                    }
                 }
             }
 
@@ -26975,8 +28202,10 @@ impl Generator {
         // Alias
         if let Some(alias) = &pivot.alias {
             self.write_space();
-            self.write_keyword("AS");
-            self.write_space();
+            if self.config.dialect != Some(DialectType::Oracle) {
+                self.write_keyword("AS");
+                self.write_space();
+            }
             self.generate_identifier(alias)?;
             self.generate_alias_column_list(&pivot.alias_columns)?;
         }
@@ -27022,13 +28251,27 @@ impl Generator {
             if i > 0 {
                 self.write(", ");
             }
-            self.generate_expression(col)?;
+            if self.config.dialect == Some(DialectType::Oracle) {
+                let unqualified = crate::dialects::transform_recursive(col.clone(), &|e| {
+                    if let Expression::Column(mut c) = e {
+                        c.table = None;
+                        Ok(Expression::Column(c))
+                    } else {
+                        Ok(e)
+                    }
+                })?;
+                self.generate_expression(&unqualified)?;
+            } else {
+                self.generate_expression(col)?;
+            }
         }
         self.write("))");
         if let Some(alias) = &unpivot.alias {
             self.write_space();
-            self.write_keyword("AS");
-            self.write_space();
+            if self.config.dialect != Some(DialectType::Oracle) {
+                self.write_keyword("AS");
+                self.write_space();
+            }
             self.generate_identifier(alias)?;
             self.generate_alias_column_list(&unpivot.alias_columns)?;
         }
@@ -27195,24 +28438,24 @@ impl Generator {
     }
 
     fn generate_ordered(&mut self, ordered: &Ordered) -> Result<()> {
-        let unsupported_tsql_null_ordering = ordered.nulls_first.is_some()
+        let unsupported_null_ordering = ordered.nulls_first.is_some()
             && !self.config.null_ordering_supported
             && matches!(
                 self.config.dialect,
-                Some(DialectType::TSQL) | Some(DialectType::Fabric)
+                Some(DialectType::TSQL) | Some(DialectType::Fabric) | Some(DialectType::MySQL)
             );
         let random_ordering = matches!(ordered.this, Expression::Rand(_) | Expression::Random(_));
-        let emulate_tsql_null_ordering = if let Some(nulls_first) = ordered.nulls_first {
+        let emulate_null_ordering = if let Some(nulls_first) = ordered.nulls_first {
             let target_default_nulls_first = !ordered.desc;
 
-            unsupported_tsql_null_ordering
+            unsupported_null_ordering
                 && nulls_first != target_default_nulls_first
                 && !random_ordering
         } else {
             false
         };
 
-        if emulate_tsql_null_ordering {
+        if emulate_null_ordering {
             if Self::is_integer_ordering_literal(&ordered.this) {
                 let nulls_order = if ordered.nulls_first == Some(true) {
                     "NULLS FIRST"
@@ -27260,7 +28503,7 @@ impl Generator {
             self.write_keyword("ASC");
         }
         if let Some(nulls_first) = ordered.nulls_first {
-            if !unsupported_tsql_null_ordering
+            if !unsupported_null_ordering
                 && (self.config.null_ordering_supported
                     || !matches!(self.config.dialect, Some(DialectType::Fabric)))
             {
@@ -27938,6 +29181,71 @@ impl Generator {
             return Ok(());
         }
 
+        if self.config.dialect == Some(DialectType::ClickHouse) {
+            // A generator without source metadata is also used for native
+            // ClickHouse identity generation. Only an explicit foreign source
+            // requests automatic nullability; native wrappers remain explicit.
+            let foreign = self
+                .config
+                .source_dialect
+                .is_some_and(|source| source != DialectType::ClickHouse);
+            let scalar = matches!(
+                dt,
+                DataType::Boolean
+                    | DataType::TinyInt { .. }
+                    | DataType::SmallInt { .. }
+                    | DataType::Int { .. }
+                    | DataType::BigInt { .. }
+                    | DataType::Int128
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::UInt128
+                    | DataType::Float { .. }
+                    | DataType::Double { .. }
+                    | DataType::Decimal { .. }
+                    | DataType::Char { .. }
+                    | DataType::VarChar { .. }
+                    | DataType::Text
+                    | DataType::String { .. }
+                    | DataType::Date
+                    | DataType::Time { .. }
+                    | DataType::Timestamp { .. }
+                    | DataType::Uuid
+            ) || matches!(dt, DataType::Custom { name } if matches!(name.to_ascii_uppercase().as_str(),
+                "DOUBLE PRECISION" | "FLOAT8" | "DATE32" | "DATETIME" | "TIMESTAMPTZ"
+                | "DATETIME64" | "TIMESTAMPNTZ" | "UUID" | "STRING"));
+            if foreign && scalar && self.clickhouse_nullable_depth >= 0 {
+                self.write("Nullable(");
+                let saved_depth = self.clickhouse_nullable_depth;
+                self.clickhouse_nullable_depth = -1;
+                let result = self.generate_data_type_inner(dt);
+                self.clickhouse_nullable_depth = saved_depth;
+                result?;
+                self.write(")");
+                return Ok(());
+            }
+            match dt {
+                DataType::Char { .. } | DataType::VarChar { .. } | DataType::String { .. }
+                    if foreign =>
+                {
+                    self.write("String");
+                    return Ok(());
+                }
+                DataType::Custom { name }
+                    if matches!(
+                        name.to_ascii_uppercase().as_str(),
+                        "DOUBLE PRECISION" | "FLOAT8"
+                    ) =>
+                {
+                    self.write("Float64");
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
         match dt {
             DataType::Boolean => {
                 // Dialect-specific boolean type mappings
@@ -28062,7 +29370,7 @@ impl Generator {
                     _ => unreachable!(),
                 };
                 if self.config.dialect == Some(DialectType::ClickHouse) {
-                    // As with Int128, only an explicit Nullable wrapper adds nullability.
+                    // Native types retain explicit nullability; foreign scalar wrapping is handled above.
                     self.write(clickhouse);
                 } else {
                     // Do not silently discard signedness or narrow unsupported targets.
@@ -29804,9 +31112,12 @@ impl Generator {
                     }
                 }
             }
-            DataType::CharacterSet { name } => {
-                // For MySQL CONVERT USING - output as CHAR CHARACTER SET name
-                self.write_keyword("CHAR CHARACTER SET ");
+            DataType::CharacterSet { name, length } => {
+                self.write_keyword("CHAR");
+                if let Some(length) = length {
+                    self.write(&format!("({length})"));
+                }
+                self.write_keyword(" CHARACTER SET ");
                 self.write(name);
             }
             _ => self.write("UNKNOWN"),
@@ -29988,6 +31299,56 @@ impl Generator {
     /// `FETCH FIRST n ROWS ONLY`) is parenthesized, so the limit stays on that
     /// branch instead of binding to the whole set operation. ClickHouse already
     /// binds branch LIMITs locally.
+    fn generate_set_left_operand(&mut self, expr: &Expression) -> Result<()> {
+        // SQLite evaluates all compound operators left to right. A modifier-free
+        // left grouping can be flattened without a SELECT * wrapper, which would
+        // rename duplicate output columns (x, x becomes x, x:1).
+        fn flattenable(e: &Expression) -> bool {
+            match e {
+                Expression::Subquery(s) => {
+                    s.alias.is_none()
+                        && s.order_by.is_none()
+                        && s.limit.is_none()
+                        && s.offset.is_none()
+                        && s.distribute_by.is_none()
+                        && s.sort_by.is_none()
+                        && s.cluster_by.is_none()
+                        && flattenable(&s.this)
+                }
+                Expression::Union(u) => {
+                    u.with.is_none()
+                        && u.order_by.is_none()
+                        && u.limit.is_none()
+                        && u.offset.is_none()
+                }
+                Expression::Intersect(u) => {
+                    u.with.is_none()
+                        && u.order_by.is_none()
+                        && u.limit.is_none()
+                        && u.offset.is_none()
+                }
+                Expression::Except(u) => {
+                    u.with.is_none()
+                        && u.order_by.is_none()
+                        && u.limit.is_none()
+                        && u.offset.is_none()
+                }
+                _ => false,
+            }
+        }
+        if self.config.dialect == Some(DialectType::SQLite) && flattenable(expr) {
+            if let Expression::Subquery(s) = expr {
+                self.generate_set_left_operand(&s.this)?;
+                for comment in &s.trailing_comments {
+                    self.write_space();
+                    self.write_formatted_comment(comment);
+                }
+                return Ok(());
+            }
+        }
+        self.generate_set_operand(expr)
+    }
+
     fn generate_set_operand(&mut self, expr: &Expression) -> Result<()> {
         // Group the annotated operand itself, keeping its comments outside the parentheses.
         if let Expression::Annotated(annotated) = expr {
@@ -30610,6 +31971,10 @@ impl Generator {
             }
             self.write(")");
         }
+        for table in &e.tables {
+            self.write(", ");
+            self.generate_expression(table)?;
+        }
         if let Some(partition) = &e.partition {
             self.write_space();
             self.generate_expression(partition)?;
@@ -30799,7 +32164,16 @@ impl Generator {
         self.write_space();
         self.write_keyword("APPLY");
         self.write("(");
-        self.generate_expression(&e.expression)?;
+        if let Expression::Tuple(arguments) = e.expression.as_ref() {
+            for (index, argument) in arguments.expressions.iter().enumerate() {
+                if index > 0 {
+                    self.write(", ");
+                }
+                self.generate_expression(argument)?;
+            }
+        } else {
+            self.generate_expression(&e.expression)?;
+        }
         self.write(")");
         Ok(())
     }
@@ -32007,6 +33381,15 @@ impl Generator {
     /// Handles MySQL/PostgreSQL: GENERATED ALWAYS AS (expr) STORED|VIRTUAL
     /// Handles TSQL: AS (expr) [PERSISTED] [NOT NULL]
     fn generate_computed_column_inline(&mut self, cc: &ComputedColumn) -> Result<()> {
+        if self.config.dialect == Some(DialectType::SQLite) {
+            self.write_keyword("AS (");
+            self.generate_expression(&cc.expression)?;
+            self.write(")");
+            if cc.persisted {
+                self.write_keyword(" STORED");
+            }
+            return Ok(());
+        }
         if self.config.dialect == Some(DialectType::HANA) {
             self.write("GENERATED ALWAYS AS ");
             self.generate_expression(&cc.expression)?;
@@ -32888,9 +34271,9 @@ impl Generator {
             self.generate_mysql_concat_from_dpipe(e)?;
         } else {
             // String concatenation: this || expression
-            self.generate_expression(&e.this)?;
+            self.generate_infix_operand(InfixOperator::Concat, &e.this, OperandSide::Left)?;
             self.write(" || ");
-            self.generate_expression(&e.expression)?;
+            self.generate_infix_operand(InfixOperator::Concat, &e.expression, OperandSide::Right)?;
         }
         Ok(())
     }
@@ -33789,7 +35172,6 @@ impl Generator {
                     | Some(DialectType::StarRocks)
                     | Some(DialectType::Doris)
                     | Some(DialectType::Athena)
-                    | Some(DialectType::ClickHouse)
                     | Some(DialectType::Redshift)
             )
     }
@@ -33831,6 +35213,10 @@ impl Generator {
             }
             return Ok(());
         }
+        self.generate_fetch_clause(e)
+    }
+
+    fn generate_fetch_clause(&mut self, e: &Fetch) -> Result<()> {
         if e.with_ties
             && matches!(
                 self.config.dialect,
@@ -34669,7 +36055,11 @@ impl Generator {
             self.indent_level += 1;
             for (i, expr) in regular_expressions.iter().enumerate() {
                 if i > 0 {
-                    self.write(",");
+                    if !(self.config.dialect == Some(DialectType::Hive)
+                        && matches!(expr, Expression::GroupingSets(_)))
+                    {
+                        self.write(",");
+                    }
                     self.write_newline();
                 }
                 self.write_indent();
@@ -34680,7 +36070,15 @@ impl Generator {
             self.write_space();
             for (i, expr) in regular_expressions.iter().enumerate() {
                 if i > 0 {
-                    self.write(", ");
+                    self.write(
+                        if self.config.dialect == Some(DialectType::Hive)
+                            && matches!(expr, Expression::GroupingSets(_))
+                        {
+                            " "
+                        } else {
+                            ", "
+                        },
+                    );
                 }
                 self.generate_expression(expr)?;
             }
@@ -35762,11 +37160,8 @@ impl Generator {
                 }
             }
         }
-        // Output as quoted string
-        self.write("'");
-        self.write(&path_str);
-        self.write("'");
-        Ok(())
+        // JSONPath quoting and SQL string quoting are separate escaping layers.
+        self.generate_literal(&Literal::String(path_str))
     }
 
     fn generate_json_path_filter(&mut self, e: &JSONPathFilter) -> Result<()> {
@@ -36089,14 +37484,21 @@ impl Generator {
             self.generate_expression(&e.this)?;
             if let Some(alias) = &e.alias {
                 self.write_space();
-                self.write(alias);
+                self.generate_alias_identifier(&Identifier {
+                    quoted: e.alias_quoted,
+                    ..Identifier::new(alias)
+                })?;
             }
         } else {
             // LATERAL subquery/function [WITH ORDINALITY] [AS alias(columns)]
             self.write_keyword("LATERAL");
             self.write_space();
             self.generate_expression(&e.this)?;
-            if e.ordinality.is_some() {
+            // UNNEST renders its own ordinality (or target-specific OFFSET).
+            // The wrapper flag can also be present in parsed and legacy ASTs.
+            if e.ordinality.is_some()
+                && !matches!(e.this.as_ref(), Expression::Unnest(unnest) if unnest.with_ordinality)
+            {
                 self.write_space();
                 self.write_keyword("WITH ORDINALITY");
             }
@@ -36104,14 +37506,20 @@ impl Generator {
                 self.write_space();
                 self.write_keyword("AS");
                 self.write_space();
-                self.write(alias);
+                self.generate_alias_identifier(&Identifier {
+                    quoted: e.alias_quoted,
+                    ..Identifier::new(alias)
+                })?;
                 if !e.column_aliases.is_empty() {
                     self.write("(");
                     for (i, col) in e.column_aliases.iter().enumerate() {
                         if i > 0 {
                             self.write(", ");
                         }
-                        self.write(col);
+                        self.generate_alias_identifier(&Identifier {
+                            quoted: e.column_aliases_quoted.get(i).copied().unwrap_or(false),
+                            ..Identifier::new(col)
+                        })?;
                     }
                     self.write(")");
                 }
@@ -36139,10 +37547,15 @@ impl Generator {
         limit: Option<&Expression>,
         offset: Option<&Expression>,
     ) -> Result<()> {
-        let fetch_form = match limit {
-            Some(Expression::Fetch(fetch)) => !self.fetch_uses_limit(fetch),
-            _ => self.uses_fetch_first_limit(),
-        };
+        let tsql = matches!(
+            self.config.dialect,
+            Some(DialectType::TSQL | DialectType::Fabric)
+        );
+        let fetch_form = tsql
+            || match limit {
+                Some(Expression::Fetch(fetch)) => !self.fetch_uses_limit(fetch),
+                _ => self.uses_fetch_first_limit(),
+            };
         let offset_first = fetch_form
             || matches!(
                 self.config.dialect,
@@ -36161,7 +37574,7 @@ impl Generator {
                 match limit {
                     Expression::Limit(limit) => self.generate_limit(limit)?,
                     Expression::Fetch(fetch) => self.generate_fetch(fetch)?,
-                    count if self.uses_fetch_first_limit() => {
+                    count if self.uses_fetch_first_limit() || tsql => {
                         self.write_fetch_first(count, false, false)?
                     }
                     count => {
@@ -36260,6 +37673,41 @@ impl Generator {
         for comment in &e.comments {
             self.write(" ");
             self.write_formatted_comment(comment);
+        }
+        Ok(())
+    }
+
+    fn generate_limit_range(&mut self, e: &LimitRange) -> Result<()> {
+        if !matches!(self.config.dialect, Some(DialectType::ClickHouse) | None) {
+            return Err(crate::error::Error::unsupported(
+                "LIMIT AFTER/UNTIL stream boundaries",
+                "target dialect",
+            ));
+        }
+        if let Some(count) = &e.count {
+            self.generate_expression(count)?;
+        }
+        if let Some(after) = &e.after {
+            if e.count.is_some() {
+                self.write_space();
+            }
+            self.write_keyword("AFTER");
+            self.write_space();
+            self.generate_expression(after)?;
+            if e.after_all {
+                self.write_keyword(" ALL");
+            }
+        }
+        if let Some(until) = &e.until {
+            if e.count.is_some() || e.after.is_some() {
+                self.write_space();
+            }
+            self.write_keyword("UNTIL");
+            self.write_space();
+            self.generate_expression(until)?;
+        }
+        if e.with_ties {
+            self.write_keyword(" WITH TIES");
         }
         Ok(())
     }
@@ -36484,6 +37932,15 @@ impl Generator {
     }
 
     fn generate_locking_statement(&mut self, e: &LockingStatement) -> Result<()> {
+        if !matches!(
+            self.config.dialect,
+            None | Some(DialectType::Generic | DialectType::Teradata)
+        ) {
+            return Err(crate::error::Error::unsupported(
+                "Teradata LOCKING isolation semantics",
+                "target dialect",
+            ));
+        }
         // this expression
         self.generate_expression(&e.this)?;
         self.write_space();
@@ -37093,6 +38550,15 @@ impl Generator {
     }
 
     fn generate_multitable_inserts(&mut self, e: &MultitableInserts) -> Result<()> {
+        if !matches!(
+            self.config.dialect,
+            None | Some(DialectType::Generic | DialectType::Oracle | DialectType::Snowflake)
+        ) {
+            return Err(crate::error::Error::unsupported(
+                "Conditional multi-table INSERT",
+                "target dialect",
+            ));
+        }
         // Output leading comments
         for comment in &e.leading_comments {
             self.write_formatted_comment(comment);
@@ -37109,8 +38575,12 @@ impl Generator {
             self.write_space();
             self.write_keyword("OVERWRITE");
         }
-        self.write_space();
-        self.write(&e.kind);
+        if !e.kind.is_empty() {
+            self.write_space();
+            self.write(&e.kind);
+        } else if self.config.dialect == Some(DialectType::Snowflake) {
+            self.write(" ALL");
+        }
         if self.config.pretty {
             self.indent_level += 1;
             for expr in &e.expressions {
@@ -37329,6 +38799,16 @@ impl Generator {
         Ok(())
     }
 
+    fn generate_set_assignment(&mut self, expr: &Expression) -> Result<()> {
+        if let Expression::Eq(eq) = expr {
+            self.generate_expression(&eq.left)?;
+            self.write(" = ");
+            self.generate_expression(&eq.right)
+        } else {
+            self.generate_expression(expr)
+        }
+    }
+
     fn generate_on_conflict(&mut self, e: &OnConflict) -> Result<()> {
         // Materialize doesn't support ON CONFLICT - skip entirely
         if matches!(self.config.dialect, Some(DialectType::Materialize)) {
@@ -37343,7 +38823,7 @@ impl Generator {
                     self.write(",");
                 }
                 self.write_space();
-                self.generate_expression(expr)?;
+                self.generate_set_assignment(expr)?;
             }
             return Ok(());
         } else {
@@ -37361,7 +38841,7 @@ impl Generator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expression(expr)?;
+                    self.generate_set_assignment(expr)?;
                 }
                 self.write(")");
             } else {
@@ -37390,7 +38870,7 @@ impl Generator {
                     if i > 0 {
                         self.write(", ");
                     }
-                    self.generate_expression(expr)?;
+                    self.generate_set_assignment(expr)?;
                 }
             } else {
                 self.write_keyword(" DO ");
@@ -38434,10 +39914,8 @@ impl Generator {
         self.write_space();
 
         // Source file path - preserve original quoting
-        if e.source_quoted {
-            self.write("'");
-            self.write(&e.source);
-            self.write("'");
+        if e.source_quoted || e.source.starts_with("file://") {
+            self.generate_string_literal(&e.source)?;
         } else {
             self.write(&e.source);
         }
@@ -38664,11 +40142,23 @@ impl Generator {
         self.write_keyword("SET");
         self.write_space();
         self.generate_expression(&e.expression)?;
+        if let Some(value) = &e.mark_value {
+            self.write_keyword(" TO ");
+            self.generate_expression(value)?;
+        }
+        if let Some(value) = &e.default_value {
+            self.write_keyword(" DEFAULT ");
+            self.generate_expression(value)?;
+        }
         if let Some(using) = &e.using {
             self.write_space();
             self.write_keyword("USING");
             self.write_space();
             self.generate_expression(using)?;
+        }
+        if let Some(next) = &e.next {
+            self.write_space();
+            self.generate_expression(next)?;
         }
         Ok(())
     }
@@ -38717,6 +40207,17 @@ impl Generator {
     }
 
     fn generate_refresh(&mut self, e: &Refresh) -> Result<()> {
+        if (!e.partitions.is_empty() || e.partition_range.is_some() || e.force || e.mode.is_some())
+            && !matches!(
+                self.config.dialect,
+                Some(DialectType::StarRocks | DialectType::Doris)
+            )
+        {
+            return Err(crate::error::Error::unsupported(
+                "REFRESH partition/force/mode",
+                "target dialect",
+            ));
+        }
         // REFRESH [kind] this
         self.write_keyword("REFRESH");
         if !e.kind.is_empty() {
@@ -38725,10 +40226,87 @@ impl Generator {
         }
         self.write_space();
         self.generate_expression(&e.this)?;
+        if !e.partitions.is_empty() {
+            self.write_keyword(" PARTITION(");
+            for (i, partition) in e.partitions.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.generate_expression(partition)?;
+            }
+            self.write(")");
+        }
+        if let Some((start, end)) = &e.partition_range {
+            self.write_keyword(" PARTITION START (");
+            self.generate_expression(start)?;
+            self.write_keyword(") END (");
+            self.generate_expression(end)?;
+            self.write(")");
+        }
+        if e.force {
+            self.write_keyword(" FORCE");
+        }
+        if let Some(mode) = &e.mode {
+            self.write_keyword(&format!(" WITH {mode} MODE"));
+        }
+        Ok(())
+    }
+
+    fn generate_refresh_intervals(&mut self, intervals: &[(Expression, Identifier)]) -> Result<()> {
+        for (value, unit) in intervals {
+            self.write(" ");
+            self.generate_expression(value)?;
+            self.write(" ");
+            self.generate_identifier(unit)?;
+        }
         Ok(())
     }
 
     fn generate_refresh_trigger_property(&mut self, e: &RefreshTriggerProperty) -> Result<()> {
+        if let Some(refresh) = &e.clickhouse {
+            if self.config.dialect != Some(DialectType::ClickHouse) {
+                return Err(crate::error::Error::unsupported(
+                    "ClickHouse REFRESH schedule",
+                    "target dialect",
+                ));
+            }
+            self.write("REFRESH");
+            if let Some(schedule) = &refresh.schedule {
+                self.write(" ");
+                self.write(schedule);
+            }
+            self.generate_refresh_intervals(&refresh.intervals)?;
+            if !refresh.offset.is_empty() {
+                self.write(" OFFSET");
+                self.generate_refresh_intervals(&refresh.offset)?;
+            }
+            if !refresh.randomize.is_empty() {
+                self.write(" RANDOMIZE FOR");
+                self.generate_refresh_intervals(&refresh.randomize)?;
+            }
+            if !refresh.depends_on.is_empty() {
+                self.write(" DEPENDS ON ");
+                for (i, table) in refresh.depends_on.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.generate_table(table)?;
+                }
+            }
+            if !refresh.settings.is_empty() {
+                self.write(" SETTINGS ");
+                for (i, setting) in refresh.settings.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.generate_expression(setting)?;
+                }
+            }
+            if refresh.append {
+                self.write(" APPEND");
+            }
+            return Ok(());
+        }
         // Doris REFRESH clause: REFRESH method ON kind [EVERY n UNIT] [STARTS 'datetime']
         self.write_keyword("REFRESH");
         self.write_space();
@@ -38797,13 +40375,29 @@ impl Generator {
         Ok(())
     }
 
+    fn validate_regexp_full_match_target(&self) -> Result<()> {
+        if let Some(dialect) = self.config.dialect {
+            if !matches!(dialect, DialectType::DuckDB | DialectType::Generic) {
+                return Err(crate::error::Error::unsupported(
+                    "full-match regular expression without a verified target mapping",
+                    format!("{dialect:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn generate_regexp_full_match(&mut self, e: &RegexpFullMatch) -> Result<()> {
-        // REGEXP_FULL_MATCH(this, expression)
+        self.validate_regexp_full_match_target()?;
         self.write_keyword("REGEXP_FULL_MATCH");
         self.write("(");
         self.generate_expression(&e.this)?;
         self.write(", ");
         self.generate_expression(&e.expression)?;
+        for option in &e.options {
+            self.write(", ");
+            self.generate_expression(option)?;
+        }
         self.write(")");
         Ok(())
     }
@@ -39922,6 +41516,8 @@ impl Generator {
         self.write(":");
         if let Some(end) = &e.expression {
             self.generate_expression(end)?;
+        } else if e.step.is_some() && self.config.dialect == Some(DialectType::DuckDB) {
+            self.write("-");
         }
         if let Some(step) = &e.step {
             self.write(":");
@@ -42795,6 +44391,88 @@ impl Generator {
     }
 
     fn generate_unicode_string(&mut self, e: &UnicodeString) -> Result<()> {
+        use crate::error::Error;
+        if !matches!(
+            self.config.dialect,
+            None | Some(
+                DialectType::Generic
+                    | DialectType::PostgreSQL
+                    | DialectType::CockroachDB
+                    | DialectType::Presto
+                    | DialectType::Trino
+                    | DialectType::Athena
+            )
+        ) {
+            let value = match e.this.as_ref() {
+                Expression::Literal(l) => match l.as_ref() {
+                    Literal::String(s) => s,
+                    _ => {
+                        return Err(Error::unsupported(
+                            "Unicode string literal",
+                            "target dialect",
+                        ))
+                    }
+                },
+                _ => {
+                    return Err(Error::unsupported(
+                        "Unicode string literal",
+                        "target dialect",
+                    ))
+                }
+            };
+            let escape = match e.escape.as_deref() {
+                Some(Expression::Literal(l)) => match l.as_ref() {
+                    Literal::String(s) if s.chars().count() == 1 => s.chars().next().unwrap(),
+                    _ => {
+                        return Err(Error::unsupported(
+                            "Invalid UESCAPE character",
+                            "target dialect",
+                        ))
+                    }
+                },
+                None => '\\',
+                _ => return Err(Error::unsupported("Nonliteral UESCAPE", "target dialect")),
+            };
+            let mut chars = value.chars();
+            let mut units = Vec::new();
+            while let Some(ch) = chars.next() {
+                if ch != escape {
+                    units.extend(ch.encode_utf16(&mut [0; 2]).iter().copied());
+                    continue;
+                }
+                let next = chars.next().ok_or_else(|| {
+                    Error::unsupported("Incomplete Unicode escape", "target dialect")
+                })?;
+                if next == escape {
+                    units.extend(escape.encode_utf16(&mut [0; 2]).iter().copied());
+                    continue;
+                }
+                let long = next == '+';
+                let mut digits = String::new();
+                if !long {
+                    digits.push(next);
+                }
+                for _ in 0..if long { 6 } else { 3 } {
+                    digits.push(chars.next().ok_or_else(|| {
+                        Error::unsupported("Incomplete Unicode escape", "target dialect")
+                    })?);
+                }
+                let code = u32::from_str_radix(&digits, 16)
+                    .map_err(|_| Error::unsupported("Invalid Unicode escape", "target dialect"))?;
+                if long {
+                    let ch = char::from_u32(code).ok_or_else(|| {
+                        Error::unsupported("Invalid Unicode codepoint", "target dialect")
+                    })?;
+                    units.extend(ch.encode_utf16(&mut [0; 2]).iter().copied());
+                } else {
+                    units.push(code as u16);
+                }
+            }
+            let decoded = String::from_utf16(&units).map_err(|_| {
+                Error::unsupported("Invalid Unicode surrogate pair", "target dialect")
+            })?;
+            return self.generate_string_literal(&decoded);
+        }
         // U&this [UESCAPE escape]
         self.write("U&");
         self.generate_expression(&e.this)?;
@@ -42852,9 +44530,51 @@ impl Generator {
         Ok(())
     }
 
+    fn generate_oracle_table_property(&mut self, property: &OracleTableProperty) -> Result<()> {
+        if self.config.dialect != Some(DialectType::Oracle) {
+            return Err(crate::error::Error::unsupported(
+                "Oracle physical table attributes",
+                "target dialect",
+            ));
+        }
+        self.write_keyword(&property.name);
+        if let Some(value) = &property.value {
+            self.write_space();
+            self.generate_expression(value)?;
+        }
+        if let Some(unit) = &property.unit {
+            self.write_keyword(unit);
+        }
+        if !property.options.is_empty() {
+            self.write(" (");
+            for (i, option) in property.options.iter().enumerate() {
+                if i > 0 {
+                    self.write_space();
+                }
+                self.generate_oracle_table_property(option)?;
+            }
+            self.write(")");
+        }
+        Ok(())
+    }
+
     fn generate_unique_key_property(&mut self, e: &UniqueKeyProperty) -> Result<()> {
         // UNIQUE KEY (expressions)
         self.write_keyword("UNIQUE KEY");
+        self.write(" (");
+        for (i, expr) in e.expressions.iter().enumerate() {
+            if i > 0 {
+                self.write(", ");
+            }
+            self.generate_expression(expr)?;
+        }
+        self.write(")");
+        Ok(())
+    }
+
+    fn generate_aggregate_key_property(&mut self, e: &UniqueKeyProperty) -> Result<()> {
+        // AGGREGATE KEY (expressions)
+        self.write_keyword("AGGREGATE KEY");
         self.write(" (");
         for (i, expr) in e.expressions.iter().enumerate() {
             if i > 0 {
@@ -43335,6 +45055,71 @@ impl Generator {
         // e.expression = the value expression
         // Hive does NOT use the FOR prefix for time travel
         use crate::dialects::DialectType;
+        if matches!(e.kind.as_str(), "AT" | "BEFORE") {
+            if self.config.dialect != Some(DialectType::Snowflake) {
+                return Err(crate::error::Error::unsupported(
+                    "CLONE AT/BEFORE",
+                    "target dialect",
+                ));
+            }
+            self.write(&e.kind);
+            self.write(" (");
+            self.generate_expression(&e.this)?;
+            self.write(" => ");
+            if let Some(value) = &e.expression {
+                self.generate_expression(value)?;
+            }
+            self.write(")");
+            return Ok(());
+        }
+        // An Oracle SCN is a database change number, not a timestamp and not
+        // another system's snapshot identifier, so there is nothing to convert
+        // it into. Left to the paths below it produced invalid SQL for
+        // PostgreSQL and Trino (`FOR SCN AS OF 12345`) and, worse, valid SQL
+        // with a different meaning for Dremio, whose branch treats every kind
+        // other than VERSION as a timestamp and so reinterpreted the change
+        // number as one.
+        //
+        // Reported through the unsupported-construct policy, so strict mode
+        // fails rather than emitting either, and the clause is replaced by a
+        // comment rather than by fabricated target syntax.
+        if !matches!(self.config.dialect, Some(DialectType::Oracle))
+            && self.config.dialect.is_some()
+            && version_kind_is(e, "SCN")
+        {
+            return self.write_unsupported_comment(
+                "Oracle AS OF SCN has no equivalent in this dialect: a system change number is \
+                 not a timestamp or a snapshot identifier",
+            );
+        }
+
+        // A timestamp value alone does not make the target's time travel syntax
+        // compatible. BigQuery and Snowflake use other AST fields and clause
+        // forms; until Version is translated into those forms, report the
+        // unsupported conversion instead of falling back to Trino syntax.
+        if e.kind.eq_ignore_ascii_case("AS OF")
+            && version_kind_is(e, "TIMESTAMP")
+            && !matches!(
+                self.config.dialect,
+                None | Some(
+                    DialectType::Generic
+                        | DialectType::Oracle
+                        | DialectType::Presto
+                        | DialectType::Trino
+                        | DialectType::Athena
+                        | DialectType::Dune
+                        | DialectType::Hive
+                        | DialectType::Spark
+                        | DialectType::Databricks
+                        | DialectType::Dremio
+                )
+            )
+        {
+            return self.write_unsupported_comment(
+                "AS OF TIMESTAMP conversion is not supported for this target dialect",
+            );
+        }
+
         if matches!(self.config.dialect, Some(DialectType::Dremio)) {
             self.write_keyword("AT");
             self.write_space();
@@ -43345,6 +45130,27 @@ impl Generator {
                 _ => "TIMESTAMP",
             };
             self.write_keyword(name);
+            if let Some(expression) = &e.expression {
+                self.write_space();
+                self.generate_expression(expression)?;
+            }
+            return Ok(());
+        }
+        // Oracle has its own word order: the AS OF comes first and names what
+        // follows, and there is no FOR prefix.
+        //
+        //   Trino      FROM t FOR VERSION AS OF 12345
+        //   Oracle     FROM t AS OF SCN 12345
+        //
+        // So Oracle cannot share the `FOR {this} {kind}` shape below, which
+        // would emit `FOR SCN AS OF 12345`.
+        if matches!(self.config.dialect, Some(DialectType::Oracle)) {
+            self.write_keyword(&e.kind);
+            self.write_space();
+            match e.this.as_ref() {
+                Expression::Identifier(ident) => self.write_keyword(&ident.name),
+                other => self.generate_expression(other)?,
+            }
             if let Some(expression) = &e.expression {
                 self.write_space();
                 self.generate_expression(expression)?;
@@ -43495,7 +45301,20 @@ impl Generator {
                     Expression::Var(v) if v.this == "INSERT" => {
                         self.write_keyword("INSERT");
                         // Spark: INSERT * (insert all columns)
-                        if elements.len() > 1 && matches!(&elements[1], Expression::Star(_)) {
+                        if matches!(elements.get(1), Some(Expression::Var(v)) if v.this == "ALL BY NAME")
+                        {
+                            match self.config.dialect {
+                                Some(DialectType::Snowflake) => self.write_keyword(" ALL BY NAME"),
+                                Some(DialectType::Databricks) => self.write_keyword(" *"),
+                                _ => {
+                                    return Err(crate::error::Error::unsupported(
+                                        "MERGE ALL BY NAME requires column metadata",
+                                        "target dialect",
+                                    ))
+                                }
+                            }
+                        } else if elements.len() > 1 && matches!(&elements[1], Expression::Star(_))
+                        {
                             self.write(" *");
                             if let Some(Expression::Where(w)) = elements.get(2) {
                                 self.write_space();
@@ -43565,7 +45384,20 @@ impl Generator {
                     Expression::Var(v) if v.this == "UPDATE" => {
                         self.write_keyword("UPDATE");
                         // Spark: UPDATE * (update all columns)
-                        if elements.len() > 1 && matches!(&elements[1], Expression::Star(_)) {
+                        if matches!(elements.get(1), Some(Expression::Var(v)) if v.this == "ALL BY NAME")
+                        {
+                            match self.config.dialect {
+                                Some(DialectType::Snowflake) => self.write_keyword(" ALL BY NAME"),
+                                Some(DialectType::Databricks) => self.write_keyword(" SET *"),
+                                _ => {
+                                    return Err(crate::error::Error::unsupported(
+                                        "MERGE ALL BY NAME requires column metadata",
+                                        "target dialect",
+                                    ))
+                                }
+                            }
+                        } else if elements.len() > 1 && matches!(&elements[1], Expression::Star(_))
+                        {
                             self.write(" *");
                             if let Some(Expression::Where(w)) = elements.get(2) {
                                 self.write_space();
@@ -45565,7 +47397,7 @@ mod tests {
                     test_column("a"),
                     Expression::Add(Box::new(BinaryOp::new(test_column("b"), test_column("c")))),
                 ))),
-                "a + b + c",
+                "a + (b + c)",
             ),
             (
                 Expression::Add(Box::new(BinaryOp::new(
@@ -45585,6 +47417,159 @@ mod tests {
 
         for (expression, expected) in cases {
             assert_eq!(Generator::sql(&expression).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_concat_precedence_programmatic_ast() {
+        fn concat(l: Expression, r: Expression) -> Expression {
+            Expression::Concat(Box::new(BinaryOp::new(l, r)))
+        }
+        fn dpipe(l: Expression, r: Expression) -> Expression {
+            Expression::DPipe(Box::new(DPipe {
+                this: Box::new(l),
+                expression: Box::new(r),
+                safe: None,
+            }))
+        }
+        let n = Expression::number;
+        for concatenate in [concat, dpipe] {
+            let cases = [
+                (
+                    concatenate(n(1), Expression::Mul(Box::new(BinaryOp::new(n(2), n(3))))),
+                    "1 || (2 * 3)",
+                    "1 || 2 * 3",
+                    "CONCAT(1, 2 * 3)",
+                ),
+                (
+                    concatenate(Expression::Add(Box::new(BinaryOp::new(n(1), n(2)))), n(3)),
+                    "(1 + 2) || 3",
+                    "1 + 2 || 3",
+                    "CONCAT(1 + 2, 3)",
+                ),
+                (
+                    Expression::Mul(Box::new(BinaryOp::new(concatenate(n(1), n(2)), n(3)))),
+                    "1 || 2 * 3",
+                    "(1 || 2) * 3",
+                    "CONCAT(1, 2) * 3",
+                ),
+                (
+                    Expression::Mul(Box::new(BinaryOp::new(n(1), concatenate(n(2), n(3))))),
+                    "1 * 2 || 3",
+                    "1 * (2 || 3)",
+                    "1 * CONCAT(2, 3)",
+                ),
+                (
+                    Expression::Neg(Box::new(UnaryOp::new(concatenate(n(1), n(2))))),
+                    "-(1 || 2)",
+                    "-(1 || 2)",
+                    "-CONCAT(1, 2)",
+                ),
+                (
+                    Expression::Mul(Box::new(BinaryOp::new(
+                        Expression::Add(Box::new(BinaryOp::new(concatenate(n(1), n(2)), n(3)))),
+                        n(4),
+                    ))),
+                    "(1 || 2 + 3) * 4",
+                    "((1 || 2) + 3) * 4",
+                    "(CONCAT(1, 2) + 3) * 4",
+                ),
+            ];
+            for (expr, sqlite, low_precedence, mysql) in cases {
+                for (dialect, expected) in [
+                    (DialectType::SQLite, sqlite),
+                    (DialectType::PostgreSQL, low_precedence),
+                    (DialectType::DuckDB, low_precedence),
+                    (DialectType::MySQL, mysql),
+                ] {
+                    assert_eq!(
+                        crate::generate(&expr, dialect).unwrap(),
+                        expected,
+                        "{dialect:?}: {expr:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_concat_preserves_nested_json_grouping() {
+        let parsed = crate::parse_one("SELECT '[1]' ->> 0", DialectType::SQLite).unwrap();
+        let extract = parsed.as_select().unwrap().expressions[0].clone();
+        let nested = Expression::Concat(Box::new(BinaryOp::new(extract, Expression::string("y"))));
+        for right in [
+            nested.clone(),
+            Expression::Concat(Box::new(BinaryOp::new(nested, Expression::string("z")))),
+        ] {
+            let expr = Expression::Concat(Box::new(BinaryOp::new(Expression::string("x"), right)));
+            let sql = crate::generate(&expr, DialectType::SQLite).unwrap();
+            assert!(sql.starts_with("'x' || ('[1]' ->> 0 || 'y'"), "{sql}");
+            assert!(sql.ends_with(')'), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_bitwise_precedence_programmatic_ast() {
+        let n = Expression::number;
+        let cases = [
+            (
+                Expression::BitwiseAnd(Box::new(BinaryOp::new(
+                    Expression::BitwiseOr(Box::new(BinaryOp::new(n(1), n(2)))),
+                    n(4),
+                ))),
+                "1 | 2 & 4",
+                "(1 | 2) & 4",
+            ),
+            (
+                Expression::BitwiseOr(Box::new(BinaryOp::new(
+                    n(1),
+                    Expression::BitwiseAnd(Box::new(BinaryOp::new(n(2), n(4)))),
+                ))),
+                "1 | (2 & 4)",
+                "1 | 2 & 4",
+            ),
+            (
+                Expression::BitwiseLeftShift(Box::new(BinaryOp::new(
+                    Expression::BitwiseOr(Box::new(BinaryOp::new(n(1), n(2)))),
+                    n(1),
+                ))),
+                "1 | 2 << 1",
+                "(1 | 2) << 1",
+            ),
+            (
+                Expression::BitwiseOr(Box::new(BinaryOp::new(
+                    n(1),
+                    Expression::BitwiseLeftShift(Box::new(BinaryOp::new(n(2), n(1)))),
+                ))),
+                "1 | (2 << 1)",
+                "1 | 2 << 1",
+            ),
+            (
+                Expression::BitwiseRightShift(Box::new(BinaryOp::new(
+                    n(8),
+                    Expression::BitwiseRightShift(Box::new(BinaryOp::new(n(2), n(1)))),
+                ))),
+                "8 >> (2 >> 1)",
+                "8 >> (2 >> 1)",
+            ),
+        ];
+        for (expr, shared_tier_sql, mysql_sql) in cases {
+            for (dialect, expected) in [
+                (DialectType::SQLite, shared_tier_sql),
+                (DialectType::PostgreSQL, shared_tier_sql),
+                (DialectType::DuckDB, shared_tier_sql),
+                (DialectType::MySQL, mysql_sql),
+            ] {
+                let config = GeneratorConfig {
+                    dialect: Some(dialect),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    Generator::with_config(config).generate(&expr).unwrap(),
+                    expected,
+                    "{dialect:?}: {expr:?}"
+                );
+            }
         }
     }
 
@@ -45989,5 +47974,14 @@ mod tests {
         let sql = format!("SELECT {}", String::from_utf8_lossy(recorded));
         let ast = Parser::parse_sql(&sql).expect("the recorded input parses");
         Generator::sql(&ast[0]).expect("and generates without panicking");
+    }
+}
+
+/// Time travel keywords use Var in Oracle and Identifier in other parsers.
+fn version_kind_is(e: &Version, kind: &str) -> bool {
+    match e.this.as_ref() {
+        Expression::Identifier(ident) => ident.name.eq_ignore_ascii_case(kind),
+        Expression::Var(var) => var.this.eq_ignore_ascii_case(kind),
+        _ => false,
     }
 }

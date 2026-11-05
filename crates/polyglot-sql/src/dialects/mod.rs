@@ -757,8 +757,8 @@ fn query_output_width(e: &Expression) -> Option<usize> {
 /// The source's explicit direction and NULL order (if any) carry over to each
 /// positional entry unchanged; the later cross-dialect NULL-ordering pass
 /// fills in the source dialect's implied default where the target's differs.
-/// MySQL is the exception: it has no NULLS FIRST/LAST syntax and is skipped by
-/// that pass, so compare every supported source's default against MySQL here.
+/// MySQL additionally checks placement here because a known width alone does
+/// not establish that every generated ordinal can be resolved to an expression.
 #[cfg(feature = "transpile")]
 fn expand_order_by_all(
     order_by: &mut Option<crate::expressions::OrderBy>,
@@ -800,11 +800,8 @@ fn expand_order_by_all(
         .map(|i| {
             let mut o = ob.expressions[0].clone();
             o.this = E::number(i);
-            if target == DialectType::MySQL {
-                // Matching explicit NULL placement is redundant and MySQL
-                // cannot print the NULLS FIRST/LAST syntax.
-                o.nulls_first = None;
-            }
+            // Keep explicit placement until generation. Clearing it here would
+            // make normalization substitute the source dialect's implicit default.
             o
         })
         .collect();
@@ -907,6 +904,16 @@ where
             Expression::Except(set_op) => set_op.with.is_none() && set_op.order_by.is_none(),
             Expression::Subquery(subquery) => subquery.order_by.is_none(),
             Expression::Vertica(_)
+            | Expression::AtTimeZone(_)
+            | Expression::OracleTableProperty(_)
+            | Expression::AggregateKeyProperty(_)
+            | Expression::Version(_)
+            | Expression::Per(_)
+            | Expression::PartitionByExcluding(_)
+            | Expression::MultiInsert(_)
+            | Expression::PipeQuery(_)
+            | Expression::StreamSource(_)
+            | Expression::WithFunction(_)
             | Expression::Literal(_)
             | Expression::Boolean(_)
             | Expression::Null(_)
@@ -947,6 +954,8 @@ where
             | Expression::BitwiseAnd(_)
             | Expression::BitwiseOr(_)
             | Expression::BitwiseXor(_)
+            | Expression::BitwiseLeftShift(_)
+            | Expression::BitwiseRightShift(_)
             | Expression::Is(_)
             | Expression::MemberOf(_)
             | Expression::ArrayContainsAll(_)
@@ -1062,6 +1071,13 @@ where
     }
     if let Some(match_condition) = join.match_condition.take() {
         join.match_condition = Some(transform_recursive(match_condition, transform_fn)?);
+    }
+    if let Some(nearest) = join.nearest.take() {
+        join.nearest = Some(crate::expressions::NearestJoin {
+            count: transform_recursive(nearest.count, transform_fn)?,
+            metric: transform_recursive(nearest.metric, transform_fn)?,
+            ..nearest
+        });
     }
     join.pivots = join
         .pivots
@@ -1967,6 +1983,15 @@ where
                     (id, new_val)
                 })
                 .collect();
+            upd.assignments = upd
+                .assignments
+                .into_iter()
+                .map(|mut assignment| {
+                    assignment.left = transform_recursive(assignment.left, transform_fn)?;
+                    assignment.right = transform_recursive(assignment.right, transform_fn)?;
+                    Ok(assignment)
+                })
+                .collect::<Result<Vec<_>>>()?;
             if let Some(from_clause) = upd.from_clause.take() {
                 upd.from_clause = Some(transform_from_recursive(from_clause, transform_fn)?);
             }
@@ -2110,6 +2135,8 @@ where
         Expression::BitwiseAnd(op) => transform_binary!(BitwiseAnd, *op),
         Expression::BitwiseOr(op) => transform_binary!(BitwiseOr, *op),
         Expression::BitwiseXor(op) => transform_binary!(BitwiseXor, *op),
+        Expression::BitwiseLeftShift(op) => transform_binary!(BitwiseLeftShift, *op),
+        Expression::BitwiseRightShift(op) => transform_binary!(BitwiseRightShift, *op),
         Expression::Is(op) => transform_binary!(Is, *op),
 
         // ===== TryCast / SafeCast =====
@@ -4109,6 +4136,17 @@ impl Dialect {
         parser.parse()
     }
 
+    #[cfg(feature = "generate")]
+    pub(crate) fn tokenize_for_parser(
+        &self,
+        source: &Arc<str>,
+    ) -> Result<(
+        Vec<crate::tokens::ParserToken>,
+        crate::guard::TokenGuardStats,
+    )> {
+        self.tokenizer.tokenize_for_parser(source)
+    }
+
     fn default_complexity_guard(&self) -> ComplexityGuardOptions {
         let mut guard = ComplexityGuardOptions::default();
         if matches!(self.dialect_type, DialectType::ClickHouse) {
@@ -4357,6 +4395,7 @@ impl Dialect {
             feature = "dialect-sqlite",
             feature = "dialect-trino",
             feature = "dialect-presto",
+            feature = "dialect-athena",
             feature = "dialect-duckdb",
             feature = "dialect-redshift",
             feature = "dialect-starrocks",
@@ -4419,7 +4458,6 @@ impl Dialect {
             DialectType::Snowflake => {
                 let expr = transforms::eliminate_semi_and_anti_joins(expr)?;
                 let expr = transforms::eliminate_window_clause(expr)?;
-                let expr = transforms::snowflake_flatten_projection_to_unnest(expr)?;
                 Ok(expr)
             }
             // TSQL doesn't support QUALIFY
@@ -4445,6 +4483,14 @@ impl Dialect {
             // but keeps Fabric-specific APPLY and derived-table behavior separate.
             #[cfg(feature = "dialect-fabric")]
             DialectType::Fabric => {
+                // Preserve TIMESTAMPTZ information before the child type is mapped to DATETIME2.
+                let expr = transform_recursive(expr, &|node| {
+                    if matches!(&node, Expression::AtTimeZone(_)) {
+                        FabricDialect.transform_expr(node)
+                    } else {
+                        Ok(node)
+                    }
+                })?;
                 let expr = transforms::normalize_grouping_sets_for_tsql(expr)?;
                 let expr =
                     transforms::expand_distinct_grouping_sets_for_tsql(expr, DialectType::Fabric)?;
@@ -4500,6 +4546,12 @@ impl Dialect {
                 let expr = transforms::explode_projection_to_unnest(expr, DialectType::Presto)?;
                 Ok(expr)
             }
+            #[cfg(feature = "dialect-athena")]
+            DialectType::Athena => {
+                let expr = transforms::eliminate_qualify(expr)?;
+                let expr = transforms::eliminate_window_clause(expr)?;
+                transforms::explode_projection_to_unnest(expr, DialectType::Athena)
+            }
             // DuckDB supports QUALIFY - no elimination needed
             // Expand POSEXPLODE to GENERATE_SUBSCRIPTS + UNNEST
             // Expand LIKE ANY / ILIKE ANY to OR chains (DuckDB doesn't support quantifiers)
@@ -4509,15 +4561,14 @@ impl Dialect {
                 let expr = transforms::expand_like_any(expr)?;
                 Ok(expr)
             }
-            // Redshift doesn't support QUALIFY, WINDOW clause, or GENERATE_DATE_ARRAY
+            // Redshift supports QUALIFY, but not WINDOW or GENERATE_DATE_ARRAY.
             #[cfg(feature = "dialect-redshift")]
             DialectType::Redshift => {
-                let expr = transforms::eliminate_qualify(expr)?;
                 let expr = transforms::eliminate_window_clause(expr)?;
                 let expr = transforms::unnest_generate_date_array_using_recursive_cte(expr)?;
                 Ok(expr)
             }
-            // StarRocks doesn't support BETWEEN in DELETE statements or QUALIFY
+            // StarRocks supports only restricted QUALIFY forms; lower the general form.
             #[cfg(feature = "dialect-starrocks")]
             DialectType::StarRocks => {
                 let expr = transforms::eliminate_qualify(expr)?;
@@ -4555,8 +4606,14 @@ impl Dialect {
             // ClickHouse doesn't support ORDER BY/LIMIT directly on UNION
             #[cfg(feature = "dialect-clickhouse")]
             DialectType::ClickHouse => {
-                let expr = transforms::no_limit_order_by_union(expr)?;
-                Ok(expr)
+                // Native ClickHouse modifiers belong to each SELECT operand.
+                // Only a set-level modifier (e.g. from another dialect) needs a wrapper.
+                if matches!(&expr, Expression::Union(u) if u.order_by.is_some() || u.limit.is_some() || u.offset.is_some())
+                {
+                    transforms::no_limit_order_by_union(expr)
+                } else {
+                    Ok(expr)
+                }
             }
             // Other dialects - no preprocessing
             _ => Ok(expr),
@@ -4750,46 +4807,23 @@ impl Dialect {
                     opts,
                 )?;
 
+                let expr = normalization::prepare_source_formats(expr, self.dialect_type, target)?;
+
                 // When source and target differ, first normalize the source dialect's
                 // AST constructs to standard SQL, so that the target dialect can handle them.
                 // This handles cases like Snowflake's SQUARE -> POWER, DIV0 -> CASE, etc.
                 let normalized =
-                    if self.dialect_type != target && self.dialect_type != DialectType::Generic {
+                    if self.dialect_type == DialectType::Hive && target == DialectType::Databricks {
+                        // Databricks handles QUALIFY and CTE preprocessing itself.
+                        // Lowering QUALIFY in a Hive multi-insert before attaching
+                        // its shared FROM loses the source scope.
+                        transform_recursive(expr, &|node| {
+                            if node.source_dialect().is_some() || matches!(&node, Expression::Function(f) if !f.qualified_name.is_empty()) { Ok(node) } else { (self.transformer)(node) }
+                        })?
+                    } else if self.dialect_type != target && self.dialect_type != DialectType::Generic {
                         self.transform_with_guard(expr, opts.complexity_guard)?
                     } else {
                         expr
-                    };
-
-                // For TSQL source targeting non-TSQL: unwrap ISNULL(JSON_QUERY(...), JSON_VALUE(...))
-                // to just JSON_QUERY(...) so cross_dialect_normalize can convert it cleanly.
-                // The TSQL read transform wraps JsonQuery in ISNULL for identity, but for
-                // cross-dialect transpilation we need the unwrapped JSON_QUERY.
-                let normalized =
-                    if matches!(self.dialect_type, DialectType::TSQL | DialectType::Fabric)
-                        && !matches!(target, DialectType::TSQL | DialectType::Fabric)
-                    {
-                        transform_recursive(normalized, &|e| {
-                            if let Expression::Function(ref f) = e {
-                                if f.name.eq_ignore_ascii_case("ISNULL") && f.args.len() == 2 {
-                                    // Check if first arg is JSON_QUERY and second is JSON_VALUE
-                                    if let (
-                                        Expression::Function(ref jq),
-                                        Expression::Function(ref jv),
-                                    ) = (&f.args[0], &f.args[1])
-                                    {
-                                        if jq.name.eq_ignore_ascii_case("JSON_QUERY")
-                                            && jv.name.eq_ignore_ascii_case("JSON_VALUE")
-                                        {
-                                            // Unwrap: return just JSON_QUERY(...)
-                                            return Ok(f.args[0].clone());
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(e)
-                        })?
-                    } else {
-                        normalized
                     };
 
                 // Snowflake source to non-Snowflake target: CURRENT_TIME -> LOCALTIME.
@@ -5173,7 +5207,9 @@ impl Dialect {
                 };
 
                 // Wrap UNION with ORDER BY/LIMIT in a subquery for dialects that require it
-                let normalized = if matches!(target, DialectType::ClickHouse | DialectType::TSQL) {
+                let normalized = if target == DialectType::ClickHouse
+                    || (target == DialectType::TSQL && !matches!(self.dialect_type, DialectType::TSQL | DialectType::Fabric)
+                        && !matches!(&normalized, Expression::Union(u) if u.order_by.is_some() && u.offset.is_some())) {
                     crate::transforms::no_limit_order_by_union(normalized)?
                 } else {
                     normalized
@@ -5212,6 +5248,7 @@ impl Dialect {
                 // because it would break TSQL -> TSQL identity
                 let normalized = if matches!(target, DialectType::TSQL | DialectType::Fabric)
                     && !matches!(self.dialect_type, DialectType::TSQL | DialectType::Fabric)
+                    && normalized.contains(|node| matches!(node, Expression::Count(_)))
                 {
                     transform_recursive(normalized, &|e| {
                         if let Expression::Count(ref c) = e {
@@ -5286,6 +5323,11 @@ impl Dialect {
                     normalized
                 };
 
+                let normalized = crate::transforms::lower_set_operations_by_name(
+                    normalized,
+                    self.dialect_type,
+                    target,
+                )?;
                 let transformed =
                     target_dialect.transform_with_guard(normalized, opts.complexity_guard)?;
 
@@ -7206,7 +7248,15 @@ impl Dialect {
     fn node_is_regex_predicate(expr: &Expression) -> bool {
         matches!(
             expr,
-            Expression::SimilarTo(_) | Expression::RegexpLike(_) | Expression::RegexpILike(_)
+            Expression::SimilarTo(_)
+                | Expression::RegexpLike(_)
+                | Expression::RegexpILike(_)
+                | Expression::RegexpFullMatch(_)
+        ) || matches!(
+            expr,
+            Expression::Function(function)
+                if function.qualified_name.len() <= 1
+                    && function.name.eq_ignore_ascii_case("REGEXP_FULL_MATCH")
         ) || Self::node_is_function_named(expr, "REGEXP_LIKE")
             || Self::node_is_function_named(expr, "REGEXP_I_LIKE")
             || Self::node_is_function_named(expr, "REGEXP_ILIKE")
@@ -7306,6 +7356,9 @@ impl Dialect {
     }
 
     fn normalize_tsql_fetch_overlaps_date_bin(expr: Expression) -> Result<Expression> {
+        if !expr.contains(|node| matches!(node, Expression::Overlaps(_) | Expression::DateBin(_))
+            || matches!(node, Expression::Select(select) if select.fetch.is_some())
+            || matches!(node, Expression::Function(function) if function.name.eq_ignore_ascii_case("DATE_BIN"))) { return Ok(expr); }
         transform_recursive(expr, &|e| match e {
             Expression::Select(mut select) => {
                 if select.top.is_none() && select.offset.is_none() {
@@ -7875,6 +7928,19 @@ impl Dialect {
     }
 
     fn normalize_postgres_string_semantics_for_tsql(expr: Expression) -> Result<Expression> {
+        if !expr.contains(|node| {
+            matches!(
+                node,
+                Expression::Like(_)
+                    | Expression::ILike(_)
+                    | Expression::Substring(_)
+                    | Expression::Trim(_)
+                    | Expression::Translate(_)
+                    | Expression::Function(_)
+            )
+        }) {
+            return Ok(expr);
+        }
         transform_recursive(expr, &|e| match e {
             Expression::Like(mut op) => {
                 Self::recover_postgres_like_escape(&mut op);
@@ -7923,6 +7989,9 @@ impl Dialect {
     }
 
     fn normalize_postgres_bytea_literals_for_tsql(expr: Expression) -> Result<Expression> {
+        if !expr.contains(|node| matches!(node, Expression::Cast(_))) {
+            return Ok(expr);
+        }
         transform_recursive(expr, &|e| match e {
             Expression::Cast(cast) if Self::is_postgres_bytea_data_type(&cast.to) => {
                 let Some(value) = Self::postgres_plain_string_literal_value(&cast.this) else {
@@ -8424,6 +8493,9 @@ impl Dialect {
         expr: Expression,
         target: DialectType,
     ) -> Result<Expression> {
+        if !expr.contains(Self::node_is_postgres_type_function_cast) {
+            return Ok(expr);
+        }
         transform_recursive(expr, &|e| match e {
             Expression::Function(function) => {
                 let mut function = *function;
@@ -8507,6 +8579,25 @@ impl Dialect {
     }
 
     fn rewrite_boolean_values_for_tsql(expr: Expression) -> Result<Expression> {
+        // Nested query dispatch revisits descendants, so avoid entering it for
+        // branches with no scalar predicates or predicate contexts to rewrite.
+        // In particular, a chain of SELECT * subqueries needs no boolean work.
+        if !expr.contains(|node| {
+            Self::is_tsql_boolean_value_expression(node)
+                || matches!(
+                    node,
+                    Expression::Boolean(_) | Expression::Case(_) | Expression::IfFunc(_)
+                )
+                || matches!(node, Expression::Select(select)
+                    if select.where_clause.is_some()
+                        || select.prewhere.is_some()
+                        || select.having.is_some()
+                        || select.qualify.is_some()
+                        || select.joins.iter().any(|join|
+                            join.on.is_some() || join.match_condition.is_some()))
+        }) {
+            return Ok(expr);
+        }
         match expr {
             Expression::Select(select) => Self::rewrite_boolean_values_in_tsql_select(select),
             Expression::Subquery(mut subquery) => {
@@ -9086,6 +9177,9 @@ impl Dialect {
     }
 
     fn normalize_postgres_boolean_semantics_for_tsql(expr: Expression) -> Result<Expression> {
+        if !expr.contains(|node| matches!(node, Expression::Cast(_) | Expression::Function(_))) {
+            return Ok(expr);
+        }
         transform_recursive(expr, &|e| match e {
             Expression::Function(function)
                 if function.args.len() == 2
@@ -10158,6 +10252,7 @@ impl Dialect {
                 cross_apply: None,
                 ordinality: None,
                 column_aliases: vec![],
+                column_aliases_quoted: vec![],
             }));
 
             // Remove the original join and add to FROM expressions
@@ -12163,7 +12258,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result[0],
-            "SELECT CASE WHEN '(?i)' || 'pattern' = '' THEN 0 ELSE LENGTH(REGEXP_EXTRACT_ALL(SUBSTRING(s, 1), '(?i)' || 'pattern')) END"
+            "SELECT CASE WHEN 'pattern' = '' THEN 0 ELSE LENGTH(REGEXP_EXTRACT_ALL(SUBSTRING(s, 1), '(?i)' || 'pattern')) END"
         );
     }
 
@@ -12178,7 +12273,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result[0],
-            "SELECT CASE WHEN '(?im)' || 'L' = '' THEN 0 ELSE LENGTH(REGEXP_EXTRACT_ALL(SUBSTRING('Hello World', 1), '(?im)' || 'L')) END"
+            "SELECT CASE WHEN 'L' = '' THEN 0 ELSE LENGTH(REGEXP_EXTRACT_ALL(SUBSTRING('Hello World', 1), '(?im)' || 'L')) END"
         );
     }
 

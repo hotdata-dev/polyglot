@@ -5,7 +5,7 @@
 //!
 //! Ported from sqlglot's optimizer/scope.py
 
-use crate::expressions::Expression;
+use crate::expressions::{Expression, Identifier, JoinKind, Literal, TableRef};
 use crate::traversal::ExpressionWalk;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -73,28 +73,32 @@ pub(crate) fn scope_query(expression: &Expression) -> &Expression {
 /// A lightweight resolution view containing only selected sources. CTE
 /// declarations remain available, but do not themselves cause ambiguity.
 pub(crate) fn selected_reference_scope(scope: &Scope) -> Scope {
-    let query = scope_query(&scope.expression);
-    let aliases: HashSet<_> = walk_in_scope(query, false)
+    let mut selected = Scope::new(scope_query(&scope.expression).clone());
+    selected.cte_sources = scope.cte_sources.clone();
+    selected.sources = selected_reference_sources(scope)
+        .into_iter()
+        .map(|(name, source)| (name, source.clone()))
+        .collect();
+    selected
+}
+
+/// Read-only consumers share source ASTs with their scope. Only validation,
+/// which binds aliases in its copy, needs the owned view above.
+pub(crate) fn selected_reference_sources(scope: &Scope) -> HashMap<String, &SourceInfo> {
+    let aliases: HashSet<_> = walk_in_scope(scope_query(&scope.expression), false)
         .filter_map(|node| match node {
             Expression::Table(table) => {
-                Some(table.alias.as_ref().unwrap_or(&table.name).name.clone())
+                Some(table.alias.as_ref().unwrap_or(&table.name).name.as_str())
             }
             _ => None,
         })
         .collect();
-    let mut selected = Scope::new(query.clone());
-    selected.cte_sources = scope.cte_sources.clone();
-    selected.sources = scope
+    scope
         .sources
         .iter()
-        .filter(|(name, source)| {
-            // Source keys use the spelling of the actual FROM/JOIN binding.
-            // Folding here can accidentally retain an unused, quoted CTE.
-            source.kind != SourceKind::Cte || aliases.contains(*name)
-        })
-        .map(|(name, source)| (name.clone(), source.clone()))
-        .collect();
-    selected
+        .filter(|(name, source)| source.kind != SourceKind::Cte || aliases.contains(name.as_str()))
+        .map(|(name, source)| (name.clone(), source))
+        .collect()
 }
 
 /// Information about a source (table or subquery) in a scope
@@ -308,7 +312,7 @@ impl Scope {
         } else {
             SourceKind::Table
         };
-        let info = SourceInfo::new(expression.clone(), is_scope, kind);
+        let info = SourceInfo::new(expression, is_scope, kind);
         self.sources.insert(name.clone(), info.clone());
         self.lateral_sources.insert(name, info);
         self.clear_cache();
@@ -680,14 +684,14 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
             // Register relations in order. CTE declarations are available for
             // FROM lookup, but only selected preceding bindings are lateral inputs.
             let mut preceding_sources = HashSet::new();
-            for table in select
-                .from
-                .iter()
-                .flat_map(|from| &from.expressions)
-                .chain(select.joins.iter().map(|join| &join.this))
-            {
-                if let Some(name) = add_table_to_scope(table, current_scope, &preceding_sources) {
-                    preceding_sources.insert(name);
+            for table in select.from.iter().flat_map(|from| &from.expressions) {
+                add_relation_to_scope(table, current_scope, &mut preceding_sources);
+            }
+            for join in &select.joins {
+                if matches!(join.kind, JoinKind::Array | JoinKind::LeftArray) {
+                    add_array_join_to_scope(&join.this, current_scope, &mut preceding_sources);
+                } else {
+                    add_relation_to_scope(&join.this, current_scope, &mut preceding_sources);
                 }
             }
 
@@ -698,6 +702,10 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
 
             // Process subqueries in WHERE, SELECT expressions, etc.
             collect_subqueries(expression, current_scope);
+        }
+        Expression::JoinedTable(joined) => {
+            let mut preceding_sources = HashSet::new();
+            add_join_group_to_scope(joined, current_scope, &mut preceding_sources);
         }
         Expression::Union(union) => {
             if let Some(with) = &union.with {
@@ -762,6 +770,9 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
         Expression::Paren(paren) => {
             build_scope_impl(&paren.this, current_scope);
         }
+        Expression::Alias(alias) => {
+            build_scope_impl(&alias.this, current_scope);
+        }
         _ => {}
     }
 }
@@ -792,6 +803,45 @@ fn cte_body_self_references(cte: &crate::expressions::Cte) -> bool {
             _ => false,
         })
         .is_empty()
+}
+
+fn add_join_group_to_scope(
+    joined: &crate::expressions::JoinedTable,
+    scope: &mut Scope,
+    preceding_sources: &mut HashSet<String>,
+) {
+    add_relation_to_scope(&joined.left, scope, preceding_sources);
+    for join in &joined.joins {
+        add_relation_to_scope(&join.this, scope, preceding_sources);
+        if let Some(condition) = &join.on {
+            collect_subqueries_in_expr(condition, scope);
+        }
+        if let Some(condition) = &join.match_condition {
+            collect_subqueries_in_expr(condition, scope);
+        }
+    }
+    for lateral_view in &joined.lateral_views {
+        add_lateral_view_to_scope(lateral_view, scope);
+    }
+}
+
+/// Unaliased join groups expose each member to following lateral relations.
+fn add_relation_to_scope(
+    expr: &Expression,
+    scope: &mut Scope,
+    preceding_sources: &mut HashSet<String>,
+) {
+    match expr {
+        Expression::JoinedTable(joined) if joined.alias.is_none() => {
+            add_join_group_to_scope(joined, scope, preceding_sources);
+        }
+        Expression::Paren(paren) => add_relation_to_scope(&paren.this, scope, preceding_sources),
+        _ => {
+            if let Some(name) = add_table_to_scope(expr, scope, preceding_sources) {
+                preceding_sources.insert(name);
+            }
+        }
+    }
 }
 
 fn add_table_to_scope(
@@ -856,6 +906,14 @@ fn add_table_to_scope(
             scope.derived_table_scopes.push(derived_scope);
             Some(name)
         }
+        Expression::JoinedTable(joined) => {
+            let alias = joined.alias.as_ref()?;
+            let mut derived_scope = scope.branch(expr.clone(), ScopeType::DerivedTable);
+            build_scope_impl(expr, &mut derived_scope);
+            scope.add_source(alias.name.clone(), expr.clone(), true);
+            scope.derived_table_scopes.push(derived_scope);
+            Some(alias.name.clone())
+        }
         Expression::Unnest(unnest) => {
             if let Some(alias) = &unnest.alias {
                 scope.add_virtual_source(alias.name.clone(), expr.clone());
@@ -875,7 +933,10 @@ fn add_table_to_scope(
             scope.add_virtual_source(alias.alias.name.clone(), expr.clone());
             Some(alias.alias.name.clone())
         }
-        Expression::Alias(alias) if is_query_like_relation(&alias.this) => {
+        Expression::Alias(alias)
+            if is_query_like_relation(&alias.this)
+                || matches!(scope_query(&alias.this), Expression::JoinedTable(_)) =>
+        {
             let outer_columns = alias
                 .column_aliases
                 .iter()
@@ -931,7 +992,91 @@ fn add_table_to_scope(
             Some(name)
         }
         Expression::Paren(paren) => add_table_to_scope(&paren.this, scope, preceding_sources),
-        _ => None,
+        _ => identifier_table(expr).and_then(|table| {
+            add_table_to_scope(
+                &Expression::Table(Box::new(table)),
+                scope,
+                preceding_sources,
+            )
+        }),
+    }
+}
+
+/// Snowflake `IDENTIFIER('db.schema.table')` names a table with a string literal.
+fn identifier_table(expr: &Expression) -> Option<TableRef> {
+    let (function, alias) = match expr {
+        Expression::Function(function) => (function, None),
+        Expression::Alias(alias) => match &alias.this {
+            Expression::Function(function) => (function, Some(alias)),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !function.name.eq_ignore_ascii_case("IDENTIFIER") {
+        return None;
+    }
+    let [Expression::Literal(literal)] = function.args.as_slice() else {
+        return None;
+    };
+    let Literal::String(name) = literal.as_ref() else {
+        return None;
+    };
+    let mut parts = identifier_table_parts(name)?;
+    let mut table = TableRef::new("");
+    table.name = parts.pop().filter(|part| !part.is_empty())?;
+    table.schema = parts.pop();
+    table.catalog = parts.pop();
+    if let Some(alias) = alias {
+        table.alias = Some(alias.alias.clone());
+        table.column_aliases = alias.column_aliases.clone();
+    }
+    parts.is_empty().then_some(table)
+}
+
+/// Split a literal object name without treating quoted dots as separators.
+fn identifier_table_parts(name: &str) -> Option<Vec<Identifier>> {
+    let mut chars = name.chars().peekable();
+    let mut parts = Vec::new();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let quoted = chars.next_if_eq(&'"').is_some();
+        let mut part = String::new();
+        if quoted {
+            loop {
+                match chars.next()? {
+                    '"' if chars.next_if_eq(&'"').is_some() => part.push('"'),
+                    '"' => break,
+                    ch => part.push(ch),
+                }
+            }
+        } else {
+            while let Some(ch) =
+                chars.next_if(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+            {
+                part.push(ch);
+            }
+            if part.starts_with(|c: char| c.is_ascii_digit() || c == '$') {
+                return None;
+            }
+        }
+        // Snowflake's db..table notation refers to the PUBLIC schema.
+        if part.is_empty() {
+            if quoted || parts.len() != 1 || chars.peek() != Some(&'.') {
+                return None;
+            }
+            part.push_str("PUBLIC");
+        }
+        parts.push(if quoted {
+            Identifier::quoted(part)
+        } else {
+            Identifier::new(part)
+        });
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        match chars.next() {
+            None => return Some(parts),
+            Some('.') if parts.len() < 3 => {}
+            _ => return None,
+        }
     }
 }
 
@@ -993,6 +1138,24 @@ fn add_lateral_view_to_scope(lateral_view: &crate::expressions::LateralView, sco
             alias,
             Expression::LateralView(Box::new(lateral_view.clone())),
         );
+    }
+}
+
+/// ClickHouse `ARRAY JOIN arr AS item` binds each aliased array as a virtual source.
+fn add_array_join_to_scope(
+    expr: &Expression,
+    scope: &mut Scope,
+    preceding_sources: &mut HashSet<String>,
+) {
+    let items = match expr {
+        Expression::Tuple(tuple) => tuple.expressions.as_slice(),
+        item => std::slice::from_ref(item),
+    };
+    for item in items {
+        if let Expression::Alias(alias) = item {
+            scope.add_virtual_source(alias.alias.name.clone(), item.clone());
+            preceding_sources.insert(alias.alias.name.clone());
+        }
     }
 }
 
@@ -1410,6 +1573,42 @@ mod tests {
     }
 
     #[test]
+    fn unaliased_join_members_are_visible_to_following_lateral_relations() {
+        let scope = parse_and_build_scope(
+            "SELECT d.id FROM alpha a JOIN (beta b JOIN gamma c ON b.id = c.id) \
+             ON a.id = b.id CROSS JOIN LATERAL (SELECT c.id) AS d",
+        );
+        assert!(scope.sources.contains_key("a"));
+        assert!(scope.sources.contains_key("b"));
+        assert!(scope.sources.contains_key("c"));
+        let lateral = scope.derived_table_scopes.last().expect("lateral scope");
+        assert!(lateral.is_lateral);
+        assert_eq!(
+            lateral
+                .lateral_sources
+                .keys()
+                .map(String::as_str)
+                .collect::<HashSet<_>>(),
+            HashSet::from(["a", "b", "c"]),
+        );
+    }
+
+    #[test]
+    fn aliased_join_group_hides_member_bindings_from_its_parent() {
+        let scope = parse_and_build_scope(
+            "SELECT grouped.id FROM (beta b JOIN gamma c ON b.id = c.id) AS grouped",
+        );
+        assert_eq!(scope.sources.len(), 1);
+        assert!(scope.sources.contains_key("grouped"));
+        let group = scope
+            .derived_table_scopes
+            .first()
+            .expect("join group scope");
+        assert!(group.sources.contains_key("b"));
+        assert!(group.sources.contains_key("c"));
+    }
+
+    #[test]
     fn test_simple_select_scope() {
         let mut scope = parse_and_build_scope("SELECT a, b FROM t");
 
@@ -1447,6 +1646,49 @@ mod tests {
         let scope = parse_and_build_scope("SELECT n.a FROM t, (SELECT t.a) n");
         assert!(!scope.derived_table_scopes[0].is_lateral);
         assert!(scope.derived_table_scopes[0].lateral_sources.is_empty());
+    }
+
+    #[test]
+    fn test_clickhouse_array_join_aliases_are_virtual_sources() {
+        for (sql, aliases) in [
+            ("SELECT item FROM t ARRAY JOIN arr AS item", &["item"][..]),
+            (
+                "SELECT a, b FROM t LEFT ARRAY JOIN arr AS a, t.nested AS b",
+                &["a", "b"],
+            ),
+            ("SELECT arr FROM t ARRAY JOIN arr", &[]),
+        ] {
+            let ast = crate::parse_one(sql, crate::dialects::DialectType::ClickHouse).unwrap();
+            let scope = build_scope(&ast);
+            let mut virtual_sources: Vec<_> = scope
+                .sources
+                .iter()
+                .filter(|(_, source)| source.kind == SourceKind::Virtual)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            virtual_sources.sort();
+            assert_eq!(virtual_sources, aliases, "{sql}");
+            assert_eq!(scope.sources.len(), aliases.len() + 1, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_snowflake_identifier_string_is_a_table_source() {
+        let ast = crate::parse_one(
+            "SELECT o.id FROM IDENTIFIER('db.s.orders') AS o, IDENTIFIER('customers'), IDENTIFIER($t)",
+            crate::dialects::DialectType::Snowflake,
+        )
+        .unwrap();
+        let scope = build_scope(&ast);
+        assert_eq!(scope.sources.len(), 2);
+        let Expression::Table(orders) = &scope.sources["o"].expression else {
+            panic!("expected a table source");
+        };
+        assert_eq!(orders.catalog.as_ref().unwrap().name, "db");
+        assert_eq!(orders.schema.as_ref().unwrap().name, "s");
+        assert_eq!(orders.name.name, "orders");
+        assert_eq!(scope.sources["o"].kind, SourceKind::Table);
+        assert!(scope.sources.contains_key("customers"));
     }
 
     #[test]

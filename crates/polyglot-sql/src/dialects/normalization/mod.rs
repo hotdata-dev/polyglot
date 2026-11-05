@@ -108,6 +108,14 @@ pub(super) fn normalize(
             e
         };
 
+        if let Some(rewritten) = scalar::normalize_source_functions(&e, &context)? {
+            return Ok(rewritten);
+        }
+
+        if let Some(rewritten) = temporal::normalize_source_calendar(&e, &context)? {
+            return Ok(rewritten);
+        }
+
         if matches!(source, DialectType::DataFusion) && matches!(target, DialectType::DuckDB) {
             if let Expression::Function(ref function) = e {
                 if function.name.eq_ignore_ascii_case("NOW") && function.args.is_empty() {
@@ -1059,6 +1067,7 @@ pub(super) fn normalize(
                                                 comments: Vec::new(),
                                                 nesting_group: 0,
                                                 directed: false,
+                                                nearest: None,
                                             });
                                         } else {
                                             new_from_exprs.push(expr.clone());
@@ -1095,6 +1104,7 @@ pub(super) fn normalize(
                                                 comments: Vec::new(),
                                                 nesting_group: 0,
                                                 directed: false,
+                                                nearest: None,
                                             });
                                         } else {
                                             new_from_exprs.push(expr.clone());
@@ -1780,21 +1790,7 @@ pub(super) fn normalize(
                         && name == "DATE_TRUNC"
                         && f.args.len() == 2
                     {
-                        // Determine if DuckDB DATE_TRUNC needs CAST wrapping to preserve input type.
-                        // Logic based on Python sqlglot's input_type_preserved flag:
-                        // - DATE + non-date-unit (HOUR, MINUTE, etc.) -> wrap
-                        // - TIMESTAMP + date-unit (YEAR, QUARTER, MONTH, WEEK, DAY) -> wrap
-                        // - TIMESTAMPTZ/TIMESTAMPLTZ/TIME -> always wrap
-                        let unit_str = match &f.args[0] {
-                            Expression::Literal(lit) if matches!(lit.as_ref(), crate::expressions::Literal::String(_)) => {
-                                let crate::expressions::Literal::String(s) = lit.as_ref() else { unreachable!() };
-                                Some(s.to_ascii_uppercase())
-                            }
-                            _ => None,
-                        };
-                        let is_date_unit = unit_str.as_ref().map_or(false, |u| {
-                            matches!(u.as_str(), "YEAR" | "QUARTER" | "MONTH" | "WEEK" | "DAY")
-                        });
+                        // Preserve the declared source return type.
                         match &f.args[1] {
                             Expression::Cast(c) => match &c.to {
                                 DataType::Time { .. } => Action::Types(types::Action::DateTruncWrapCast),
@@ -1807,10 +1803,10 @@ pub(super) fn normalize(
                                 DataType::Timestamp { timezone: true, .. } => {
                                     Action::Types(types::Action::DateTruncWrapCast)
                                 }
-                                DataType::Date if !is_date_unit => Action::Types(types::Action::DateTruncWrapCast),
+                                DataType::Date => Action::Types(types::Action::DateTruncWrapCast),
                                 DataType::Timestamp {
                                     timezone: false, ..
-                                } if is_date_unit => Action::Types(types::Action::DateTruncWrapCast),
+                                } => Action::Types(types::Action::DateTruncWrapCast),
                                 _ => Action::None,
                             },
                             _ => Action::None,
@@ -2003,7 +1999,7 @@ pub(super) fn normalize(
                                 Action::Scalar(scalar::Action::PostgresConcatToTsql)
                             }
                             "ARBITRARY" | "AGGREGATE"
-                            | "REGEXP_MATCHES" | "REGEXP_FULL_MATCH"
+                            | "REGEXP_MATCHES"
                             | "STRUCT_EXTRACT"
                             | "LIST_FILTER" | "LIST_TRANSFORM" | "LIST_SORT" | "LIST_REVERSE_SORT"
                             | "STRING_TO_ARRAY" | "STR_SPLIT" | "STR_SPLIT_REGEX" | "SPLIT_TO_ARRAY"
@@ -2759,33 +2755,13 @@ pub(super) fn normalize(
                 // When nulls_first is not specified, fill in the source dialect's implied
                 // default so the target generator can correctly add/strip NULLS FIRST/LAST.
                 Expression::Ordered(o) => {
-                    // MySQL doesn't support NULLS FIRST/LAST - strip or rewrite
-                    if matches!(target, DialectType::MySQL) && o.nulls_first.is_some() {
-                        Action::Operators(operators::Action::MysqlNullsOrdering)
+                    if o.nulls_first.is_none()
+                        && source != target
+                        && source != DialectType::Vertica
+                    {
+                        Action::Operators(operators::Action::NullsOrdering)
                     } else {
-                        // Skip targets that don't support NULLS FIRST/LAST syntax unless
-                        // the generator can preserve semantics with a CASE sort key.
-                        let target_rewrites_nulls =
-                            matches!(target, DialectType::TSQL | DialectType::Fabric);
-                        let target_supports_nulls = !matches!(
-                            target,
-                            DialectType::MySQL
-                                | DialectType::TSQL
-                                | DialectType::Fabric
-                                | DialectType::StarRocks
-                                | DialectType::Doris
-                        );
-                        // Vertica's implicit NULL placement depends on the sort key's data
-                        // type (NULLS AUTO), so there is no source default to make explicit.
-                        if o.nulls_first.is_none()
-                            && source != target
-                            && source != DialectType::Vertica
-                            && (target_supports_nulls || target_rewrites_nulls)
-                        {
-                            Action::Operators(operators::Action::NullsOrdering)
-                        } else {
-                            Action::None
-                        }
+                        Action::None
                     }
                 }
                 // BigQuery data types: convert INT64, BYTES, NUMERIC etc. to standard types
@@ -3403,6 +3379,11 @@ pub(super) fn normalize(
                 {
                     Action::Collections(collections::Action::ArraySyntaxConvert)
                 }
+                Expression::Variance(_) | Expression::Stddev(_)
+                    if source == DialectType::DuckDB && matches!(target,
+                        DialectType::MySQL | DialectType::Doris | DialectType::StarRocks | DialectType::SingleStore) => {
+                    Action::Aggregates(aggregates::Action::DuckDBSampleAlias)
+                }
                 // VARIANCE expression -> varSamp for ClickHouse
                 Expression::Variance(_) if matches!(target, DialectType::ClickHouse) => {
                     Action::Aggregates(aggregates::Action::VarianceToClickHouse)
@@ -3569,7 +3550,6 @@ pub(super) fn normalize(
                     Action::Collections(collections::Action::ArrayIndexConvert)
                 }
                 // ANY_VALUE IGNORE NULLS detection moved to the AnyValue arm above
-                // MysqlNullsOrdering for Ordered is now handled in the Ordered arm above
                 // RESPECT NULLS handling for SQLite (strip it, add NULLS LAST to ORDER BY)
                 // and for MySQL (rewrite ORDER BY with CASE WHEN for null ordering)
                 Expression::WindowFunction(ref wf) => {
@@ -3582,25 +3562,7 @@ pub(super) fn normalize(
                         && wf.over.order_by.iter().any(|o| o.nulls_first.is_some())
                     {
                         Action::Operators(operators::Action::BigQueryNullsOrdering)
-                    // DuckDB -> MySQL: Add CASE WHEN for NULLS LAST simulation in window ORDER BY
-                    // But NOT when frame is RANGE/GROUPS, since adding CASE WHEN would break value-based frames
                     } else {
-                        let source_nulls_last = matches!(source, DialectType::DuckDB);
-                        let has_range_frame = wf.over.frame.as_ref().map_or(false, |f| {
-                            matches!(
-                                f.kind,
-                                crate::expressions::WindowFrameKind::Range
-                                    | crate::expressions::WindowFrameKind::Groups
-                            )
-                        });
-                        if source_nulls_last
-                            && matches!(target, DialectType::MySQL)
-                            && !wf.over.order_by.is_empty()
-                            && wf.over.order_by.iter().any(|o| !o.desc)
-                            && !has_range_frame
-                        {
-                            Action::Scalar(scalar::Action::MysqlNullsLastRewrite)
-                        } else {
                             // Check for Snowflake window frame handling for FIRST_VALUE/LAST_VALUE/NTH_VALUE
                             let is_ranking_window_func = matches!(
                                 &wf.this,
@@ -3652,7 +3614,6 @@ pub(super) fn normalize(
                                     _ => Action::None,
                                 }
                             }
-                        }
                     }
                 }
                 // CREATE TABLE a LIKE b -> dialect-specific transformations
@@ -4202,5 +4163,53 @@ pub(super) fn normalize(
         };
 
         Ok(outcome.into_expression())
+    })
+}
+
+/// Convert source format models while quoted literal text is still available.
+/// Source canonicalization can otherwise erase the distinction between a quoted
+/// word and a date-format token before the target sees it.
+pub(super) fn prepare_source_formats(
+    expr: Expression,
+    source: DialectType,
+    target: DialectType,
+) -> Result<Expression> {
+    if target != DialectType::DuckDB
+        || !matches!(
+            source,
+            DialectType::Snowflake | DialectType::PostgreSQL | DialectType::MySQL
+        )
+    {
+        return Ok(expr);
+    }
+    transform_recursive(expr, &|e| {
+        let Expression::Function(mut f) = e else {
+            return Ok(e);
+        };
+        let applicable = f.qualified_name.is_empty()
+            && f.args.len() == 2
+            && ((source == DialectType::MySQL && f.name.eq_ignore_ascii_case("DATE_FORMAT"))
+                || (source != DialectType::MySQL && f.name.eq_ignore_ascii_case("TO_CHAR")));
+        if applicable {
+            if let Expression::Literal(l) = &f.args[1] {
+                if let Literal::String(format) = l.as_ref() {
+                    let format = temporal::source_format_to_strftime(format, source);
+                    if source == DialectType::MySQL
+                        && matches!(&f.args[0], Expression::Literal(l) if matches!(l.as_ref(), Literal::String(_)))
+                    {
+                        if let Expression::Literal(l) = &f.args[0] {
+                            if let Literal::String(value) = l.as_ref() {
+                                f.args[0] = Expression::Literal(Box::new(Literal::Timestamp(
+                                    value.clone(),
+                                )));
+                            }
+                        }
+                    }
+                    f.args[1] = Expression::string(format);
+                    f.name = "STRFTIME".into();
+                }
+            }
+        }
+        Ok(Expression::Function(f))
     })
 }

@@ -45,6 +45,19 @@ fn is_true(v: &bool) -> bool {
     *v
 }
 
+// Keep payload readers out of Expression's recursive serde visitor on WASI.
+// Inlining them into one enormous function creates large spill frames in
+// wazero's amd64 backend and exhausts its call stack on supported deep ASTs.
+#[cfg(target_os = "wasi")]
+#[inline(never)]
+fn deserialize_expression_payload<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer)
+}
+
 /// Represent any SQL expression or statement as a single, recursive AST node.
 ///
 /// `Expression` is the root type of the polyglot AST. Every parsed SQL
@@ -73,6 +86,10 @@ fn is_true(v: &bool) -> bool {
 /// let expr = Expression::column("name");
 /// assert_eq!(expr.sql(), "name");
 /// ```
+#[cfg_attr(
+    target_os = "wasi",
+    polyglot_sql_ast_derive::deserialize_payloads_with("deserialize_expression_payload")
+)]
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[serde(rename_all = "snake_case")]
@@ -100,6 +117,12 @@ pub enum Expression {
     Except(Box<Except>),
     Subquery(Box<Subquery>),
     PipeOperator(Box<PipeOperator>),
+    PipeQuery(Box<PipeQuery>),
+    MultiInsert(Box<MultiInsert>),
+    /// Semantic-layer extensions supported only by the generic dialect.
+    Per(Box<BinaryOp>),
+    PartitionByExcluding(Box<Tuple>),
+    StreamSource(Box<StreamSource>),
     Pivot(Box<Pivot>),
     PivotAlias(Box<PivotAlias>),
     Unpivot(Box<Unpivot>),
@@ -198,6 +221,8 @@ pub enum Expression {
     Having(Box<Having>),
     OrderBy(Box<OrderBy>),
     Limit(Box<Limit>),
+    /// ClickHouse LIMIT with value-based stream boundaries.
+    LimitRange(Box<LimitRange>),
     Offset(Box<Offset>),
     Qualify(Box<Qualify>),
     With(Box<With>),
@@ -766,6 +791,8 @@ pub enum Expression {
     Partition(Box<Partition>),
     RefreshTriggerProperty(Box<RefreshTriggerProperty>),
     UniqueKeyProperty(Box<UniqueKeyProperty>),
+    AggregateKeyProperty(Box<UniqueKeyProperty>),
+    OracleTableProperty(Box<OracleTableProperty>),
     RollupProperty(Box<RollupProperty>),
     PartitionBoundSpec(Box<PartitionBoundSpec>),
     PartitionedOfProperty(Box<PartitionedOfProperty>),
@@ -1029,6 +1056,9 @@ pub enum Expression {
     Slice(Box<Slice>),
     VarMap(Box<VarMap>),
     MatchAgainst(Box<MatchAgainst>),
+    DorisMatch(Box<DorisMatch>),
+    /// Trino query-local SQL routines, followed by their query.
+    WithFunction(Box<WithFunction>),
     MD5Digest(Box<MD5Digest>),
     MD5NumberLower64(Box<UnaryFunc>),
     MD5NumberUpper64(Box<UnaryFunc>),
@@ -1189,6 +1219,9 @@ impl Expression {
             | Expression::Subquery(_)
             | Expression::Values(_)
             | Expression::PipeOperator(_)
+            | Expression::MultiInsert(_)
+            | Expression::PipeQuery(_)
+            | Expression::WithFunction(_)
 
             // DML
             | Expression::Upsert(_)
@@ -1904,6 +1937,11 @@ impl Expression {
             Expression::Except(_) => "except",
             Expression::Subquery(_) => "subquery",
             Expression::PipeOperator(_) => "pipe_operator",
+            Expression::PipeQuery(_) => "pipe_query",
+            Expression::MultiInsert(_) => "multi_insert",
+            Expression::Per(_) => "per",
+            Expression::PartitionByExcluding(_) => "partition_by_excluding",
+            Expression::StreamSource(_) => "stream_source",
             Expression::Pivot(_) => "pivot",
             Expression::PivotAlias(_) => "pivot_alias",
             Expression::Unpivot(_) => "unpivot",
@@ -1981,6 +2019,7 @@ impl Expression {
             Expression::Having(_) => "having",
             Expression::OrderBy(_) => "order_by",
             Expression::Limit(_) => "limit",
+            Expression::LimitRange(_) => "limit_range",
             Expression::Offset(_) => "offset",
             Expression::Qualify(_) => "qualify",
             Expression::With(_) => "with",
@@ -2469,6 +2508,8 @@ impl Expression {
             Expression::Partition(_) => "partition",
             Expression::RefreshTriggerProperty(_) => "refresh_trigger_property",
             Expression::UniqueKeyProperty(_) => "unique_key_property",
+            Expression::AggregateKeyProperty(_) => "aggregate_key_property",
+            Expression::OracleTableProperty(_) => "oracle_table_property",
             Expression::RollupProperty(_) => "rollup_property",
             Expression::PartitionBoundSpec(_) => "partition_bound_spec",
             Expression::PartitionedOfProperty(_) => "partitioned_of_property",
@@ -2734,6 +2775,8 @@ impl Expression {
             Expression::Slice(_) => "slice",
             Expression::VarMap(_) => "var_map",
             Expression::MatchAgainst(_) => "match_against",
+            Expression::DorisMatch(_) => "doris_match",
+            Expression::WithFunction(_) => "with_function",
             Expression::MD5Digest(_) => "m_d5_digest",
             Expression::MD5NumberLower64(_) => "m_d5_number_lower64",
             Expression::MD5NumberUpper64(_) => "m_d5_number_upper64",
@@ -3563,6 +3606,9 @@ pub struct TableRef {
     /// MySQL: PARTITION(p0, p1, ...) hint for reading from specific partitions
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partitions: Vec<Identifier>,
+    /// Oracle SUBPARTITION selection, otherwise PARTITION.
+    #[serde(default)]
+    pub subpartition: bool,
     /// Snowflake IDENTIFIER() function: dynamic table name from string/variable
     /// When set, this is used instead of the name field
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3595,6 +3641,7 @@ impl TableRef {
             table_sample: None,
             hints: Vec::new(),
             system_time: None,
+            subpartition: false,
             partitions: Vec::new(),
             identifier_func: None,
             changes: None,
@@ -3639,6 +3686,7 @@ impl TableRef {
             table_sample: None,
             hints: Vec::new(),
             system_time: None,
+            subpartition: false,
             partitions: Vec::new(),
             identifier_func: None,
             changes: None,
@@ -3679,6 +3727,186 @@ pub struct Star {
     /// Source position span
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<Span>,
+}
+
+impl Star {
+    /// Apply EXCEPT, REPLACE, and RENAME to the expanded `column` named `name`.
+    /// Returns `None` when EXCEPT removes the column.
+    #[cfg(feature = "semantic")]
+    pub(crate) fn expand_column(
+        &self,
+        name: &str,
+        column: Expression,
+        dialect: Option<crate::dialects::DialectType>,
+    ) -> Option<Expression> {
+        if self.excludes(name, dialect) {
+            return None;
+        }
+        let renamed = self.renamed(name, dialect);
+        if let Some(replacement) = self.replacement(name, dialect) {
+            let mut replacement = replacement.clone();
+            if let Some(alias) = renamed {
+                replacement.alias = alias;
+            }
+            return Some(Expression::Alias(Box::new(replacement)));
+        }
+        Some(match renamed {
+            Some(alias) => Expression::Alias(Box::new(Alias::new(column, alias))),
+            None => column,
+        })
+    }
+
+    /// Whether EXCEPT holds a ClickHouse pattern string (`EXCEPT ('re')`).
+    /// The columns it removes are not known, so the star stays unexpanded.
+    #[cfg(any(feature = "semantic", test))]
+    pub(crate) fn has_except_pattern(&self) -> bool {
+        self.except.iter().flatten().any(is_except_pattern)
+    }
+
+    /// Whether EXCEPT / EXCLUDE removes the column `name`.
+    #[cfg(feature = "semantic")]
+    pub(crate) fn excludes(
+        &self,
+        name: &str,
+        dialect: Option<crate::dialects::DialectType>,
+    ) -> bool {
+        self.except
+            .iter()
+            .flatten()
+            .any(|column| star_modifier_matches(column, name, dialect))
+    }
+
+    /// The new name RENAME gives to the column `name`. With a known dialect,
+    /// the name gets the identifier normalization that schema columns get.
+    #[cfg(feature = "semantic")]
+    pub(crate) fn renamed(
+        &self,
+        name: &str,
+        dialect: Option<crate::dialects::DialectType>,
+    ) -> Option<Identifier> {
+        let (_, new) = self
+            .rename
+            .iter()
+            .flatten()
+            .find(|(old, _)| star_modifier_matches(old, name, dialect))?;
+        Some(match dialect {
+            Some(_) => crate::optimizer::normalize_identifiers::normalize_identifier(
+                new.clone(),
+                crate::optimizer::normalize_identifiers::get_normalization_strategy(dialect),
+            ),
+            None => new.clone(),
+        })
+    }
+
+    /// The REPLACE expression for the column `name`.
+    #[cfg(feature = "semantic")]
+    pub(crate) fn replacement(
+        &self,
+        name: &str,
+        dialect: Option<crate::dialects::DialectType>,
+    ) -> Option<&Alias> {
+        self.replace
+            .iter()
+            .flatten()
+            .find(|replacement| star_modifier_matches(&replacement.alias, name, dialect))
+    }
+
+    /// The source column that the star outputs as `output`, after RENAME and
+    /// EXCEPT. Returns `None` when the star does not output `output`.
+    #[cfg(feature = "semantic")]
+    pub(crate) fn source_column(
+        &self,
+        output: &str,
+        dialect: Option<crate::dialects::DialectType>,
+    ) -> Option<String> {
+        let renames = self.rename.iter().flatten();
+        let column = match renames
+            .clone()
+            .find(|(_, new)| star_modifier_matches(new, output, dialect))
+        {
+            Some((old, _)) => old.name.clone(),
+            None if renames
+                .clone()
+                .any(|(old, _)| star_modifier_matches(old, output, dialect)) =>
+            {
+                return None
+            }
+            None => output.to_string(),
+        };
+        (!self.excludes(&column, dialect)).then_some(column)
+    }
+}
+
+/// A pattern string keeps its quotes in the name (see `parse_star_except_name`).
+#[cfg(any(feature = "semantic", test))]
+fn is_except_pattern(identifier: &Identifier) -> bool {
+    !identifier.quoted && identifier.name.starts_with('\'')
+}
+
+/// Match a modifier name to the column `name`. A quoted name matches with
+/// its case, unless the dialect ignores case. An unquoted name ignores case,
+/// unless the dialect is case sensitive. A qualified name such as `t.col`
+/// matches on its column part, as in sqlglot. A pattern string never matches.
+#[cfg(feature = "semantic")]
+fn star_modifier_matches(
+    identifier: &Identifier,
+    name: &str,
+    dialect: Option<crate::dialects::DialectType>,
+) -> bool {
+    use crate::optimizer::normalize_identifiers::{
+        get_normalization_strategy, NormalizationStrategy,
+    };
+    use std::borrow::Cow;
+    if is_except_pattern(identifier) {
+        return false;
+    }
+    let text = identifier.name.as_str();
+    let (column, quoted) = if identifier.quoted {
+        (Cow::Borrowed(text), true)
+    } else if let Some(quote) = text.chars().last().filter(|c| matches!(c, '"' | '`')) {
+        // A qualified name keeps the quotes of its parts: `t."col"`.
+        let body = &text[..text.len() - 1];
+        let mut chars = body.char_indices().rev().peekable();
+        let mut opening = None;
+        while let Some((index, ch)) = chars.next() {
+            if ch == quote {
+                if chars.peek().is_some_and(|(_, next)| *next == quote) {
+                    chars.next(); // Skip an escaped quote inside the identifier.
+                } else {
+                    opening = Some(index);
+                    break;
+                }
+            }
+        }
+        match opening {
+            Some(open) => (
+                Cow::Owned(
+                    body[open + 1..].replace(&format!("{quote}{quote}"), &quote.to_string()),
+                ),
+                true,
+            ),
+            None => (Cow::Borrowed(text), false),
+        }
+    } else {
+        (
+            Cow::Borrowed(text.rsplit_once('.').map_or(text, |(_, column)| column)),
+            false,
+        )
+    };
+    let strategy = dialect.map(|dialect| get_normalization_strategy(Some(dialect)));
+    let exact = match strategy {
+        Some(NormalizationStrategy::CaseSensitive) => true,
+        Some(
+            NormalizationStrategy::CaseInsensitive
+            | NormalizationStrategy::CaseInsensitiveUppercase,
+        ) => false,
+        _ => quoted,
+    };
+    if exact {
+        column == name
+    } else {
+        column.eq_ignore_ascii_case(name)
+    }
 }
 
 /// Represent a complete SELECT statement.
@@ -4210,6 +4438,72 @@ pub struct PipeOperator {
     pub expression: Expression,
 }
 
+/// Hive/Spark multiple inserts sharing one FROM source.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct MultiInsert {
+    pub from: From,
+    pub joins: Vec<Join>,
+    pub lateral_views: Vec<LateralView>,
+    pub branches: Vec<Expression>,
+    #[serde(default)]
+    pub with: Option<With>,
+    #[serde(default)]
+    pub leading_comments: Vec<String>,
+}
+
+/// A ClickHouse pipe chain. Stages retain their order and query scope.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct PipeQuery {
+    pub this: Expression,
+    pub stages: Vec<PipeStage>,
+    pub with: Option<With>,
+    pub settings: Vec<Expression>,
+    pub format: Option<Identifier>,
+}
+
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub enum PipeStage {
+    Select {
+        expressions: Vec<Expression>,
+        distinct: bool,
+    },
+    Where(Expression),
+    Aggregate {
+        expressions: Vec<Expression>,
+        group_by: Vec<Expression>,
+    },
+    Extend(Vec<Expression>),
+    Set(Vec<Expression>),
+    Drop(Vec<Expression>),
+    Distinct,
+    OrderBy(OrderBy),
+    Limit {
+        count: Expression,
+        offset: Option<Expression>,
+    },
+    Offset(Expression),
+    Alias(Identifier),
+    Joins(Vec<Join>),
+    Cross(Vec<Expression>),
+    SetOperation {
+        kind: String,
+        distinct: Option<bool>,
+        query: Expression,
+    },
+}
+
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct StreamSource {
+    pub this: Expression,
+    pub bounded: bool,
+    pub watermark: Option<Box<Expression>>,
+    pub watermark_expression: Option<Box<Expression>>,
+}
+
 /// VALUES table constructor: VALUES (1, 'a'), (2, 'b')
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
@@ -4425,6 +4719,9 @@ pub struct Insert {
     /// REPLACE WHERE clause (Databricks): INSERT INTO a REPLACE WHERE cond VALUES ...
     #[serde(default)]
     pub replace_where: Option<Box<Expression>>,
+    /// Databricks dynamic replacement keys: REPLACE USING (columns).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replace_using: Vec<Identifier>,
     /// Source table (Hive/Spark): INSERT OVERWRITE TABLE target TABLE source
     #[serde(default)]
     pub source: Option<Box<Expression>>,
@@ -4455,6 +4752,9 @@ pub struct OutputClause {
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct Update {
     pub table: TableRef,
+    /// ClickHouse distributed lightweight update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_cluster: Option<OnCluster>,
     #[serde(default)]
     pub hint: Option<Hint>,
     /// Additional tables for multi-table UPDATE (MySQL syntax)
@@ -4464,6 +4764,10 @@ pub struct Update {
     #[serde(default)]
     pub table_joins: Vec<Join>,
     pub set: Vec<(Identifier, Expression)>,
+    /// Assignment expressions for tuple, field, or subscript targets, in source order.
+    /// Used instead of `set` when any target needs a structured expression.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignments: Vec<BinaryOp>,
     pub from_clause: Option<From>,
     /// JOINs after FROM clause (PostgreSQL, Snowflake, SQL Server syntax)
     #[serde(default)]
@@ -5373,6 +5677,18 @@ pub struct Join {
     /// Snowflake: DIRECTED keyword in JOIN (e.g., CROSS DIRECTED JOIN)
     #[serde(default)]
     pub directed: bool,
+    /// DuckDB nearest-neighbor join condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nearest: Option<NearestJoin>,
+}
+
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct NearestJoin {
+    pub count: Expression,
+    pub metric: Expression,
+    pub approximate: bool,
+    pub similarity: bool,
 }
 
 /// Enumerate all supported SQL join types.
@@ -5424,6 +5740,8 @@ pub enum JoinKind {
     Paste,
     // DuckDB POSITIONAL JOIN
     Positional,
+    Mark,
+    Single,
 }
 
 impl Default for JoinKind {
@@ -5810,6 +6128,19 @@ pub struct Limit {
     pub comments: Vec<String>,
 }
 
+/// ClickHouse 26.9: `LIMIT [count] [AFTER predicate [ALL]] [UNTIL predicate]`.
+/// Stored in `Limit::this` so existing count-only limits keep their AST shape.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct LimitRange {
+    #[serde(default)]
+    pub with_ties: bool,
+    pub count: Option<Box<Expression>>,
+    pub after: Option<Box<Expression>>,
+    pub after_all: bool,
+    pub until: Option<Box<Expression>>,
+}
+
 impl Limit {
     /// Preserve the legacy count-only set-operation AST when no metadata is needed.
     pub(crate) fn into_set_limit(self) -> Box<Expression> {
@@ -5973,6 +6304,84 @@ pub struct With {
     /// SEARCH/CYCLE clause for recursive CTEs (PostgreSQL)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<Box<Expression>>,
+}
+
+/// Trino inline functions are scoped to the following query, independently of CTEs.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct WithFunction {
+    pub functions: Vec<InlineFunction>,
+    pub this: Expression,
+}
+
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct InlineFunction {
+    pub name: Identifier,
+    pub parameters: Vec<FunctionParameter>,
+    pub return_type: DataType,
+    pub characteristics: Vec<RoutineCharacteristic>,
+    pub body: RoutineStatement,
+}
+
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub enum RoutineCharacteristic {
+    Language(String),
+    Deterministic(bool),
+    ReturnsNullOnNullInput(bool),
+    Security(FunctionSecurity),
+    Comment(String),
+    Properties(Vec<Expression>),
+}
+
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct RoutineBranch {
+    pub condition: Expression,
+    pub statements: Vec<RoutineStatement>,
+}
+
+/// SQL routine control flow. Expressions remain traversable for analysis and transforms.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub enum RoutineStatement {
+    Block(Vec<RoutineStatement>),
+    Declare {
+        names: Vec<Identifier>,
+        data_type: DataType,
+        default: Option<Expression>,
+    },
+    Set {
+        name: Identifier,
+        value: Expression,
+    },
+    Return(Expression),
+    If {
+        branches: Vec<RoutineBranch>,
+        otherwise: Vec<RoutineStatement>,
+    },
+    Case {
+        operand: Option<Expression>,
+        branches: Vec<RoutineBranch>,
+        otherwise: Vec<RoutineStatement>,
+    },
+    While {
+        label: Option<Identifier>,
+        condition: Expression,
+        statements: Vec<RoutineStatement>,
+    },
+    Loop {
+        label: Option<Identifier>,
+        statements: Vec<RoutineStatement>,
+    },
+    Repeat {
+        label: Option<Identifier>,
+        statements: Vec<RoutineStatement>,
+        until: Expression,
+    },
+    Leave(Identifier),
+    Iterate(Identifier),
 }
 
 /// Represent a single Common Table Expression definition.
@@ -6440,6 +6849,8 @@ pub enum DataType {
     // Renders as CHAR CHARACTER SET {name} in cast target
     CharacterSet {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length: Option<u32>,
     },
 
     // Unknown
@@ -8255,6 +8666,22 @@ pub struct ColumnDef {
     /// Teradata: CHARACTER SET name
     #[serde(default)]
     pub character_set: Option<String>,
+    /// MySQL BINARY string comparison modifier, preserving its position relative to CHARACTER SET.
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default)]
+    pub binary_before_charset: bool,
+    /// MySQL ENGINE_ATTRIBUTE / SECONDARY_ENGINE_ATTRIBUTE JSON literals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engine_attributes: Vec<(String, Expression)>,
+    #[serde(default)]
+    pub aggregation: Option<String>,
+    #[serde(default)]
+    pub name_path: Vec<Identifier>,
+    #[serde(default)]
+    pub position: Option<ColumnPosition>,
+    #[serde(default)]
+    pub rollup: Option<Identifier>,
     /// Teradata: UPPERCASE
     #[serde(default)]
     pub uppercase: bool,
@@ -8344,6 +8771,13 @@ impl ColumnDef {
             inline_length: None,
             compress: None,
             character_set: None,
+            binary: false,
+            binary_before_charset: false,
+            engine_attributes: Vec::new(),
+            aggregation: None,
+            name_path: Vec::new(),
+            position: None,
+            rollup: None,
             uppercase: false,
             casespecific: None,
             auto_increment_start: None,
@@ -8453,6 +8887,8 @@ pub struct GeneratedAsIdentity {
 )]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct ConstraintModifiers {
+    #[serde(default)]
+    pub key_block_size: Option<String>,
     /// ENFORCED / NOT ENFORCED
     pub enforced: Option<bool>,
     /// DEFERRABLE / NOT DEFERRABLE
@@ -8505,6 +8941,11 @@ pub enum TableConstraint {
     PrimaryKey {
         name: Option<Identifier>,
         columns: Vec<Identifier>,
+        /// Structured quoted, prefixed or ordered keys. When present these are
+        /// authoritative for rendering; `columns` retains the column names.
+        /// Older ASTs can encode prefix/order syntax directly in `columns`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        key_parts: Vec<IndexKeyPart>,
         /// Databricks primary-key columns marked with the TIMESERIES attribute.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         timeseries_columns: Vec<Identifier>,
@@ -8520,6 +8961,9 @@ pub enum TableConstraint {
     Unique {
         name: Option<Identifier>,
         columns: Vec<Identifier>,
+        /// Structured quoted, prefixed or ordered keys, as for `PrimaryKey`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        key_parts: Vec<IndexKeyPart>,
         /// Whether columns are parenthesized (false for UNIQUE idx_name without parens)
         #[serde(default)]
         columns_parenthesized: bool,
@@ -8534,6 +8978,8 @@ pub enum TableConstraint {
     },
     ForeignKey {
         name: Option<Identifier>,
+        #[serde(default)]
+        index_name: Option<Identifier>,
         columns: Vec<Identifier>,
         #[serde(default)]
         references: Option<ForeignKeyRef>,
@@ -8716,6 +9162,10 @@ pub enum ReferentialAction {
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct DropTable {
+    #[serde(default)]
+    pub temporary: bool,
+    #[serde(default)]
+    pub force: bool,
     pub names: Vec<TableRef>,
     pub if_exists: bool,
     pub cascade: bool,
@@ -8746,6 +9196,8 @@ pub struct DropTable {
 impl DropTable {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
+            temporary: false,
+            force: false,
             names: vec![TableRef::new(name)],
             if_exists: false,
             cascade: false,
@@ -8878,6 +9330,22 @@ pub enum ColumnPosition {
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub enum AlterTableAction {
+    ModifyTtl {
+        ttl: Expression,
+    },
+    /// MySQL table options, optionally followed by repartitioning.
+    PartitionBy {
+        partition: Expression,
+        distribution: Option<Expression>,
+    },
+    TableOptions {
+        options: Vec<(String, Expression)>,
+        partition_by: Option<Expression>,
+    },
+    Force,
+    DropCheck {
+        name: Identifier,
+    },
     AddColumn {
         column: ColumnDef,
         if_not_exists: bool,
@@ -8887,6 +9355,8 @@ pub enum AlterTableAction {
         name: Identifier,
         if_exists: bool,
         cascade: bool,
+        #[serde(default)]
+        restrict: bool,
     },
     RenameColumn {
         old_name: Identifier,
@@ -8908,6 +9378,12 @@ pub enum AlterTableAction {
     },
     RenameTable(TableRef),
     AddConstraint(TableConstraint),
+    /// ClickHouse conditional ADD/MODIFY CONSTRAINT.
+    AlterConstraint {
+        constraint: TableConstraint,
+        modify: bool,
+        conditional: bool,
+    },
     DropConstraint {
         name: Identifier,
         if_exists: bool,
@@ -8977,6 +9453,10 @@ pub enum AlterTableAction {
         options: Option<Expression>,
     },
     /// Hive/Spark: ADD COLUMNS (col1 TYPE, col2 TYPE) [CASCADE]
+    ReplaceColumns {
+        columns: Vec<ColumnDef>,
+        cascade: bool,
+    },
     AddColumns {
         columns: Vec<ColumnDef>,
         cascade: bool,
@@ -9060,8 +9540,13 @@ pub enum AlterColumnAction {
         /// COLLATE clause (TSQL: ALTER COLUMN col TYPE COLLATE collation_name)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         collate: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nullable: Option<bool>,
     },
     SetDefault(Expression),
+    SetStatistics(Expression),
+    Restart(Option<Expression>),
+    Options(Vec<AlterColumnOption>),
     DropDefault,
     SetNotNull,
     DropNotNull,
@@ -9071,6 +9556,15 @@ pub enum AlterColumnAction {
     SetVisible,
     /// MySQL: SET INVISIBLE
     SetInvisible,
+}
+
+/// PostgreSQL foreign-column option change.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct AlterColumnOption {
+    pub action: Option<String>,
+    pub name: Identifier,
+    pub value: Option<Expression>,
 }
 
 /// CREATE INDEX statement
@@ -9268,6 +9762,12 @@ pub struct CreateView {
     /// BigQuery: OPTIONS (key=value, ...)
     #[serde(default)]
     pub options: Vec<Expression>,
+    /// PostgreSQL storage options or SQL Server view attributes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub with_options: Vec<Expression>,
+    /// Empty string denotes an unqualified WITH CHECK OPTION.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_option: Option<String>,
     /// Doris: BUILD IMMEDIATE/DEFERRED for materialized views
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub build: Option<String>,
@@ -9326,6 +9826,8 @@ impl CreateView {
             row_access_policy: None,
             tags: Vec::new(),
             options: Vec::new(),
+            with_options: Vec::new(),
+            check_option: None,
             build: None,
             refresh: None,
             schema: None,
@@ -9345,6 +9847,8 @@ impl CreateView {
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct DropView {
     pub name: TableRef,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_names: Vec<TableRef>,
     pub if_exists: bool,
     pub materialized: bool,
 }
@@ -9352,6 +9856,7 @@ pub struct DropView {
 impl DropView {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
+            additional_names: Vec::new(),
             name: TableRef::new(name),
             if_exists: false,
             materialized: false,
@@ -9829,7 +10334,9 @@ pub struct CreateDatabase {
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub enum DatabaseOption {
+    Comment(String),
     CharacterSet(String),
+    DefaultCharacterSet(String),
     Collate(String),
     Owner(Identifier),
     Template(Identifier),
@@ -10750,6 +11257,14 @@ pub struct Annotated {
 pub struct Refresh {
     pub this: Box<Expression>,
     pub kind: String,
+    #[serde(default)]
+    pub partitions: Vec<Expression>,
+    #[serde(default)]
+    pub partition_range: Option<(Expression, Expression)>,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// LockingStatement
@@ -10929,6 +11444,12 @@ pub struct RecursiveWithSearch {
     pub kind: String,
     pub this: Box<Expression>,
     pub expression: Box<Expression>,
+    #[serde(default)]
+    pub mark_value: Option<Box<Expression>>,
+    #[serde(default)]
+    pub default_value: Option<Box<Expression>>,
+    #[serde(default)]
+    pub next: Option<Box<Expression>>,
     #[serde(default)]
     pub using: Option<Box<Expression>>,
 }
@@ -11676,6 +12197,9 @@ pub struct Lateral {
     /// Column aliases for the lateral expression (e.g., LATERAL func() AS alias(col1, col2))
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_aliases: Vec<String>,
+    /// Quoting of each column alias, parallel to `column_aliases`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_aliases_quoted: Vec<bool>,
 }
 
 /// TableFromRows
@@ -12258,6 +12782,8 @@ pub struct Partition {
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct RefreshTriggerProperty {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clickhouse: Option<ClickHouseRefresh>,
     /// Method: COMPLETE or AUTO
     pub method: String,
     /// Trigger kind: MANUAL, COMMIT, or SCHEDULE
@@ -12274,7 +12800,30 @@ pub struct RefreshTriggerProperty {
     pub starts: Option<Box<Expression>>,
 }
 
+/// ClickHouse refresh schedules and dependency clauses.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct ClickHouseRefresh {
+    pub schedule: Option<String>,
+    pub intervals: Vec<(Expression, Identifier)>,
+    pub offset: Vec<(Expression, Identifier)>,
+    pub randomize: Vec<(Expression, Identifier)>,
+    pub depends_on: Vec<TableRef>,
+    pub settings: Vec<Expression>,
+    pub append: bool,
+}
+
 /// UniqueKeyProperty
+/// Oracle physical table/storage attributes.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct OracleTableProperty {
+    pub name: String,
+    pub value: Option<Expression>,
+    pub unit: Option<String>,
+    pub options: Vec<OracleTableProperty>,
+}
+
 #[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 pub struct UniqueKeyProperty {
@@ -12928,6 +13477,8 @@ pub struct Analyze {
     /// Column list for ANALYZE tbl(col1, col2) syntax (PostgreSQL)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<Expression>,
 }
 
 /// AnalyzeStatistics
@@ -14927,6 +15478,16 @@ pub struct VarMap {
     pub keys: Vec<Expression>,
     #[serde(default)]
     pub values: Vec<Expression>,
+}
+
+/// Doris inverted-index predicate, with optional query-time analyzer selection.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct DorisMatch {
+    pub this: Expression,
+    pub expression: Expression,
+    pub kind: String,
+    pub analyzer: Option<Expression>,
 }
 
 /// MatchAgainst
