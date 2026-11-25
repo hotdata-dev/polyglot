@@ -1364,11 +1364,10 @@ where
                     .ctes
                     .into_iter()
                     .map(|mut cte| {
-                        let original = cte.this.clone();
-                        cte.this = transform_recursive(cte.this, transform_fn).unwrap_or(original);
-                        cte
+                        cte.this = transform_recursive(cte.this, transform_fn)?;
+                        Ok(cte)
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 select.with = Some(with);
             }
 
@@ -1874,11 +1873,10 @@ where
                     .ctes
                     .into_iter()
                     .map(|mut cte| {
-                        let original = cte.this.clone();
-                        cte.this = transform_recursive(cte.this, transform_fn).unwrap_or(original);
-                        cte
+                        cte.this = transform_recursive(cte.this, transform_fn)?;
+                        Ok(cte)
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 u.with = Some(with);
             }
             Expression::Union(u)
@@ -1909,11 +1907,10 @@ where
                     .ctes
                     .into_iter()
                     .map(|mut cte| {
-                        let original = cte.this.clone();
-                        cte.this = transform_recursive(cte.this, transform_fn).unwrap_or(original);
-                        cte
+                        cte.this = transform_recursive(cte.this, transform_fn)?;
+                        Ok(cte)
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 i.with = Some(with);
             }
             Expression::Intersect(i)
@@ -1944,11 +1941,10 @@ where
                     .ctes
                     .into_iter()
                     .map(|mut cte| {
-                        let original = cte.this.clone();
-                        cte.this = transform_recursive(cte.this, transform_fn).unwrap_or(original);
-                        cte
+                        cte.this = transform_recursive(cte.this, transform_fn)?;
+                        Ok(cte)
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 e.with = Some(with);
             }
             Expression::Except(e)
@@ -2093,11 +2089,10 @@ where
                 .ctes
                 .into_iter()
                 .map(|mut cte| {
-                    let original = cte.this.clone();
-                    cte.this = transform_recursive(cte.this, transform_fn).unwrap_or(original);
-                    cte
+                    cte.this = transform_recursive(cte.this, transform_fn)?;
+                    Ok(cte)
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             Expression::With(w)
         }
         Expression::Cte(mut c) => {

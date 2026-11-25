@@ -520,11 +520,10 @@ fn transform_recursive_preserves_ordered_original_when_wrapper_transform_errors(
 }
 
 #[test]
-fn transform_recursive_preserves_cte_body_when_child_transform_errors() {
+fn transform_recursive_propagates_cte_child_transform_errors() {
     let expr = parse_one("WITH cte AS (SELECT 1) SELECT * FROM cte");
-    let original_sql = expr.sql();
 
-    let transformed = transform_recursive(expr, &|node| match node {
+    let err = transform_recursive(expr, &|node| match node {
         Expression::Literal(_) => Err(polyglot_sql::Error::Parse {
             message: "literal transform failure".to_string(),
             line: 0,
@@ -534,9 +533,9 @@ fn transform_recursive_preserves_cte_body_when_child_transform_errors() {
         }),
         other => Ok(other),
     })
-    .expect("cte child failure should fall back to original body");
+    .expect_err("cte child failure should not leave the body untransformed");
 
-    assert_eq!(transformed.sql(), original_sql);
+    assert!(err.to_string().contains("literal transform failure"));
 }
 
 #[test]
