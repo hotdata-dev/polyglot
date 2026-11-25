@@ -6,6 +6,242 @@ use polyglot_sql::{
 use serde_json::json;
 
 #[test]
+fn lateral_flatten_inputs_affect_rows_and_generated_values() {
+    use polyglot_sql::ColumnUseContext;
+
+    let schema: ValidationSchema = serde_json::from_value(json!({"tables": [
+        {"schema":"s","name":"t","columns":[{"name":"k","type":"INT"},{"name":"items","type":"VARIANT"}]},
+        {"schema":"s","name":"other","columns":[{"name":"items","type":"VARIANT"}]}
+    ]})).unwrap();
+    for (input, tail, schema) in [
+        ("t.items", "", None),
+        ("t.items", "", Some(schema.clone())),
+        ("items", ", s.other later", Some(schema)),
+    ] {
+        let sql = format!(
+            "SELECT t.k, f.value AS v FROM s.t t, LATERAL FLATTEN(input => {input}) f{tail}"
+        );
+        let analysis = analyze_query(
+            &sql,
+            AnalyzeQueryOptions {
+                dialect: DialectType::Snowflake,
+                schema,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            analysis.column_uses.len(),
+            1,
+            "{sql}: {:?}",
+            analysis.column_uses
+        );
+        let usage = &analysis.column_uses[0];
+        assert_eq!(usage.context, ColumnUseContext::TableFunctionInput);
+        assert_eq!(
+            serde_json::to_value(usage.context).unwrap(),
+            "table_function_input"
+        );
+        assert_eq!(usage.expression_sql, input);
+        assert_eq!(usage.references.len(), 1);
+        let reference = &usage.references[0];
+        assert_eq!(
+            reference.reference.source_name.as_deref(),
+            Some("s.t"),
+            "{sql}"
+        );
+        assert_eq!(reference.reference.column, "ITEMS");
+        assert_eq!(
+            reference.reference.confidence,
+            ReferenceConfidence::Resolved
+        );
+        let span = reference.span.unwrap();
+        assert_eq!(&sql[span.start..span.end], input);
+
+        let key = &analysis.projections[0].upstream;
+        assert_eq!(key.len(), 1);
+        assert_eq!(key[0].column, "K");
+        assert_eq!(key[0].path_transform_kind, Some(TransformKind::Direct));
+        assert!(key[0].path_functions.is_empty());
+        let value = &analysis.projections[1].upstream;
+        assert_eq!(value.len(), 1);
+        assert_eq!(value[0].source_name.as_deref(), Some("s.t"));
+        assert_eq!(value[0].column, "ITEMS");
+        assert_eq!(
+            value[0].path_transform_kind,
+            Some(TransformKind::Expression)
+        );
+        assert_eq!(value[0].path_functions, ["FLATTEN"]);
+    }
+}
+
+#[test]
+fn group_by_all_reports_only_inferred_grouping_columns() {
+    let schema: ValidationSchema = serde_json::from_value(json!({"tables": [
+        {"name":"t","columns":[{"name":"k","type":"INT"},{"name":"a","type":"INT"}]}
+    ]}))
+    .unwrap();
+    for dialect in [DialectType::Snowflake, DialectType::DuckDB] {
+        for (sql, expected) in [
+            ("SELECT k, SUM(a) FROM t GROUP BY ALL", vec!["k"]),
+            (
+                "SELECT k + 1 AS n, 2 AS literal, SUM(a) AS total FROM t GROUP BY ALL",
+                vec!["k"],
+            ),
+            (
+                "SELECT SUM(a), ROW_NUMBER() OVER (ORDER BY SUM(a)) FROM t GROUP BY ALL",
+                vec![],
+            ),
+            ("SELECT k, SUM(a) FROM t GROUP BY ALL k", vec!["k"]),
+            ("SELECT t.*, COUNT(*) FROM t GROUP BY ALL", vec!["a", "k"]),
+        ] {
+            let analysis = analyze_query(
+                sql,
+                AnalyzeQueryOptions {
+                    dialect,
+                    schema: Some(schema.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let groups: Vec<_> = analysis
+                .column_uses
+                .iter()
+                .filter(|fact| fact.context == polyglot_sql::ColumnUseContext::Group)
+                .collect();
+            assert_eq!(groups.len(), expected.len(), "{dialect}: {sql}: {groups:?}");
+            let mut keys: Vec<_> = groups
+                .iter()
+                .flat_map(|group| &group.references)
+                .map(|r| {
+                    assert_eq!(r.reference.source_name.as_deref(), Some("t"), "{sql}");
+                    r.reference.column.to_ascii_lowercase()
+                })
+                .collect();
+            keys.sort();
+            assert_eq!(keys, expected, "{dialect}: {sql}");
+        }
+    }
+}
+
+#[test]
+fn aggregate_order_columns_are_projection_dependencies() {
+    let schema: ValidationSchema = serde_json::from_value(json!({"tables": [
+        {"name":"t","columns":[{"name":"a","type":"VARCHAR"}]},
+        {"name":"u","columns":[{"name":"b","type":"INT"}]}
+    ]}))
+    .unwrap();
+    for (dialect, aggregate) in [
+        (DialectType::DuckDB, "string_agg(t.a, ',' ORDER BY u.b)"),
+        (DialectType::DuckDB, "array_agg(t.a ORDER BY u.b + 1 DESC)"),
+        (
+            DialectType::Snowflake,
+            "listagg(t.a, ',') WITHIN GROUP (ORDER BY u.b)",
+        ),
+    ] {
+        let sql = format!("SELECT {aggregate} AS result FROM t CROSS JOIN u");
+        let analysis = analyze_query(
+            &sql,
+            AnalyzeQueryOptions {
+                dialect,
+                schema: Some(schema.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut inputs: Vec<_> = analysis.projections[0]
+            .upstream
+            .iter()
+            .map(|reference| {
+                assert_eq!(
+                    reference.path_transform_kind,
+                    Some(TransformKind::Aggregation),
+                    "{sql}: {reference:?}"
+                );
+                (
+                    reference.source_name.as_deref(),
+                    reference.column.to_ascii_lowercase(),
+                )
+            })
+            .collect();
+        inputs.sort();
+        assert_eq!(
+            inputs,
+            [(Some("t"), "a".into()), (Some("u"), "b".into())],
+            "{sql}"
+        );
+        assert!(
+            analysis.column_uses.iter().any(|usage| usage.context
+                == polyglot_sql::ColumnUseContext::AggregateOrder
+                && usage
+                    .references
+                    .iter()
+                    .any(|r| r.reference.column.eq_ignore_ascii_case("b"))),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn commented_columns_keep_their_output_names_and_lineage() {
+    let schema: ValidationSchema = serde_json::from_value(json!({"tables": [
+        {"schema":"s","name":"t","columns":[{"name":"a","type":"INT"}]}
+    ]}))
+    .unwrap();
+    for comment in ["-- note", "/* note */"] {
+        let projection = format!("SELECT\n {comment}\n a FROM s.t");
+        for sql in [
+            projection.clone(),
+            format!("WITH c AS ({projection}) SELECT a FROM c"),
+        ] {
+            let analysis = analyze_query(
+                &sql,
+                AnalyzeQueryOptions {
+                    dialect: DialectType::Snowflake,
+                    schema: Some(schema.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let output = &analysis.projections[0];
+            assert_eq!(output.name.as_deref(), Some("A"), "{sql}");
+            assert_eq!(output.upstream.len(), 1, "{sql}");
+            assert_eq!(
+                output.upstream[0].source_name.as_deref(),
+                Some("s.t"),
+                "{sql}"
+            );
+            assert_eq!(output.upstream[0].source_kind, SourceKind::Table, "{sql}");
+        }
+    }
+}
+
+#[test]
+fn catalog_qualified_cte_star_lineage() {
+    let schema: ValidationSchema = serde_json::from_value(json!({"tables":[
+        {"schema":"s","name":"t","columns":[{"name":"k","type":"INT"},{"name":"a","type":"INT"}]},
+        {"schema":"s","name":"u","columns":[{"name":"k","type":"INT"}]}
+    ]}))
+    .unwrap();
+    for source in [r#""db"."s"."t""#, "db.s.t JOIN db.s.u USING (k)"] {
+        let sql = format!("WITH c AS (SELECT * FROM {source}) SELECT a FROM c");
+        let analysis = analyze_query(
+            &sql,
+            AnalyzeQueryOptions {
+                dialect: DialectType::DuckDB,
+                schema: Some(schema.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let upstream = &analysis.projections[0].upstream;
+        assert_eq!(upstream.len(), 1, "{sql}: {upstream:?}");
+        assert_eq!(upstream[0].source_name.as_deref(), Some("db.s.t"), "{sql}");
+        assert_eq!(upstream[0].source_kind, SourceKind::Table, "{sql}");
+    }
+}
+
+#[test]
 fn analyze_query_non_recursive_cte_table_shadowing_473() {
     let schema: ValidationSchema = serde_json::from_value(json!({
         "tables": [{"name": "orders", "columns": [{"name": "id", "type": "BIGINT"}]}]
@@ -573,6 +809,25 @@ fn analyze_query_column_uses_resolve_chained_ctes_and_correlated_scopes() {
             .iter()
             .any(|fact| fact.scope_path == "root.ctes[1]"));
     }
+}
+
+#[test]
+fn scalar_subquery_filters_identify_their_parent_projection() {
+    let subquery = "(SELECT MAX(id) FROM customers WHERE id > 0)";
+    let sql = format!("SELECT id, {subquery} AS first, 1 + {subquery} AS second FROM orders");
+    let analysis = column_use_analysis(&sql, true);
+    let paths: Vec<_> = analysis
+        .column_uses
+        .iter()
+        .map(|fact| fact.scope_path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "root.expressions[1].subqueries[0]",
+            "root.expressions[2].subqueries[1]"
+        ]
+    );
 }
 
 #[test]
@@ -1684,6 +1939,91 @@ fn path_function_names_preserve_quoted_identity() {
 }
 
 #[test]
+fn outer_join_using_traces_the_preserved_key() {
+    let schema: ValidationSchema = serde_json::from_value(json!({"tables": [
+        {"name":"t","columns":[{"name":"k","type":"INT"}]},
+        {"name":"u","columns":[{"name":"k","type":"INT"}]},
+        {"name":"v","columns":[{"name":"k","type":"INT"}]}
+    ]}))
+    .unwrap();
+    for dialect in [DialectType::Snowflake, DialectType::DuckDB] {
+        for (joins, sources) in [
+            ("LEFT JOIN u USING(k)", vec!["t"]),
+            ("RIGHT JOIN u USING(k)", vec!["u"]),
+            ("FULL JOIN u USING(k)", vec!["t", "u"]),
+            ("RIGHT JOIN u USING(k) LEFT JOIN v USING(k)", vec!["u"]),
+            ("FULL JOIN u USING(k) LEFT JOIN v USING(k)", vec!["t", "u"]),
+        ] {
+            for selection in ["k", "*"] {
+                let sql = format!("SELECT {selection} FROM t {joins}");
+                let analysis = analyze_query(
+                    &sql,
+                    AnalyzeQueryOptions {
+                        dialect,
+                        schema: Some(schema.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(analysis.projections.len(), 1, "{sql}");
+                let upstream = &analysis.projections[0].upstream;
+                let mut actual: Vec<_> = upstream
+                    .iter()
+                    .map(|r| r.source_name.as_deref().unwrap())
+                    .collect();
+                actual.sort_unstable();
+                assert_eq!(actual, sources, "{sql}");
+                if sources.len() == 1 {
+                    assert_eq!(
+                        upstream[0].path_transform_kind,
+                        Some(TransformKind::Direct),
+                        "{sql}"
+                    );
+                }
+                assert_eq!(analysis.column_uses[0].references.len(), 2, "{sql}");
+            }
+        }
+    }
+}
+
+#[test]
+fn qualified_stars_project_direct_using_keys() {
+    let schema: ValidationSchema = serde_json::from_value(json!({"tables": [
+        {"name":"t","columns":[{"name":"k","type":"INT"},{"name":"a","type":"INT"}]},
+        {"name":"u","columns":[{"name":"k","type":"INT"},{"name":"x","type":"INT"}]}
+    ]}))
+    .unwrap();
+    for join in ["JOIN", "LEFT JOIN", "FULL OUTER JOIN"] {
+        for (star, source) in [("c.*", "t"), ("d.*", "u")] {
+            let sql = format!("SELECT {star} FROM t c {join} u d USING (k)");
+            let analysis = analyze_query(
+                &sql,
+                AnalyzeQueryOptions {
+                    dialect: DialectType::Snowflake,
+                    schema: Some(schema.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(analysis.projections.len(), 2, "{sql}");
+            let key = &analysis.projections[0];
+            assert_eq!(key.name.as_deref(), Some("K"), "{sql}");
+            assert_eq!(key.upstream.len(), 1, "{sql}: {key:?}");
+            assert_eq!(
+                key.upstream[0].source_name.as_deref(),
+                Some(source),
+                "{sql}"
+            );
+            assert_eq!(
+                key.upstream[0].path_transform_kind,
+                Some(TransformKind::Direct),
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
 fn star_modifiers_apply_to_join_using_outputs() {
     let schema: ValidationSchema = serde_json::from_value(json!({"tables": [
         {"name": "a", "columns": [{"name": "id", "type": "INT"}, {"name": "av", "type": "INT"}]},
@@ -1757,7 +2097,7 @@ fn star_exclusion_matches_escaped_qualified_identifiers() {
     )
     .unwrap();
     assert_eq!(analysis.projections.len(), 1, "{:?}", analysis.projections);
-    assert_eq!(analysis.projections[0].name.as_deref(), Some("keep"));
+    assert_eq!(analysis.projections[0].name.as_deref(), Some("KEEP"));
 }
 
 #[test]
@@ -1952,17 +2292,19 @@ fn analyze_query_reports_name_aligned_set_operation_outputs() {
         )
         .unwrap_or_else(|error| panic!("analysis failed for {dialect:?}: {error}"));
 
-        assert_eq!(
-            analysis.set_operations[0].output_columns,
-            vec!["left_value", "right_value"]
-        );
+        let expected = if dialect == DialectType::Snowflake {
+            ["LEFT_VALUE", "RIGHT_VALUE"]
+        } else {
+            ["left_value", "right_value"]
+        };
+        assert_eq!(analysis.set_operations[0].output_columns, expected);
         assert_eq!(
             analysis
                 .projections
                 .iter()
                 .map(|projection| projection.name.as_deref())
                 .collect::<Vec<_>>(),
-            vec![Some("left_value"), Some("right_value")]
+            expected.map(Some)
         );
         assert!(analysis
             .projections
@@ -3245,7 +3587,7 @@ fn analyze_query_resolves_snowflake_identifier_tables() {
         );
         let upstream = &analysis.projections[0].upstream;
         assert_eq!(upstream.len(), 1, "{sql}: {upstream:?}");
-        assert_eq!(upstream[0].column, "id", "{sql}");
+        assert_eq!(upstream[0].column, "ID", "{sql}");
         assert_eq!(
             upstream[0].confidence,
             ReferenceConfidence::Resolved,

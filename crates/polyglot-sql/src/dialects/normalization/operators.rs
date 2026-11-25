@@ -17,7 +17,6 @@ pub(super) enum Action {
     MySQLSafeDivide,
     NullsOrdering,
     XorExpand,
-    DollarParamConvert,
     AnyToExists,
     RespectNullsConvert,
     BigQueryNullsOrdering,
@@ -355,30 +354,24 @@ pub(super) fn rewrite(
                 if let Expression::Div(op) = e {
                     let left = op.left;
                     let right = op.right;
-                    // For SQLite: CAST left as REAL but NO NULLIF wrapping
+                    // SQLite: no NULLIF wrapping; the REAL cast is added by
+                    // cast_division_to_real after normalization
                     if matches!(target, DialectType::SQLite) {
-                        let new_left = Expression::Cast(Box::new(Cast {
-                            this: left,
-                            to: DataType::Float {
-                                precision: None,
-                                scale: None,
-                                real_spelling: true,
-                            },
-                            trailing_comments: Vec::new(),
-                            double_colon_syntax: false,
-                            format: None,
-                            default: None,
-                            inferred_type: None,
-                        }));
-                        return Ok(Expression::Div(Box::new(BinaryOp::new(new_left, right))));
+                        return Ok(Expression::Div(Box::new(BinaryOp::new(left, right))));
                     }
-                    // Wrap right in NULLIF(right, 0)
-                    let nullif_right = Expression::Function(Box::new(Function::new(
-                        "NULLIF".to_string(),
-                        vec![right, Expression::number(0)],
-                    )));
+                    // Wrap right in NULLIF(right, 0) unless it already is one
+                    let nullif_right = if matches!(&right, Expression::Function(f) if f.name.eq_ignore_ascii_case("NULLIF"))
+                    {
+                        right
+                    } else {
+                        Expression::Function(Box::new(Function::new(
+                            "NULLIF".to_string(),
+                            vec![right, Expression::number(0)],
+                        )))
+                    };
                     // For some dialects, also CAST the left side
                     let new_left = match target {
+                        _ if is_float_cast(&left) => left,
                         DialectType::PostgreSQL
                         | DialectType::Redshift
                         | DialectType::Teradata
@@ -606,23 +599,6 @@ pub(super) fn rewrite(
                     Ok(e)
                 }
             }
-            Action::DollarParamConvert => {
-                if let Expression::Parameter(p) = e {
-                    Ok(Expression::Parameter(Box::new(
-                        crate::expressions::Parameter {
-                            name: p.name,
-                            index: p.index,
-                            style: crate::expressions::ParameterStyle::At,
-                            quoted: p.quoted,
-                            string_quoted: p.string_quoted,
-                            expression: p.expression,
-                        },
-                    )))
-                } else {
-                    Ok(e)
-                }
-            }
-
             Action::AnyToExists => {
                 if let Expression::Any(q) = e {
                     if let Some(op) = q.op.clone() {
@@ -1769,6 +1745,156 @@ fn snowflake_regex_inline_flags(flags: Option<&Expression>) -> std::result::Resu
     } else {
         Ok(format!("(?{enabled}-s)"))
     }
+}
+
+/// Whether `expr` is already a CAST to a floating-point type.
+fn is_float_cast(expr: &Expression) -> bool {
+    match expr {
+        Expression::Cast(cast) => match &cast.to {
+            DataType::Double { .. } | DataType::Float { .. } => true,
+            DataType::Custom { name } => {
+                name.eq_ignore_ascii_case("REAL") || name.eq_ignore_ascii_case("DOUBLE")
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether `expr` has an exact decimal type: a CAST to DECIMAL/NUMERIC, or an
+/// expression that keeps such an operand's type (parentheses, sign, arithmetic,
+/// NULLIF, COALESCE, GREATEST/LEAST, ABS, CASE, aggregates), or a decimal literal.
+fn is_decimal_typed(expr: &Expression, source: DialectType) -> bool {
+    let is_decimal_typed = |expr: &Expression| is_decimal_typed(expr, source);
+    let promotes_nullif = matches!(
+        source,
+        DialectType::PostgreSQL | DialectType::Materialize | DialectType::RisingWave
+    );
+    let is_tsql = matches!(source, DialectType::TSQL | DialectType::Fabric);
+    match expr {
+        Expression::Cast(cast) => match &cast.to {
+            DataType::Decimal { .. } => true,
+            DataType::Custom { name } => {
+                name.eq_ignore_ascii_case("NUMERIC") || name.eq_ignore_ascii_case("DECIMAL")
+            }
+            _ => false,
+        },
+        Expression::Paren(p) => is_decimal_typed(&p.this),
+        Expression::Neg(u) => is_decimal_typed(&u.this),
+        Expression::Abs(f) => is_decimal_typed(&f.this),
+        Expression::Add(op)
+        | Expression::Sub(op)
+        | Expression::Mul(op)
+        | Expression::Div(op)
+        | Expression::Mod(op) => is_decimal_typed(&op.left) || is_decimal_typed(&op.right),
+        // A decimal literal such as 2.5 or 0.0 is numeric in PostgreSQL.
+        Expression::Literal(lit) => {
+            matches!(lit.as_ref(), Literal::Number(n) if n.contains(['.', 'e', 'E']))
+        }
+        // PostgreSQL promotes the first operand to the comparison type.
+        Expression::NullIf(f) => {
+            is_decimal_typed(&f.this) || (promotes_nullif && is_decimal_typed(&f.expression))
+        }
+        Expression::Nullif(f) => {
+            is_decimal_typed(&f.this) || (promotes_nullif && is_decimal_typed(&f.expression))
+        }
+        // SQL Server returns an integer from AVG of an integer.
+        Expression::Avg(f) => !is_tsql || is_decimal_typed(&f.this),
+        Expression::Sum(f) | Expression::Min(f) | Expression::Max(f) => is_decimal_typed(&f.this),
+        Expression::Coalesce(f) | Expression::Greatest(f) | Expression::Least(f) => {
+            f.expressions.iter().any(is_decimal_typed)
+        }
+        Expression::Case(c) => {
+            c.whens.iter().any(|(_, then)| is_decimal_typed(then))
+                || c.else_.as_ref().is_some_and(is_decimal_typed)
+        }
+        Expression::Column(_) => matches!(
+            expr.inferred_type(),
+            Some(DataType::Decimal { .. } | DataType::Float { .. } | DataType::Double { .. })
+        ),
+        Expression::Function(f) if f.name.eq_ignore_ascii_case("AVG") => {
+            !is_tsql || f.args.iter().any(is_decimal_typed)
+        }
+        Expression::Function(f) if f.name.eq_ignore_ascii_case("NULLIF") && !promotes_nullif => {
+            f.args.first().is_some_and(is_decimal_typed)
+        }
+        Expression::Function(f)
+            if [
+                "NULLIF", "GREATEST", "LEAST", "COALESCE", "ABS", "ROUND", "SUM", "MIN", "MAX",
+            ]
+            .iter()
+            .any(|name| f.name.eq_ignore_ascii_case(name)) =>
+        {
+            f.args.iter().any(is_decimal_typed)
+        }
+        _ => false,
+    }
+}
+
+/// Cast the left operand of each `/` to REAL so SQLite divides fractionally,
+/// unless an operand is already a float cast or the right one a float literal.
+/// For sources that truncate integer division, promote only fractional operands.
+/// SQLite can store a whole-number DECIMAL value as an integer.
+pub(super) fn cast_division_to_real(
+    mut expr: Expression,
+    source: DialectType,
+) -> Result<Expression> {
+    use crate::traversal::ExpressionWalk;
+    if !expr.contains(|e| matches!(e, Expression::Div(_))) {
+        return Ok(expr);
+    }
+    let decimal_only = source.truncates_integer_division();
+    let resolve_columns = decimal_only && expr.contains(|e| matches!(e, Expression::Column(_)));
+    if resolve_columns {
+        crate::optimizer::annotate_types(&mut expr, None, Some(source));
+    }
+    // SQLite AVG returns REAL even for integers. Preserve SQL Server's integer
+    // result before tracing projections into any enclosing division.
+    if matches!(source, DialectType::TSQL | DialectType::Fabric)
+        && expr.contains(|e| matches!(e, Expression::Avg(_)))
+    {
+        expr = crate::traversal::transform_all(expr, &|e| {
+            if let Expression::Avg(avg) = &e {
+                if expression_integer_type(&avg.this, source).is_some() {
+                    return Ok(cast_expr(
+                        e,
+                        DataType::Int {
+                            length: None,
+                            integer_spelling: true,
+                        },
+                    ));
+                }
+            }
+            Ok(e)
+        })?;
+        if resolve_columns {
+            crate::optimizer::annotate_types(&mut expr, None, Some(source));
+        }
+    }
+    crate::dialects::transform_recursive(expr, &|e| match e {
+        Expression::Div(mut op) => {
+            let right_is_float = matches!(&op.right, Expression::Literal(lit) if matches!(lit.as_ref(), Literal::Number(n) if n.contains('.')));
+            let fractional = !decimal_only
+                || is_decimal_typed(&op.left, source)
+                || is_decimal_typed(&op.right, source);
+            if fractional
+                && !is_float_cast(&op.left)
+                && !is_float_cast(&op.right)
+                && !right_is_float
+            {
+                op.left = cast_expr(
+                    op.left,
+                    DataType::Float {
+                        precision: None,
+                        scale: None,
+                        real_spelling: true,
+                    },
+                );
+            }
+            Ok(Expression::Div(op))
+        }
+        _ => Ok(e),
+    })
 }
 
 pub(super) fn cast_expr(this: Expression, to: DataType) -> Expression {

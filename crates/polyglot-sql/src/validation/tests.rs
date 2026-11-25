@@ -3,6 +3,114 @@ use crate::function_catalog::{FunctionNameCase, FunctionSignature, HashMapFuncti
 use std::sync::Arc;
 
 #[test]
+fn snowflake_schema_lookups_respect_delimited_identifiers() {
+    let schema = serde_json::from_value(serde_json::json!({"tables": [
+        {"name":"MixedCase","schema":"S","aliases":[r#""DB"."S"."MixedCase""#],
+         "columns":[{"name":r#""Amount""#,"type":"INT"}, {"name":"bare","type":"INT"}]},
+        {"name":r#""a.b""#, "columns":[{"name":"id","type":"INT"}]}
+    ]}))
+    .unwrap();
+    for check_types in [false, true] {
+        let options = SchemaValidationOptions {
+            check_types,
+            ..Default::default()
+        };
+        for (sql, expected) in [
+            (r#"SELECT "Amount", BARE FROM db.s."MixedCase""#, None),
+            (r#"SELECT "Amount" FROM s.mixedcase"#, None),
+            (
+                r#"SELECT bare FROM s.mixedcase WHERE "Amount""#,
+                check_types.then_some("E211"),
+            ),
+            (r#"SELECT nope FROM db.s."MixedCase""#, Some("E201")),
+            (r#"SELECT amount FROM s.t"#, Some("E200")),
+            (r#"SELECT amount FROM s.mixedcase"#, Some("E201")),
+            (r#"SELECT "AMOUNT" FROM s.mixedcase"#, Some("E201")),
+            (r#"SELECT "Bare" FROM s.mixedcase"#, Some("E201")),
+            (r#"SELECT id FROM s."mixedcase""#, Some("E200")),
+            (r#"SELECT id FROM "a.b""#, None),
+            (r#"INSERT INTO s.mixedcase ("Amount") VALUES (1)"#, None),
+            (r#"UPDATE s.mixedcase SET "Amount" = 2"#, None),
+        ] {
+            let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+            assert_eq!(
+                result.valid,
+                expected.is_none(),
+                "{sql}: {:?}",
+                result.errors
+            );
+            if let Some(code) = expected {
+                assert!(
+                    result.errors.iter().any(|error| error.code == code),
+                    "{sql}: {:?}",
+                    result.errors
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pivot_operands_resolve_against_the_input_relation() {
+    let schema = serde_json::from_value(serde_json::json!({"tables": [
+        {"schema":"s","name":"p","columns":[{"name":"k","type":"INT"},{"name":"a","type":"VARCHAR"},{"name":"b","type":"INT"}]},
+        {"schema":"s","name":"t","columns":[{"name":"k","type":"INT"},{"name":"a","type":"INT"},{"name":"b","type":"INT"}]},
+        {"name":"other","columns":[{"name":"nope","type":"INT"}]}
+    ]})).unwrap();
+    for sql in [
+        "SELECT * FROM s.p PIVOT (SUM(b) FOR a IN ('x', 'y'))",
+        "SELECT r.k FROM (SELECT k, a, b FROM s.p) PIVOT (SUM(b) FOR a IN ('x')) AS r",
+        "WITH c AS (SELECT b AS amount, a FROM s.p) SELECT * FROM c PIVOT (SUM(amount) FOR a IN ('x' AS x))",
+        "SELECT k, name, val FROM s.t UNPIVOT (val FOR name IN (a, b))",
+    ] {
+        let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &Default::default());
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+    for (sql, missing) in [
+        (
+            "SELECT * FROM other CROSS JOIN s.p PIVOT (SUM(nope) FOR a IN ('x'))",
+            "nope",
+        ),
+        ("SELECT * FROM s.p PIVOT (SUM(b) FOR nope IN ('x'))", "nope"),
+        ("SELECT b FROM s.p PIVOT (SUM(b) FOR a IN ('x'))", "b"),
+        (
+            "SELECT * FROM s.t UNPIVOT (val FOR name IN (nope, b))",
+            "nope",
+        ),
+        ("SELECT a FROM s.t UNPIVOT (val FOR name IN (a, b))", "a"),
+    ] {
+        let result =
+            validate_with_schema(sql, DialectType::Snowflake, &schema, &Default::default());
+        assert_eq!(result.errors.len(), 1, "{sql}: {:?}", result.errors);
+        assert_eq!(result.errors[0].code, "E201", "{sql}");
+        assert!(
+            result.errors[0].message.contains(&format!("'{missing}'")),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn unknown_column_on_catalog_qualified_table() {
+    let schema = serde_json::from_value(serde_json::json!({"tables": [
+        {"schema": "s", "name": "t", "columns": [{"name":"a","type":"INT"}]},
+        {"name": "other", "aliases": ["db.s.t"], "columns": [{"name":"b","type":"INT"}]}
+    ]}))
+    .unwrap();
+    for (table, present, missing) in [("db.s.t", "b", "a"), ("other_db.s.t", "a", "b")] {
+        for (column, valid) in [(present, true), (missing, false)] {
+            let sql = format!("SELECT {column} FROM {table}");
+            let result =
+                validate_with_schema(&sql, DialectType::DuckDB, &schema, &Default::default());
+            assert_eq!(result.valid, valid, "{sql}: {:?}", result.errors);
+            if !valid {
+                assert!(result.errors.iter().any(|error| error.code == "E201"));
+            }
+        }
+    }
+}
+
+#[test]
 fn values_source_columns_471() {
     let schema = review_schema();
     let options = SchemaValidationOptions {
@@ -419,6 +527,22 @@ fn review_dialect_aliases_and_quoting() {
 fn review_semantic_errors_are_scope_local_and_opt_in() {
     for (sql, code) in [
         ("SELECT quantity AS n, SUM(active) FROM items", "E230"),
+        (
+            "SELECT quantity, COUNT(*) FROM items GROUP BY ALL HAVING active",
+            "E230",
+        ),
+        (
+            "SELECT COUNT(*) FROM items GROUP BY ALL ORDER BY quantity",
+            "E230",
+        ),
+        (
+            "SELECT * EXCLUDE (quantity) FROM items GROUP BY ALL HAVING quantity > 0",
+            "E230",
+        ),
+        (
+            "SELECT quantity, LISTAGG(name, ',') WITHIN GROUP (ORDER BY quantity) FROM items",
+            "E230",
+        ),
         ("SELECT quantity FROM items WHERE SUM(quantity)>0", "E231"),
         ("SELECT SUM(SUM(quantity)) FROM items", "E231"),
         (
@@ -450,6 +574,11 @@ fn review_semantic_errors_are_scope_local_and_opt_in() {
         );
     }
     for sql in [
+        "SELECT LISTAGG(name, ',') WITHIN GROUP (ORDER BY quantity) FROM items",
+        "SELECT active, LISTAGG(name, ',') WITHIN GROUP (ORDER BY quantity) FROM items GROUP BY active",
+        "SELECT quantity, COUNT(*) FROM items GROUP BY ALL HAVING quantity > 0",
+        "SELECT quantity + 1 AS n, COUNT(*) FROM items GROUP BY ALL HAVING n > 0",
+        "SELECT *, COUNT(*) FROM items GROUP BY ALL HAVING quantity > 0",
         "SELECT SUM(quantity) OVER(), quantity FROM items",
         "SELECT quantity, (SELECT SUM(quantity) FROM other) FROM items",
         "SELECT quantity, SUM(SUM(quantity)) OVER() FROM items GROUP BY quantity",
@@ -840,7 +969,7 @@ fn test_schema_validation_projection_alias_chains_are_bounded() {
     bind_scope_projection_aliases(
         &mut selected,
         &[],
-        &build_resolver_schema(&schema),
+        &mapping_schema_from_validation_schema_with_dialect(&schema, DialectType::Snowflake),
         DialectType::Snowflake,
         true,
         &mut bindings,
@@ -2392,6 +2521,38 @@ fn test_validate_with_schema_type_check_non_strict_warnings() {
 }
 
 #[test]
+fn in_subquery_projection_width() {
+    let schema = base_schema();
+    let options = SchemaValidationOptions {
+        check_types: true,
+        ..Default::default()
+    };
+    for (predicate, valid) in [
+        ("id IN (SELECT id FROM users)", true),
+        ("id NOT IN (SELECT id, age FROM users)", false),
+        (
+            "id IN (SELECT id, age FROM users UNION ALL SELECT id, age FROM users)",
+            false,
+        ),
+        ("id IN (SELECT u.* FROM users u)", false),
+        ("(id, age) IN (SELECT id, age FROM users)", true),
+        ("(id, age) IN (SELECT id, age, name FROM users)", false),
+    ] {
+        let sql = format!("SELECT id FROM users WHERE {predicate}");
+        let result = validate_with_schema(&sql, DialectType::Snowflake, &schema, &options);
+        assert_eq!(result.valid, valid, "{sql}: {:?}", result.errors);
+        assert_eq!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.code == validation_codes::E_INCOMPATIBLE_COMPARISON_TYPES),
+            !valid,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn test_validate_with_schema_type_check_setop_arity_mismatch() {
     let schema = base_schema();
     let opts = SchemaValidationOptions {
@@ -2642,4 +2803,28 @@ fn schema_validation_propagates_complexity_guard_to_both_parses() {
         assert!(!invalid.valid);
         assert!(invalid.errors.iter().any(|error| error.code == "E201"));
     }
+}
+
+#[test]
+fn snowflake_table_function_aliases_are_visible() {
+    let schema = serde_json::from_value(serde_json::json!({"tables": [
+        {"name":"t","schema":"s","columns":[{"name":"k","type":"INT"},{"name":"items","type":"VARIANT"}]}
+    ]})).unwrap();
+    let options = SchemaValidationOptions::default();
+    for sql in [
+        "SELECT t.k, f.value FROM s.t t, LATERAL FLATTEN(input => t.items) f",
+        "SELECT t.k, f.value FROM s.t t, TABLE(FLATTEN(input => t.items)) f",
+        "SELECT t.k, f.value FROM s.t t CROSS JOIN TABLE(FLATTEN(input => t.items)) f",
+        "SELECT s.value FROM TABLE(SPLIT_TO_TABLE('x,y', ',')) s",
+    ] {
+        let result = validate_with_schema(sql, DialectType::Snowflake, &schema, &options);
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+    let result = validate_with_schema(
+        "SELECT missing.value FROM TABLE(SPLIT_TO_TABLE('x,y', ',')) s",
+        DialectType::Snowflake,
+        &schema,
+        &options,
+    );
+    assert!(result.errors.iter().any(|e| e.code == "E222"));
 }

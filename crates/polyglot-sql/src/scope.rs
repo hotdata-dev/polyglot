@@ -179,6 +179,9 @@ pub struct Scope {
     /// Whether this derived table sees only preceding FROM/JOIN sources.
     pub is_lateral: bool,
 
+    /// Original SELECT-list position containing this scalar subquery.
+    pub(crate) parent_projection: Option<usize>,
+
     /// Child subquery scopes
     pub subquery_scopes: Vec<Scope>,
 
@@ -216,6 +219,7 @@ impl Scope {
             outer_columns: Vec::new(),
             can_be_correlated: false,
             is_lateral: false,
+            parent_projection: None,
             subquery_scopes: Vec::new(),
             derived_table_scopes: Vec::new(),
             cte_scopes: Vec::new(),
@@ -254,6 +258,7 @@ impl Scope {
             outer_columns: outer_columns.unwrap_or_default(),
             can_be_correlated,
             is_lateral: false,
+            parent_projection: None,
             subquery_scopes: Vec::new(),
             derived_table_scopes: Vec::new(),
             cte_scopes: Vec::new(),
@@ -814,10 +819,10 @@ fn add_join_group_to_scope(
     for join in &joined.joins {
         add_relation_to_scope(&join.this, scope, preceding_sources);
         if let Some(condition) = &join.on {
-            collect_subqueries_in_expr(condition, scope);
+            collect_subqueries_in_expr(condition, scope, None);
         }
         if let Some(condition) = &join.match_condition {
-            collect_subqueries_in_expr(condition, scope);
+            collect_subqueries_in_expr(condition, scope, None);
         }
     }
     for lateral_view in &joined.lateral_views {
@@ -842,6 +847,16 @@ fn add_relation_to_scope(
             }
         }
     }
+}
+
+/// The relation returned by Snowflake's TABLE(table_function(...)).
+pub(crate) fn table_function_argument(expr: &Expression) -> Option<&Expression> {
+    if let Expression::Function(function) = expr {
+        if function.name.eq_ignore_ascii_case("TABLE") && function.args.len() == 1 {
+            return function.args.first();
+        }
+    }
+    None
 }
 
 fn add_table_to_scope(
@@ -929,7 +944,10 @@ fn add_table_to_scope(
             scope.add_virtual_source(name.clone(), expr.clone());
             Some(name)
         }
-        Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
+        Expression::Alias(alias)
+            if matches!(&alias.this, Expression::Unnest(_))
+                || table_function_argument(&alias.this).is_some() =>
+        {
             scope.add_virtual_source(alias.alias.name.clone(), expr.clone());
             Some(alias.alias.name.clone())
         }
@@ -1034,7 +1052,7 @@ fn identifier_table(expr: &Expression) -> Option<TableRef> {
 }
 
 /// Split a literal object name without treating quoted dots as separators.
-fn identifier_table_parts(name: &str) -> Option<Vec<Identifier>> {
+pub(crate) fn identifier_table_parts(name: &str) -> Option<Vec<Identifier>> {
     let mut chars = name.chars().peekable();
     let mut parts = Vec::new();
     loop {
@@ -1172,13 +1190,21 @@ fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope) {
                 [Field("from" | "with" | "lateral_views"), ..]
                     | [Field("joins"), Index(_), Field("this"), ..]
             ) {
-                collect_subqueries_in_expr(child, parent_scope);
+                let projection = match path {
+                    [Field("expressions"), Index(index)] => Some(*index),
+                    _ => None,
+                };
+                collect_subqueries_in_expr(child, parent_scope, projection);
             }
         });
     }
 }
 
-fn collect_subqueries_in_expr(expr: &Expression, parent_scope: &mut Scope) {
+fn collect_subqueries_in_expr(
+    expr: &Expression,
+    parent_scope: &mut Scope,
+    projection: Option<usize>,
+) {
     let mut seen = HashSet::new();
     for node in walk_in_scope(expr, false) {
         let query = match node {
@@ -1199,9 +1225,18 @@ fn collect_subqueries_in_expr(expr: &Expression, parent_scope: &mut Scope) {
         }
 
         let mut sub_scope = parent_scope.branch(query.clone(), ScopeType::Subquery);
+        sub_scope.parent_projection = projection;
         build_scope_impl(query, &mut sub_scope);
         parent_scope.subquery_scopes.push(sub_scope);
     }
+}
+
+/// Whether a projection contributes an implicit GROUP BY ALL key.
+pub(crate) fn implicit_group_key(expression: &Expression) -> bool {
+    !matches!(expression, Expression::Literal(_))
+        && !walk_in_scope(expression, false).any(|node| {
+            crate::traversal::is_aggregate(node) || crate::traversal::is_window_function(node)
+        })
 }
 
 /// Walk within a scope, yielding expressions without crossing scope boundaries.
@@ -1219,20 +1254,30 @@ pub fn walk_in_scope<'a>(
     expression: &'a Expression,
     bfs: bool,
 ) -> impl Iterator<Item = &'a Expression> {
-    WalkInScopeIter::new(expression, bfs)
+    walk_in_scope_pruned(expression, bfs, |_| false)
+}
+
+/// Visit a boundary node but leave its operands to a separate scope walk.
+pub(crate) fn walk_in_scope_pruned(
+    expression: &Expression,
+    bfs: bool,
+    prune: fn(&Expression) -> bool,
+) -> impl Iterator<Item = &Expression> {
+    WalkInScopeIter::new(expression, bfs, prune)
 }
 
 /// Iterator for walking within a scope
 struct WalkInScopeIter<'a> {
     queue: VecDeque<&'a Expression>,
     bfs: bool,
+    prune: fn(&Expression) -> bool,
 }
 
 impl<'a> WalkInScopeIter<'a> {
-    fn new(expression: &'a Expression, bfs: bool) -> Self {
+    fn new(expression: &'a Expression, bfs: bool, prune: fn(&Expression) -> bool) -> Self {
         let mut queue = VecDeque::new();
         queue.push_back(expression);
-        Self { queue, bfs }
+        Self { queue, bfs, prune }
     }
 
     fn should_stop_at(&self, expr: &Expression, is_root: bool) -> bool {
@@ -1382,6 +1427,10 @@ impl<'a> WalkInScopeIter<'a> {
             Expression::Alias(alias) => {
                 children.push(&alias.this);
             }
+            Expression::PivotAlias(alias) => {
+                // The alias in an IN list names an output.
+                children.push(&alias.this);
+            }
             Expression::Case(case) => {
                 if let Some(operand) = &case.operand {
                     children.push(operand);
@@ -1471,6 +1520,9 @@ impl<'a> Iterator for WalkInScopeIter<'a> {
             self.queue.pop_back()?
         };
 
+        if (self.prune)(expr) {
+            return Some(expr);
+        }
         // Get children that don't cross scope boundaries
         let children = self.get_children(expr);
 
@@ -1548,6 +1600,15 @@ where
 /// # Returns
 /// A vector of all scopes found
 pub fn traverse_scope(expression: &Expression) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    for_each_scope(expression, |scope| scopes.push(scope.clone()));
+    scopes
+}
+
+/// Visit the scopes of `traverse_scope` in the same order, without a copy.
+/// A copy of a scope holds its child scopes, so the copies of a nested set
+/// operation grow quadratically.
+pub(crate) fn for_each_scope(expression: &Expression, visit: impl FnMut(&Scope)) {
     match expression {
         Expression::Select(_)
         | Expression::Union(_)
@@ -1555,10 +1616,12 @@ pub fn traverse_scope(expression: &Expression) -> Vec<Scope> {
         | Expression::Except(_)
         | Expression::Prepare(_)
         | Expression::CreateTable(_) => {
-            let root = build_scope(expression);
-            root.traverse().into_iter().cloned().collect()
+            build_scope(expression)
+                .traverse()
+                .into_iter()
+                .for_each(visit);
         }
-        _ => Vec::new(),
+        _ => {}
     }
 }
 

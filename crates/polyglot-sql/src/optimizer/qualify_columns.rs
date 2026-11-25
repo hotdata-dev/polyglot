@@ -429,6 +429,12 @@ fn get_source_name(expr: &Expression) -> Option<String> {
                 .unwrap_or_else(|| t.name.name.clone()),
         ),
         Expression::Subquery(sq) => sq.alias.as_ref().map(|a| a.name.clone()),
+        Expression::Lateral(lateral) => lateral.alias.clone(),
+        Expression::Alias(alias)
+            if crate::scope::table_function_argument(&alias.this).is_some() =>
+        {
+            Some(alias.alias.name.clone())
+        }
         Expression::Pivot(pivot) => Some(pivot_source_name(
             &pivot.this,
             pivot.alias.as_ref().map(|alias| alias.name.as_str()),
@@ -509,16 +515,31 @@ fn make_coalesce(column_name: &str, tables: &[String]) -> Expression {
     }))
 }
 
+struct UsingColumn {
+    participants: Vec<String>,
+    value_sources: Vec<String>,
+    // A prior FULL join can supply unmatched keys from either side.
+    has_full_join: bool,
+}
+
+impl UsingColumn {
+    fn value(&self, name: &str) -> Expression {
+        match self.value_sources.as_slice() {
+            [table] => Expression::qualified_column(table.as_str(), name),
+            tables => make_coalesce(name, tables),
+        }
+    }
+}
+
 /// Expand JOIN USING clauses into ON conditions and track which columns
-/// participate in USING joins for later COALESCE rewriting.
+/// supply the merged key for subsequent predicates and projections.
 ///
-/// Returns a mapping from column name → ordered list of table names that
-/// participate in USING for that column.
+/// Retain all participants separately for duplicate suppression in SELECT *.
 fn expand_using(
     select: &mut Select,
     _scope: &Scope,
     resolver: &mut Resolver,
-) -> QualifyColumnsResult<HashMap<String, Vec<String>>> {
+) -> QualifyColumnsResult<HashMap<String, UsingColumn>> {
     // columns: normalized column name → first source that owns it
     // (first-seen-wins)
     let mut columns: HashMap<String, String> = HashMap::new();
@@ -528,7 +549,7 @@ fn expand_using(
 
     // column_tables: normalized column name → ordered list of tables that
     // participate in USING
-    let mut column_tables: HashMap<String, Vec<String>> = HashMap::new();
+    let mut column_tables: HashMap<String, UsingColumn> = HashMap::new();
 
     // Get non-join source names from FROM clause
     let join_names: HashSet<String> = select
@@ -655,7 +676,6 @@ fn expand_using(
             .map(|id| id.name.clone())
             .collect();
 
-        let using_count = using_identifiers.len();
         let is_semi_or_anti = matches!(
             select.joins[i].kind,
             crate::expressions::JoinKind::Semi
@@ -676,32 +696,15 @@ fn expand_using(
                 .unwrap_or_else(|| source_table.clone());
 
             // Build LHS of the equality
-            let lhs = if i == 0 || using_count == 1 {
-                // Simple qualified column for first join or single USING column
-                Expression::qualified_column(table.as_str(), identifier.as_str())
-            } else {
-                // For subsequent joins with multiple USING columns,
-                // COALESCE over all previous sources that have this column
-                let coalesce_cols: Vec<String> = ordered[..ordered.len() - 1]
-                    .iter()
-                    .filter(|t| {
-                        resolver
-                            .get_source_columns(t)
-                            .unwrap_or_default()
-                            .iter()
-                            .any(|column| {
-                                normalize_column_name(column, resolver.dialect)
-                                    == normalized_identifier
-                            })
-                    })
-                    .cloned()
-                    .collect();
-
-                if coalesce_cols.len() > 1 {
-                    make_coalesce(identifier, &coalesce_cols)
-                } else {
-                    Expression::qualified_column(table.as_str(), identifier.as_str())
+            let lhs = match column_tables.get(&normalized_identifier) {
+                Some(merged) if !merged.has_full_join && using_identifiers.len() == 1 => {
+                    Expression::qualified_column(
+                        merged.value_sources[0].as_str(),
+                        identifier.as_str(),
+                    )
                 }
+                Some(merged) => merged.value(identifier),
+                None => Expression::qualified_column(table.as_str(), identifier.as_str()),
             };
 
             // Build RHS: qualified column from join table
@@ -711,14 +714,25 @@ fn expand_using(
 
             // Track tables for COALESCE rewriting (skip for semi/anti joins)
             if !is_semi_or_anti {
-                let tables = column_tables
+                let merged = column_tables
                     .entry(normalized_identifier)
-                    .or_insert_with(Vec::new);
-                if !tables.contains(&table) {
-                    tables.push(table.clone());
-                }
-                if !tables.contains(&join_table) {
-                    tables.push(join_table.clone());
+                    .or_insert_with(|| UsingColumn {
+                        participants: vec![table.clone()],
+                        value_sources: vec![table],
+                        has_full_join: false,
+                    });
+                merged.participants.push(join_table.clone());
+                match select.joins[i].kind {
+                    JoinKind::Left => {}
+                    JoinKind::Right => {
+                        merged.value_sources = vec![join_table.clone()];
+                        merged.has_full_join = false;
+                    }
+                    JoinKind::Full | JoinKind::Outer => {
+                        merged.value_sources.push(join_table.clone());
+                        merged.has_full_join = true;
+                    }
+                    _ => merged.value_sources.push(join_table.clone()),
                 }
             }
         }
@@ -735,7 +749,7 @@ fn expand_using(
         accumulated_schema_known &= right_schema_known;
     }
 
-    // Phase 2: Rewrite unqualified USING column references to COALESCE
+    // Rewrite unqualified USING references to the merged value.
     if !column_tables.is_empty() {
         // Rewrite select.expressions (projections)
         let mut new_expressions = Vec::with_capacity(select.expressions.len());
@@ -747,7 +761,7 @@ fn expand_using(
                         new_expressions.push(expr.clone());
                         continue;
                     };
-                    let coalesce = make_coalesce(&col.name.name, tables);
+                    let coalesce = tables.value(&col.name.name);
                     // Wrap in alias to preserve column name in projections
                     new_expressions.push(Expression::Alias(Box::new(Alias {
                         this: coalesce,
@@ -818,17 +832,17 @@ fn expand_using(
     Ok(column_tables)
 }
 
-/// Recursively replace unqualified USING column references with COALESCE.
+/// Recursively replace unqualified USING references with the merged value.
 fn rewrite_using_columns_in_expression(
     expr: &mut Expression,
-    column_tables: &HashMap<String, Vec<String>>,
+    column_tables: &HashMap<String, UsingColumn>,
     dialect: Option<DialectType>,
 ) {
     let transformed: crate::Result<_> = transform_in_scope(expr.clone(), |node| match node {
         Expression::Column(col) if col.table.is_none() => {
             let normalized = normalize_column_name(&col.name.name, dialect);
             if let Some(tables) = column_tables.get(&normalized) {
-                Ok(make_coalesce(&col.name.name, tables))
+                Ok(tables.value(&col.name.name))
             } else {
                 Ok(Expression::Column(col))
             }
@@ -1045,11 +1059,10 @@ fn expand_stars(
     select: &mut Select,
     _scope: &Scope,
     resolver: &mut Resolver,
-    column_tables: &HashMap<String, Vec<String>>,
+    column_tables: &HashMap<String, UsingColumn>,
 ) -> QualifyColumnsResult<()> {
     let mut new_selections: Vec<Expression> = Vec::new();
     let mut has_star = false;
-    let mut coalesced_columns: HashSet<String> = HashSet::new();
 
     // Use ordered source names (not unordered HashMap keys)
     let ordered_sources = get_ordered_source_names(select);
@@ -1071,30 +1084,6 @@ fn expand_stars(
                             return Ok(());
                         }
                         for col_name in &columns {
-                            let normalized = normalize_column_name(col_name, resolver.dialect);
-                            if star.excludes(col_name, resolver.dialect)
-                                || coalesced_columns.contains(&normalized)
-                            {
-                                continue;
-                            }
-                            if let Some(tables) = column_tables.get(&normalized) {
-                                if tables.contains(table_name) {
-                                    coalesced_columns.insert(normalized);
-                                    let coalesce = make_coalesce(col_name, tables);
-                                    if let Some(expanded) =
-                                        star.expand_column(col_name, coalesce, resolver.dialect)
-                                    {
-                                        new_selections.push(match expanded {
-                                            Expression::Alias(_) => expanded,
-                                            _ => Expression::Alias(Box::new(Alias::new(
-                                                expanded,
-                                                Identifier::new(col_name),
-                                            ))),
-                                        });
-                                    }
-                                    continue;
-                                }
-                            }
                             new_selections.extend(star.expand_column(
                                 col_name,
                                 create_qualified_column(col_name, Some(table_name)),
@@ -1103,6 +1092,7 @@ fn expand_stars(
                         }
                     }
                 } else {
+                    let mut coalesced_columns = HashSet::new();
                     for source_name in &ordered_sources {
                         if let Ok(columns) = resolver.get_source_columns(source_name) {
                             if columns.contains(&"*".to_string()) || columns.is_empty() {
@@ -1117,10 +1107,10 @@ fn expand_stars(
                                     continue;
                                 }
                                 if let Some(tables) = column_tables.get(&normalized) {
-                                    if tables.contains(source_name) {
+                                    if tables.participants.contains(source_name) {
                                         // Emit COALESCE and mark as coalesced
                                         coalesced_columns.insert(normalized);
-                                        let coalesce = make_coalesce(col_name, tables);
+                                        let coalesce = tables.value(col_name);
                                         if let Some(expanded) =
                                             star.expand_column(col_name, coalesce, resolver.dialect)
                                         {
@@ -1157,27 +1147,6 @@ fn expand_stars(
                             return Ok(());
                         }
                         for col_name in &columns {
-                            let normalized = normalize_column_name(col_name, resolver.dialect);
-                            if coalesced_columns.contains(&normalized) {
-                                continue;
-                            }
-                            if let Some(tables) = column_tables.get(&normalized) {
-                                if tables.contains(table_name) {
-                                    coalesced_columns.insert(normalized);
-                                    let coalesce = make_coalesce(col_name, tables);
-                                    new_selections.push(Expression::Alias(Box::new(Alias {
-                                        this: coalesce,
-                                        alias: Identifier::new(col_name),
-                                        column_aliases: vec![],
-                                        alias_explicit_as: false,
-                                        alias_keyword: None,
-                                        pre_alias_comments: vec![],
-                                        trailing_comments: vec![],
-                                        inferred_type: None,
-                                    })));
-                                    continue;
-                                }
-                            }
                             new_selections
                                 .push(create_qualified_column(col_name, Some(table_name)));
                         }
@@ -1212,14 +1181,15 @@ fn qualify_outputs_select(select: &mut Select) -> QualifyColumnsResult<()> {
     let mut new_selections: Vec<Expression> = Vec::new();
 
     for (i, expr) in select.expressions.iter().enumerate() {
-        match expr {
+        let mut output = expr;
+        while let Expression::Annotated(annotated) = output {
+            output = &annotated.this;
+        }
+        match output {
             Expression::Alias(_) => new_selections.push(expr.clone()),
-            Expression::Column(col) => {
-                new_selections.push(create_alias(expr.clone(), &col.name.name));
-            }
             Expression::Star(_) => new_selections.push(expr.clone()),
             _ => {
-                let alias_name = get_output_name(expr).unwrap_or_else(|| format!("_col_{}", i));
+                let alias_name = get_output_name(output).unwrap_or_else(|| format!("_col_{}", i));
                 new_selections.push(create_alias(expr.clone(), &alias_name));
             }
         }
@@ -3802,12 +3772,9 @@ mod tests {
             qualify_columns(expr, &schema, &QualifyColumnsOptions::new()).expect("qualify");
         let sql = gen(&result);
 
-        // b should become COALESCE (since x participates in USING for b)
-        assert!(
-            sql.contains("COALESCE(x.b, y.b)"),
-            "USING column from x.* should become COALESCE: {sql}"
-        );
-        assert!(sql.contains("x.a"), "non-USING column a: {sql}");
+        // The pinned SQLGlot qualify_columns.sql fixture coalesces x.b here.
+        // A qualified star projects only columns of the named relation (#547).
+        assert!(sql.starts_with("SELECT x.a AS a, x.b AS b FROM"), "{sql}");
     }
 
     #[test]

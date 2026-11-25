@@ -30,11 +30,36 @@ pub(super) fn collect(
 }
 
 #[derive(Clone)]
-struct Frame<'a> {
+struct Frame<'a, 'schema> {
     path: String,
     selected: Scope,
-    lineage: &'a ScopedLineage,
+    lineage: &'a LazyLineage<'a, 'schema>,
     subqueries: Vec<Expression>,
+}
+
+/// The lineage of a scope, built on its first use. Set-operation scopes and
+/// many CTE scopes have no clause uses, and each lineage copies its scope.
+struct LazyLineage<'a, 'schema> {
+    scope: &'a Scope,
+    inherited_ctes: &'a [&'a Scope],
+    dialect: DialectType,
+    schema: &'schema MappingSchema,
+    lineage: std::cell::OnceCell<ScopedLineage<'schema>>,
+}
+
+impl<'a, 'schema> std::ops::Deref for LazyLineage<'a, 'schema> {
+    type Target = ScopedLineage<'schema>;
+
+    fn deref(&self) -> &Self::Target {
+        self.lineage.get_or_init(|| {
+            ScopedLineage::new(
+                self.scope.clone(),
+                self.inherited_ctes,
+                self.dialect,
+                Some(self.schema),
+            )
+        })
+    }
 }
 
 struct Collector<'a> {
@@ -45,17 +70,23 @@ struct Collector<'a> {
     guard: Option<ComplexityGuardOptions>,
 }
 
-impl Collector<'_> {
+impl<'schema> Collector<'schema> {
     fn scope(
         &mut self,
         original: &Scope,
         prepared: &Scope,
         path: &str,
-        ancestors: &[&Frame],
-        inherited_ctes: &[Scope],
+        ancestors: &[&Frame<'_, 'schema>],
+        inherited_ctes: &[&Scope],
         filter_branch: bool,
     ) {
-        let lineage = ScopedLineage::new(prepared.clone(), inherited_ctes, self.dialect);
+        let lineage = LazyLineage {
+            scope: prepared,
+            inherited_ctes,
+            dialect: self.dialect,
+            schema: self.schema,
+            lineage: std::cell::OnceCell::new(),
+        };
         let frame = Frame {
             path: path.to_string(),
             selected: selected_reference_scope(original),
@@ -69,11 +100,23 @@ impl Collector<'_> {
         let query = scope_query(&original.expression);
         self.scan(query, "", &frame, ancestors, filter_branch, true);
         if let Expression::Select(select) = query {
+            self.table_function_inputs(select, &frame, ancestors);
             self.implicit_joins(select, path, &frame, ancestors);
+            self.pivot_column_uses(prepared, &frame);
+            if select
+                .group_by
+                .as_ref()
+                .is_some_and(|group| group.all == Some(true) && group.expressions.is_empty())
+            {
+                self.implicit_groups(select, prepared, &frame, ancestors);
+            }
         }
 
-        let mut ctes = prepared.cte_scopes.clone();
-        ctes.extend_from_slice(inherited_ctes);
+        let ctes: Vec<&Scope> = prepared
+            .cte_scopes
+            .iter()
+            .chain(inherited_ctes.iter().copied())
+            .collect();
         let outer: Vec<_> = std::iter::once(&frame)
             .chain(ancestors.iter().copied())
             .collect();
@@ -123,10 +166,14 @@ impl Collector<'_> {
                 });
                 let lateral_outer: Vec<_> =
                     lateral.iter().chain(ancestors.iter().copied()).collect();
+                let child_path = match child.parent_projection {
+                    Some(projection) => format!("{path}.expressions[{projection}].{kind}[{index}]"),
+                    None => format!("{path}.{kind}[{index}]"),
+                };
                 self.scope(
                     child,
                     qualified,
-                    &format!("{path}.{kind}[{index}]"),
+                    &child_path,
                     if correlated { &outer } else { &lateral_outer },
                     &ctes,
                     is_filter,
@@ -139,8 +186,8 @@ impl Collector<'_> {
         &mut self,
         expression: &Expression,
         expression_path: &str,
-        frame: &Frame,
-        ancestors: &[&Frame],
+        frame: &Frame<'_, 'schema>,
+        ancestors: &[&Frame<'_, 'schema>],
         filter_branch: bool,
         root: bool,
     ) {
@@ -245,8 +292,8 @@ impl Collector<'_> {
         &self,
         expression: &Expression,
         context: ColumnUseContext,
-        frame: &Frame,
-        ancestors: &[&Frame],
+        frame: &Frame<'_, 'schema>,
+        ancestors: &[&Frame<'_, 'schema>],
     ) -> Vec<ColumnUseReferenceFact> {
         if context == ColumnUseContext::SetOperationFilter
             && projection_is_star(unwrap_projection_alias(expression))
@@ -335,9 +382,17 @@ impl Collector<'_> {
         &self,
         column: &Column,
         context: ColumnUseContext,
-        frame: &Frame,
-        ancestors: &[&Frame],
+        frame: &Frame<'_, 'schema>,
+        ancestors: &[&Frame<'_, 'schema>],
     ) -> Vec<ColumnUseReferenceFact> {
+        let mut folded;
+        let column = if self.dialect == DialectType::Snowflake && !column.name.quoted {
+            folded = column.clone();
+            folded.name.name.make_ascii_uppercase();
+            &folded
+        } else {
+            column
+        };
         let span = column.span.or(column.name.span).map(source_span);
         let mut local = Resolver::new(&frame.selected, self.schema, false);
         if let Some(qualifier) = &column.table {
@@ -481,7 +536,7 @@ impl Collector<'_> {
 
     fn lineage_references(
         &self,
-        node: &LineageNode,
+        node: &TraceNode,
         span: Option<QuerySourceSpan>,
         unqualified: bool,
     ) -> Vec<ColumnUseReferenceFact> {
@@ -497,12 +552,207 @@ impl Collector<'_> {
         references
     }
 
+    fn table_function_inputs(
+        &mut self,
+        select: &crate::expressions::Select,
+        frame: &Frame<'_, 'schema>,
+        ancestors: &[&Frame<'_, 'schema>],
+    ) {
+        let mut preceding = HashSet::new();
+        let from = select
+            .from
+            .iter()
+            .flat_map(|from| &from.expressions)
+            .enumerate()
+            .map(|(index, relation)| {
+                (
+                    relation,
+                    "from.expressions",
+                    index,
+                    "",
+                    crate::lineage::relation_source_name(relation),
+                )
+            });
+        let joins = select.joins.iter().enumerate().map(|(index, join)| {
+            (
+                &join.this,
+                "joins",
+                index,
+                ".this",
+                crate::lineage::relation_source_name(&join.this),
+            )
+        });
+        let views = select
+            .lateral_views
+            .iter()
+            .enumerate()
+            .map(|(index, view)| {
+                let name = view
+                    .table_alias
+                    .as_ref()
+                    .or(view.column_aliases.first())
+                    .map(|alias| alias.name.clone());
+                (&view.this, "lateral_views", index, ".this", name)
+            });
+        for (relation, field, index, suffix, name) in from.chain(joins).chain(views) {
+            if let Some((call, depth)) = table_function_call(relation) {
+                let mut owner = frame.clone();
+                owner
+                    .selected
+                    .sources
+                    .retain(|name, _| preceding.contains(name));
+                let path = format!("{field}[{index}]{suffix}{}", ".this".repeat(depth));
+                for_each_child(call, |segments, argument| {
+                    let mut path = append_path(&path, segments);
+                    let value = match argument {
+                        Expression::NamedArgument(named) => {
+                            path.push_str(".value");
+                            &named.value
+                        }
+                        _ => argument,
+                    };
+                    let context = ColumnUseContext::TableFunctionInput;
+                    let references = self.references(value, context, &owner, ancestors);
+                    if !references.is_empty() {
+                        self.facts.push(ColumnUseFact {
+                            context,
+                            scope_path: frame.path.clone(),
+                            expression_path: path,
+                            expression_sql: self.sql(value),
+                            span: expression_span(value),
+                            references,
+                        });
+                    }
+                });
+            }
+            preceding.extend(name);
+        }
+    }
+
+    fn pivot_column_uses(&mut self, prepared: &Scope, frame: &Frame<'_, 'schema>) {
+        let Expression::Select(select) = scope_query(&prepared.expression) else {
+            return;
+        };
+        let resolver = Resolver::new(prepared, self.schema, false);
+        let from = select
+            .from
+            .iter()
+            .flat_map(|from| &from.expressions)
+            .enumerate()
+            .map(|(i, relation)| (relation, "from.expressions", i, ""));
+        let joins = select
+            .joins
+            .iter()
+            .enumerate()
+            .map(|(i, join)| (&join.this, "joins", i, ".this"));
+        for (relation, field, index, suffix) in from.chain(joins) {
+            if let Expression::Unpivot(unpivot) = relation {
+                if unpivot.include_nulls != Some(true) {
+                    for (entry_index, entry) in unpivot.columns.iter().enumerate() {
+                        let operand = match entry {
+                            Expression::PivotAlias(alias) => &alias.this,
+                            other => other,
+                        };
+                        let references = frame
+                            .lineage
+                            .unpivot_entry_inputs(&unpivot.this, operand)
+                            .iter()
+                            .flat_map(|node| {
+                                self.lineage_references(node, expression_span(operand), true)
+                            })
+                            .collect();
+                        self.facts.push(ColumnUseFact {
+                            context: ColumnUseContext::Filter,
+                            scope_path: frame.path.clone(),
+                            expression_path: format!(
+                                "{field}[{index}]{suffix}.columns[{entry_index}]"
+                            ),
+                            expression_sql: self.sql(operand),
+                            span: expression_span(operand),
+                            references,
+                        });
+                    }
+                }
+                continue;
+            }
+            let Expression::Pivot(pivot) = relation else {
+                continue;
+            };
+            if pivot.unpivot || pivot.group.is_some() {
+                continue;
+            }
+            for key in resolver
+                .pivot_implicit_group_columns(pivot)
+                .unwrap_or_default()
+            {
+                let node = frame.lineage.pivot_input(&pivot.this, &key);
+                self.facts.push(ColumnUseFact {
+                    context: ColumnUseContext::Group,
+                    scope_path: frame.path.clone(),
+                    expression_path: format!("{field}[{index}]{suffix}"),
+                    expression_sql: key,
+                    span: None,
+                    references: self.lineage_references(&node, None, true),
+                });
+            }
+        }
+    }
+
+    fn implicit_groups(
+        &mut self,
+        select: &crate::expressions::Select,
+        prepared: &Scope,
+        frame: &Frame<'_, 'schema>,
+        ancestors: &[&Frame<'_, 'schema>],
+    ) {
+        // Qualification expands stars with their modifiers and USING columns.
+        // For ordinary projections retain the spelling and spans from the SQL.
+        let has_star = select
+            .expressions
+            .iter()
+            .any(|expr| projection_is_star(unwrap_projection_alias(expr)));
+        let projections = match scope_query(&prepared.expression) {
+            Expression::Select(qualified) if has_star => &qualified.expressions,
+            _ => &select.expressions,
+        };
+        for (index, projection) in projections.iter().enumerate() {
+            let key = unwrap_projection_alias(projection);
+            if !crate::scope::implicit_group_key(key) {
+                continue;
+            }
+            let references = if projection_is_star(key) {
+                // Without a complete schema the contributing columns are unknown.
+                let Expression::Column(mut column) = Expression::column("*") else {
+                    unreachable!()
+                };
+                column.table = projection_star_table(key).map(Identifier::new);
+                vec![unresolved(&column, ReferenceConfidence::Unknown)]
+            } else {
+                self.references(key, ColumnUseContext::Group, frame, ancestors)
+            };
+            if !references.is_empty() {
+                self.facts.push(ColumnUseFact {
+                    context: ColumnUseContext::Group,
+                    scope_path: frame.path.clone(),
+                    expression_path: if has_star {
+                        "group_by.all".to_string()
+                    } else {
+                        format!("expressions[{index}]")
+                    },
+                    expression_sql: self.sql(key),
+                    span: expression_span(key),
+                    references,
+                });
+            }
+        }
+    }
+
     fn implicit_joins(
         &mut self,
         select: &crate::expressions::Select,
         scope_path: &str,
-        frame: &Frame,
-        ancestors: &[&Frame],
+        frame: &Frame<'_, 'schema>,
+        ancestors: &[&Frame<'_, 'schema>],
     ) {
         let mut left = Vec::new();
         if let Some(from) = &select.from {
@@ -680,7 +930,7 @@ fn unresolved(column: &Column, confidence: ReferenceConfidence) -> ColumnUseRefe
 }
 
 fn use_references(
-    node: &LineageNode,
+    node: &TraceNode,
     span: Option<QuerySourceSpan>,
     unqualified: bool,
 ) -> Vec<ColumnUseReferenceFact> {
@@ -707,6 +957,26 @@ fn merged_join_column(expression: &Expression, column: &str) -> bool {
 }
 
 pub(super) fn collect_uncertain_occurrences(
+    scope: &Scope,
+    schema: &MappingSchema,
+    uncertain: &mut HashMap<(usize, usize), ReferenceConfidence>,
+) {
+    uncertain_in_scope(scope, schema, uncertain);
+    for child in scope
+        .cte_scopes
+        .iter()
+        .chain(&scope.derived_table_scopes)
+        .chain(&scope.subquery_scopes)
+        .chain(&scope.udtf_scopes)
+        .chain(&scope.union_scopes)
+    {
+        collect_uncertain_occurrences(child, schema, uncertain);
+    }
+}
+
+/// `selected` copies the visible CTEs. Its copy ends before the walk of the
+/// children, because a nested set operation is one scope per level.
+fn uncertain_in_scope(
     scope: &Scope,
     schema: &MappingSchema,
     uncertain: &mut HashMap<(usize, usize), ReferenceConfidence>,
@@ -745,15 +1015,5 @@ pub(super) fn collect_uncertain_occurrences(
                 }
             }
         }
-    }
-    for child in scope
-        .cte_scopes
-        .iter()
-        .chain(&scope.derived_table_scopes)
-        .chain(&scope.subquery_scopes)
-        .chain(&scope.udtf_scopes)
-        .chain(&scope.union_scopes)
-    {
-        collect_uncertain_occurrences(child, schema, uncertain);
     }
 }

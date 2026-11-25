@@ -1467,7 +1467,9 @@ impl DuckDBDialect {
     fn normalize_empty_map_expr(expr: Expression) -> Expression {
         match expr {
             Expression::Cast(mut c) if matches!(&c.to, DataType::Map { .. }) => {
-                if matches!(&c.this, Expression::Struct(s) if s.fields.is_empty()) {
+                if matches!(&c.this, Expression::Struct(s) if s.fields.is_empty())
+                    || matches!(&c.this, Expression::Function(f) if f.name.eq_ignore_ascii_case("JSON_OBJECT") && f.args.is_empty())
+                {
                     c.this =
                         Expression::Function(Box::new(Function::new("MAP".to_string(), vec![])));
                 }
@@ -2794,38 +2796,105 @@ impl DuckDBDialect {
                     f.args,
                 ))))
             }
-            "OBJECT_CONSTRUCT" => {
-                // Convert to DuckDB struct literal: {'key1': val1, 'key2': val2}
-                let args = f.args;
-                if args.is_empty() {
-                    // Empty OBJECT_CONSTRUCT() -> STRUCT_PACK() (no args)
-                    Ok(Expression::Function(Box::new(Function::new(
-                        "STRUCT_PACK".to_string(),
+            "OBJECT_CONSTRUCT" if f.args.len() % 2 == 0 => {
+                // SQL NULL pairs are absent; JSON null values remain present.
+                let pairs: Vec<_> = f
+                    .args
+                    .chunks_exact(2)
+                    .filter(|pair| {
+                        !matches!(pair[0], Expression::Null(_))
+                            && !matches!(pair[1], Expression::Null(_))
+                    })
+                    .map(|pair| (pair[0].clone(), pair[1].clone()))
+                    .collect();
+                if pairs.is_empty() {
+                    return Ok(Expression::Function(Box::new(Function::new(
+                        "JSON_OBJECT",
                         vec![],
-                    ))))
-                } else {
-                    // Build struct literal from key-value pairs
-                    let mut fields = Vec::new();
-                    let mut i = 0;
-                    while i + 1 < args.len() {
-                        let key = &args[i];
-                        let value = args[i + 1].clone();
-                        let key_name = match key {
-                            Expression::Literal(lit)
-                                if matches!(lit.as_ref(), Literal::String(_)) =>
-                            {
-                                let Literal::String(s) = lit.as_ref() else {
-                                    unreachable!()
-                                };
-                                Some(s.clone())
-                            }
-                            _ => None,
-                        };
-                        fields.push((key_name, value));
-                        i += 2;
-                    }
-                    Ok(Expression::Struct(Box::new(Struct { fields })))
+                    ))));
                 }
+                // A struct is sufficient when every field is statically present.
+                if pairs.iter().all(|(key, value)| {
+                    matches!(key, Expression::Literal(lit) if matches!(lit.as_ref(), Literal::String(_)))
+                        && matches!(value, Expression::Literal(_) | Expression::Boolean(_)
+                            | Expression::Struct(_) | Expression::Array(_) | Expression::ArrayFunc(_))
+                }) {
+                    let fields = pairs.into_iter().map(|(key, value)| {
+                        let Expression::Literal(lit) = key else { unreachable!() };
+                        let Literal::String(key) = *lit else { unreachable!() };
+                        (Some(key), value)
+                    }).collect();
+                    return Ok(Expression::Struct(Box::new(Struct { fields })));
+                }
+
+                // JSON values give the entries a common type without coercing mixed
+                // scalars to strings. TO_JSON preserves SQL NULL versus JSON null.
+                let entries = pairs
+                    .into_iter()
+                    .map(|(key, value)| {
+                        Expression::Struct(Box::new(Struct {
+                            fields: vec![
+                                (
+                                    Some("key".to_string()),
+                                    Expression::Cast(Box::new(Cast {
+                                        this: key,
+                                        to: DataType::Text,
+                                        trailing_comments: Vec::new(),
+                                        double_colon_syntax: false,
+                                        format: None,
+                                        default: None,
+                                        inferred_type: None,
+                                    })),
+                                ),
+                                (
+                                    Some("value".to_string()),
+                                    Expression::Function(Box::new(Function::new(
+                                        "TO_JSON",
+                                        vec![value],
+                                    ))),
+                                ),
+                            ],
+                        }))
+                    })
+                    .collect();
+                let is_present = |field| {
+                    Expression::IsNull(Box::new(IsNull {
+                        this: Expression::Dot(Box::new(crate::expressions::DotAccess {
+                            this: Expression::column("__entry"),
+                            field: Identifier::new(field),
+                            inferred_type: None,
+                        })),
+                        not: true,
+                        postfix_form: false,
+                    }))
+                };
+                let predicate = Expression::Lambda(Box::new(crate::expressions::LambdaExpr {
+                    parameters: vec![Identifier::new("__entry")],
+                    body: Expression::And(Box::new(BinaryOp::new(
+                        is_present("key"),
+                        is_present("value"),
+                    ))),
+                    colon: false,
+                    parameter_types: Vec::new(),
+                }));
+                let filtered = Expression::Function(Box::new(Function::new(
+                    "LIST_FILTER",
+                    vec![
+                        Expression::Array(Box::new(crate::expressions::Array {
+                            expressions: entries,
+                            inferred_type: None,
+                        })),
+                        predicate,
+                    ],
+                )));
+                let map = Expression::Function(Box::new(Function::new(
+                    "MAP_FROM_ENTRIES",
+                    vec![filtered],
+                )));
+                Ok(Expression::Function(Box::new(Function::new(
+                    "TO_JSON",
+                    vec![map],
+                ))))
             }
             "IS_NULL_VALUE" if f.args.len() == 1 => {
                 let arg = f.args.into_iter().next().unwrap();
@@ -4361,7 +4430,8 @@ impl DuckDBDialect {
                     Expression::Struct(s) if s.fields.is_empty() => true,
                     Expression::Function(f) => {
                         let n = f.name.to_uppercase();
-                        (n == "STRUCT_PACK" || n == "OBJECT_CONSTRUCT") && f.args.is_empty()
+                        (n == "STRUCT_PACK" || n == "OBJECT_CONSTRUCT" || n == "JSON_OBJECT")
+                            && f.args.is_empty()
                     }
                     _ => false,
                 };
@@ -4379,7 +4449,7 @@ impl DuckDBDialect {
                 }
             }
 
-            // GET(array_or_obj, key) -> array[key+1] for arrays, obj -> '$.key' for objects
+            // Only native arrays need a one-based offset. JSON arrays are zero-based.
             "GET" if f.args.len() == 2 => {
                 let mut args = f.args;
                 let this = args.remove(0);
@@ -4406,22 +4476,53 @@ impl DuckDBDialect {
                             on_error: None,
                         })))
                     }
-                    // Numeric key -> array subscript
-                    // For MAP access: key is used as-is (map[key])
-                    // For ARRAY access: Snowflake is 0-based, DuckDB is 1-based, so add 1
+                    // Use native subscripts for known ARRAY/MAP inputs, otherwise
+                    // preserve Snowflake VARIANT semantics through JSON extraction.
                     Expression::Literal(lit) if matches!(lit.as_ref(), Literal::Number(_)) => {
                         let Literal::Number(n) = lit.as_ref() else {
                             unreachable!()
                         };
-                        let idx: i64 = n.parse().unwrap_or(0);
-                        let is_map = matches!(&this, Expression::Cast(c) if matches!(c.to, DataType::Map { .. }));
-                        let index_val = if is_map { idx } else { idx + 1 };
-                        Ok(Expression::Subscript(Box::new(
-                            crate::expressions::Subscript {
+                        let mut input = &this;
+                        while let Expression::Paren(paren) = input {
+                            input = &paren.this;
+                        }
+                        let is_map = matches!(input, Expression::Cast(c) | Expression::TryCast(c) if matches!(c.to, DataType::Map { .. }))
+                            || matches!(input.inferred_type(), Some(DataType::Map { .. }));
+                        let is_array = matches!(
+                            input,
+                            Expression::Array(_) | Expression::ArrayFunc(_)
+                        ) || matches!(input, Expression::Cast(c) | Expression::TryCast(c) if matches!(c.to, DataType::Array { .. }))
+                            || matches!(input.inferred_type(), Some(DataType::Array { .. }));
+                        if is_map || is_array {
+                            let index = if is_array {
+                                let offset = n.parse::<i64>().ok().and_then(|n| n.checked_add(1));
+                                offset.map(Expression::number).unwrap_or_else(|| {
+                                    Expression::Add(Box::new(BinaryOp::new(
+                                        key,
+                                        Expression::number(1),
+                                    )))
+                                })
+                            } else {
+                                key
+                            };
+                            Ok(Expression::Subscript(Box::new(
+                                crate::expressions::Subscript { this, index },
+                            )))
+                        } else {
+                            Ok(Expression::JsonExtract(Box::new(JsonExtractFunc {
                                 this,
-                                index: Expression::number(index_val),
-                            },
-                        )))
+                                path: normalize_json_path(key),
+                                arrow_syntax: true,
+                                options: None,
+                                source_dialect: None,
+                                returning: None,
+                                hash_arrow_syntax: false,
+                                wrapper_option: None,
+                                quotes_option: None,
+                                on_scalar_string: false,
+                                on_error: None,
+                            })))
+                        }
                     }
                     _ => {
                         // Unknown key type - use JSON arrow
@@ -8650,6 +8751,39 @@ mod tests {
     }
 
     #[test]
+    fn test_snowflake_listagg_default_separator() {
+        for (input, expected) in [
+            (
+                "SELECT LISTAGG(x) WITHIN GROUP (ORDER BY x) AS l FROM (SELECT 'b' AS x UNION ALL SELECT 'a' UNION ALL SELECT 'b')",
+                "SELECT LISTAGG(x, '' ORDER BY x) AS l FROM (SELECT 'b' AS x UNION ALL SELECT 'a' UNION ALL SELECT 'b')",
+            ),
+            ("SELECT LISTAGG(x) FROM t", "SELECT LISTAGG(x, '') FROM t"),
+            (
+                "SELECT LISTAGG(DISTINCT x) WITHIN GROUP (ORDER BY x DESC) FROM t",
+                "SELECT LISTAGG(DISTINCT x, '' ORDER BY x DESC NULLS FIRST) FROM t",
+            ),
+            (
+                "SELECT LISTAGG(x) WITHIN GROUP (ORDER BY x) OVER (PARTITION BY k) FROM t",
+                "SELECT LISTAGG(x, '' ORDER BY x) OVER (PARTITION BY k) FROM t",
+            ),
+            ("SELECT LISTAGG(x, '|') FROM t", "SELECT LISTAGG(x, '|') FROM t"),
+            ("SELECT LISTAGG(x, '') FROM t", "SELECT LISTAGG(x, '') FROM t"),
+        ] {
+            assert_eq!(
+                transpile_to_duckdb_from(input, DialectType::Snowflake),
+                expected,
+                "{input}"
+            );
+        }
+        let input = "SELECT LISTAGG(x) FROM t";
+        assert_eq!(transpile_to_duckdb_from(input, DialectType::DuckDB), input);
+        assert_eq!(
+            crate::transpile(input, DialectType::Snowflake, DialectType::Snowflake).unwrap(),
+            vec![input]
+        );
+    }
+
+    #[test]
     fn test_ordered_group_concat_uses_duckdb_listagg_order_syntax() {
         let result = transpile_to_duckdb_from(
             "SELECT GROUP_CONCAT(nm ORDER BY id SEPARATOR ',') AS v FROM t",
@@ -8678,6 +8812,295 @@ mod tests {
             "Expected REGEXP_MATCHES, got: {}",
             result
         );
+    }
+
+    #[test]
+    fn test_snowflake_regexp_like_uses_full_match() {
+        for (input, expected) in [
+            (
+                "SELECT REGEXP_LIKE('abc', 'b') AS r",
+                "SELECT REGEXP_FULL_MATCH('abc', 'b') AS r",
+            ),
+            (
+                "SELECT REGEXP_LIKE('abc', 'abc')",
+                "SELECT REGEXP_FULL_MATCH('abc', 'abc')",
+            ),
+            (
+                "SELECT REGEXP_LIKE('abc', '.*b.*')",
+                "SELECT REGEXP_FULL_MATCH('abc', '.*b.*')",
+            ),
+            (
+                "SELECT REGEXP_LIKE('abc', 'ABC', 'i')",
+                "SELECT REGEXP_FULL_MATCH('abc', 'ABC', 'i')",
+            ),
+            (
+                "SELECT REGEXP_LIKE('abc', 'ABC', 'c')",
+                "SELECT REGEXP_FULL_MATCH('abc', 'ABC', 'c')",
+            ),
+            (
+                "SELECT REGEXP_LIKE('', '')",
+                "SELECT REGEXP_FULL_MATCH('', '')",
+            ),
+            (
+                "SELECT REGEXP_LIKE('abc', '')",
+                "SELECT REGEXP_FULL_MATCH('abc', '')",
+            ),
+            (
+                "SELECT REGEXP_LIKE(NULL, 'b')",
+                "SELECT REGEXP_FULL_MATCH(NULL, 'b')",
+            ),
+            (
+                "SELECT NOT REGEXP_LIKE(s, p, f) FROM t",
+                "SELECT NOT REGEXP_FULL_MATCH(s, p, f) FROM t",
+            ),
+            (
+                "SELECT RLIKE('abc', 'b')",
+                "SELECT REGEXP_FULL_MATCH('abc', 'b')",
+            ),
+            (
+                "SELECT 'abc' RLIKE 'b'",
+                "SELECT REGEXP_FULL_MATCH('abc', 'b')",
+            ),
+        ] {
+            assert_eq!(
+                transpile_to_duckdb_from(input, DialectType::Snowflake),
+                expected,
+                "{input}"
+            );
+        }
+        assert_eq!(
+            transpile_to_duckdb_from("SELECT REGEXP_LIKE('abc', 'b')", DialectType::PostgreSQL),
+            "SELECT REGEXP_MATCHES('abc', 'b')"
+        );
+    }
+
+    #[test]
+    fn test_snowflake_substring_zero_start() {
+        for (input, expected) in [
+            (
+                "SELECT SUBSTR('hello', 0, 2) AS s",
+                "SELECT SUBSTRING('hello', 1, 2) AS s",
+            ),
+            (
+                "SELECT SUBSTRING('hello', 0, 2)",
+                "SELECT SUBSTRING('hello', 1, 2)",
+            ),
+            ("SELECT SUBSTR('hello', 0)", "SELECT SUBSTRING('hello', 1)"),
+            (
+                "SELECT SUBSTR('hello', 0, 0)",
+                "SELECT SUBSTRING('hello', 1, 0)",
+            ),
+            (
+                "SELECT SUBSTR('hello', 1, 2)",
+                "SELECT SUBSTRING('hello', 1, 2)",
+            ),
+            (
+                "SELECT SUBSTR('hello', 3, 2)",
+                "SELECT SUBSTRING('hello', 3, 2)",
+            ),
+            (
+                "SELECT SUBSTR('hello', -2, 2)",
+                "SELECT SUBSTRING('hello', CASE WHEN -2 = 0 THEN 1 ELSE -2 END, 2)",
+            ),
+            (
+                "SELECT SUBSTR('hello', NULL, 2)",
+                "SELECT SUBSTRING('hello', CASE WHEN NULL = 0 THEN 1 ELSE NULL END, 2)",
+            ),
+            (
+                "SELECT SUBSTR(s, p, n) FROM t",
+                "SELECT SUBSTRING(s, CASE WHEN p = 0 THEN 1 ELSE p END, n) FROM t",
+            ),
+            (
+                "SELECT SUBSTR(s, p - 1) FROM t",
+                "SELECT SUBSTRING(s, CASE WHEN p - 1 = 0 THEN 1 ELSE p - 1 END) FROM t",
+            ),
+        ] {
+            assert_eq!(
+                transpile_to_duckdb_from(input, DialectType::Snowflake),
+                expected,
+                "{input}"
+            );
+        }
+        assert_eq!(
+            transpile_to_duckdb_from("SELECT SUBSTRING('hello', 0, 2)", DialectType::DuckDB),
+            "SELECT SUBSTRING('hello', 0, 2)"
+        );
+    }
+
+    #[test]
+    fn test_snowflake_timestamp_type_aliases() {
+        for (input, expected) in [
+            (
+                "CREATE TABLE t (a TIMESTAMP_LTZ, b TIMESTAMP_NTZ, c TIMESTAMP_LTZ(6))",
+                "CREATE TABLE t (a TIMESTAMPTZ, b TIMESTAMP, c TIMESTAMPTZ)",
+            ),
+            (
+                "SELECT x::TIMESTAMP_LTZ, x::TIMESTAMP_NTZ FROM t",
+                "SELECT CAST(x AS TIMESTAMPTZ), CAST(x AS TIMESTAMP) FROM t",
+            ),
+            (
+                "SELECT CAST(x AS TIMESTAMPLTZ(3)), CAST(x AS TIMESTAMPNTZ(9)) FROM t",
+                "SELECT CAST(x AS TIMESTAMPTZ), CAST(x AS TIMESTAMP(9)) FROM t",
+            ),
+            (
+                "SELECT TRY_CAST(x AS TIMESTAMP_LTZ(6)), TRY_CAST(x AS TIMESTAMP_NTZ(3)) FROM t",
+                "SELECT TRY_CAST(x AS TIMESTAMPTZ), TRY_CAST(x AS TIMESTAMP(3)) FROM t",
+            ),
+            (
+                "CREATE TABLE t (a ARRAY(TIMESTAMP_NTZ(3)), b MAP(VARCHAR, TIMESTAMP_LTZ(6)))",
+                "CREATE TABLE t (a TIMESTAMP(3)[], b MAP(TEXT, TIMESTAMPTZ))",
+            ),
+            (
+                "SELECT CAST(NULL AS ARRAY(TIMESTAMP_LTZ)), CAST(NULL AS TIMESTAMP_NTZ(0))",
+                "SELECT CAST(NULL AS TIMESTAMPTZ[]), CAST(NULL AS TIMESTAMP(0))",
+            ),
+            (
+                "SELECT CAST(x AS TIMESTAMP WITH LOCAL TIME ZONE) FROM t",
+                "SELECT CAST(x AS TIMESTAMPTZ) FROM t",
+            ),
+            (
+                "CREATE TABLE t (a DECFLOAT, b TIMESTAMP_TZ(6))",
+                "CREATE TABLE t (a DECIMAL(38, 5), b TIMESTAMPTZ)",
+            ),
+        ] {
+            assert_eq!(
+                transpile_to_duckdb_from(input, DialectType::Snowflake),
+                expected,
+                "{input}"
+            );
+        }
+        assert_eq!(
+            transpile_to_duckdb_from(
+                "CREATE TABLE t (a TIMESTAMPTZ, b TIMESTAMP, c TIMESTAMP(9), d MY_TIMESTAMP_TYPE)",
+                DialectType::DuckDB,
+            ),
+            "CREATE TABLE t (a TIMESTAMPTZ, b TIMESTAMP, c TIMESTAMP(9), d MY_TIMESTAMP_TYPE)"
+        );
+        assert_eq!(
+            transpile_to_duckdb_from(
+                "CREATE TABLE t (a UNIQUEIDENTIFIER, b DATETIME2, c NVARCHAR(20))",
+                DialectType::TSQL,
+            ),
+            "CREATE TABLE t (a UUID, b TIMESTAMP, c TEXT(20))"
+        );
+        assert_eq!(
+            crate::transpile(
+                "CREATE TABLE t (a TIMESTAMP_LTZ(6), b TIMESTAMP_NTZ)",
+                DialectType::Snowflake,
+                DialectType::Snowflake,
+            )
+            .unwrap()[0],
+            "CREATE TABLE t (a TIMESTAMPLTZ(6), b TIMESTAMPNTZ)"
+        );
+    }
+
+    #[test]
+    fn test_snowflake_json_path_cast_to_text() {
+        for (input, expected) in [
+            (
+                "SELECT v:s::STRING AS s, v:n::STRING AS n FROM (SELECT PARSE_JSON('{\"s\":\"text\",\"n\":null}') AS v)",
+                "SELECT CAST(v -> '$.s' ->> '$' AS TEXT) AS s, CAST(v -> '$.n' ->> '$' AS TEXT) AS n FROM (SELECT JSON('{\"s\":\"text\",\"n\":null}') AS v)",
+            ),
+            (
+                "SELECT CAST(v:s AS VARCHAR), CAST(v:n AS TEXT), CAST(v:missing AS CHAR) FROM t",
+                "SELECT CAST(v -> '$.s' ->> '$' AS TEXT), CAST(v -> '$.n' ->> '$' AS TEXT), CAST(v -> '$.missing' ->> '$' AS TEXT) FROM t",
+            ),
+            (
+                "SELECT v:a[0]:s::VARCHAR, (v:s)::STRING FROM t",
+                "SELECT CAST(v -> '$.a[0].s' ->> '$' AS TEXT), CAST((v -> '$.s') ->> '$' AS TEXT) FROM t",
+            ),
+            (
+                "SELECT PARSE_JSON('\"text\"')::STRING, PARSE_JSON('null')::STRING, PARSE_JSON(NULL)::STRING",
+                "SELECT CAST(JSON('\"text\"') ->> '$' AS TEXT), CAST(JSON('null') ->> '$' AS TEXT), CAST(JSON(NULL) ->> '$' AS TEXT)",
+            ),
+            (
+                "SELECT GET_PATH(v, 's')::STRING FROM t",
+                "SELECT CAST(v -> '$.s' ->> '$' AS TEXT) FROM t",
+            ),
+            (
+                "SELECT v:a[t.i]::STRING FROM t",
+                "SELECT CAST((v -> '$.a')[t.i] ->> '$' AS TEXT) FROM t",
+            ),
+            (
+                "SELECT v:s::INTEGER, CAST('text' AS STRING), CAST(s AS VARCHAR) FROM t",
+                "SELECT CAST(v -> '$.s' AS INT), CAST('text' AS TEXT), CAST(s AS TEXT) FROM t",
+            ),
+        ] {
+            assert_eq!(
+                transpile_to_duckdb_from(input, DialectType::Snowflake),
+                expected,
+                "{input}"
+            );
+        }
+        assert_eq!(
+            transpile_to_duckdb_from(
+                "SELECT CAST(j -> '$.s' AS VARCHAR) FROM t",
+                DialectType::DuckDB
+            ),
+            "SELECT CAST(j -> '$.s' AS TEXT) FROM t"
+        );
+    }
+
+    #[test]
+    fn test_snowflake_object_construct_omits_sql_null_pairs() {
+        for (input, expected) in [
+            (
+                "SELECT OBJECT_CONSTRUCT(k, v) FROM t",
+                "SELECT TO_JSON(MAP_FROM_ENTRIES(LIST_FILTER([{'key': CAST(k AS TEXT), 'value': TO_JSON(v)}], LAMBDA __entry : __entry.key IS NOT NULL AND __entry.value IS NOT NULL))) FROM t",
+            ),
+            (
+                "SELECT OBJECT_INSERT(OBJECT_CONSTRUCT(), 'a', 1)",
+                "SELECT STRUCT_PACK(a := 1)",
+            ),
+            (
+                "SELECT OBJECT_CONSTRUCT('b', 1, 'a', NULL) AS o",
+                "SELECT {'b': 1} AS o",
+            ),
+            (
+                "SELECT OBJECT_CONSTRUCT(NULL, 1, 'a', 'x')",
+                "SELECT {'a': 'x'}",
+            ),
+            ("SELECT OBJECT_CONSTRUCT('a', NULL)", "SELECT JSON_OBJECT()"),
+            ("SELECT OBJECT_CONSTRUCT()", "SELECT JSON_OBJECT()"),
+            (
+                "SELECT OBJECT_CONSTRUCT('n', 1, 's', 'text')",
+                "SELECT {'n': 1, 's': 'text'}",
+            ),
+            (
+                "SELECT OBJECT_CONSTRUCT('outer', OBJECT_CONSTRUCT('drop', NULL, 'keep', 1))",
+                "SELECT {'outer': {'keep': 1}}",
+            ),
+            (
+                "SELECT OBJECT_CONSTRUCT_KEEP_NULL('b', 1, 'a', NULL)",
+                "SELECT JSON_OBJECT('b', 1, 'a', NULL)",
+            ),
+        ] {
+            assert_eq!(
+                transpile_to_duckdb_from(input, DialectType::Snowflake),
+                expected,
+                "{input}"
+            );
+        }
+        for input in [
+            "SELECT OBJECT_CONSTRUCT('a', a, 'b', b) FROM t",
+            "SELECT OBJECT_CONSTRUCT(k, v) FROM t",
+            "SELECT OBJECT_CONSTRUCT('a', PARSE_JSON('null'), 'b', NULL)",
+            "SELECT OBJECT_CONSTRUCT('a', CAST(NULL AS INT))",
+        ] {
+            let result = transpile_to_duckdb_from(input, DialectType::Snowflake);
+            assert!(
+                result.contains("TO_JSON(MAP_FROM_ENTRIES(LIST_FILTER("),
+                "{input}: {result}"
+            );
+            assert!(
+                result.contains("__entry.key IS NOT NULL AND __entry.value IS NOT NULL"),
+                "{result}"
+            );
+            assert!(
+                !result.contains("JSON_TYPE("),
+                "JSON null must remain present: {result}"
+            );
+        }
     }
 
     #[test]

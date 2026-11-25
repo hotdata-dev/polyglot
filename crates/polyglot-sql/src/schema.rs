@@ -111,11 +111,13 @@ pub struct MappingSchema {
     /// Whether to normalize identifiers
     normalize: bool,
     /// Visible columns per table
-    visible: HashMap<String, HashSet<String>>,
+    visible: HashMap<Vec<String>, HashSet<String>>,
     /// Declared column order per normalized table path.
-    column_order: HashMap<String, Vec<String>>,
+    column_order: HashMap<Vec<String>, Vec<String>>,
     /// Cached depth
     cached_depth: usize,
+    /// Validation schemas register bare names, schema-qualified names, and aliases.
+    match_table_suffixes: bool,
 }
 
 /// A node in the schema tree
@@ -144,6 +146,7 @@ impl MappingSchema {
             visible: HashMap::new(),
             column_order: HashMap::new(),
             cached_depth: 0,
+            match_table_suffixes: false,
         }
     }
 
@@ -161,9 +164,33 @@ impl MappingSchema {
         self
     }
 
+    pub(crate) fn with_table_suffix_lookup(mut self) -> Self {
+        self.match_table_suffixes = true;
+        self
+    }
+
+    pub(crate) fn contains_table(&self, table: &str) -> bool {
+        self.find_table(table).is_ok()
+    }
+
+    pub(crate) fn missing_column(&self, table: &str, column: &str) -> bool {
+        self.find_table(table).is_ok_and(|(_, columns)| {
+            !columns.is_empty()
+                && !columns.contains_key("*")
+                && !columns.contains_key(&self.normalize_name(column, false))
+        })
+    }
+
+    pub(crate) fn contains_column(&self, column: &str) -> bool {
+        let name = self.normalize_name(column, false);
+        self.column_order
+            .values()
+            .any(|columns| columns.contains(&name))
+    }
+
     /// Set visibility for columns in a table
     pub fn set_visible_columns(&mut self, table: &str, columns: &[&str]) {
-        let key = self.normalize_name(table, true);
+        let key = self.parse_table_parts(table);
         let cols: HashSet<String> = columns
             .iter()
             .map(|c| self.normalize_name(c, false))
@@ -173,38 +200,19 @@ impl MappingSchema {
 
     /// Normalize an identifier name based on dialect
     fn normalize_name(&self, name: &str, is_table: bool) -> String {
-        if !self.normalize {
-            return name.to_string();
-        }
-
-        let identifier = crate::binding::schema_identifier(name);
-        if identifier.quoted {
-            return crate::optimizer::normalize_identifiers::normalize_identifier(
-                identifier,
-                crate::optimizer::normalize_identifiers::get_normalization_strategy(self.dialect),
-            )
-            .name;
-        }
-        // Default normalization: lowercase
-        // Different dialects may have different rules
-        match self.dialect {
-            Some(DialectType::BigQuery) if is_table => {
-                // BigQuery preserves case for tables
-                name.to_string()
-            }
-            Some(DialectType::Snowflake) => {
-                // Snowflake uppercases by default
-                name.to_uppercase()
-            }
-            _ => {
-                // Most dialects lowercase
-                name.to_lowercase()
-            }
-        }
+        normalize_name(name, self.dialect, is_table, self.normalize)
     }
 
     /// Parse a qualified table name into parts
     fn parse_table_parts(&self, table: &str) -> Vec<String> {
+        if self.normalize && table.contains('"') {
+            if let Some(parts) = crate::scope::identifier_table_parts(table) {
+                return parts
+                    .iter()
+                    .map(|part| self.normalize_name(&crate::binding::identifier_name(part), true))
+                    .collect();
+            }
+        }
         table
             .split('.')
             .map(|s| self.normalize_name(s.trim(), true))
@@ -212,8 +220,17 @@ impl MappingSchema {
     }
 
     /// Get the column mapping for a table
-    fn find_table(&self, table: &str) -> SchemaResult<&HashMap<String, ColumnInfo>> {
-        let parts = self.parse_table_parts(table);
+    fn find_table(&self, table: &str) -> SchemaResult<(Vec<String>, &HashMap<String, ColumnInfo>)> {
+        let mut parts = self.parse_table_parts(table);
+        if self.match_table_suffixes {
+            for start in 0..parts.len() {
+                let candidate = &parts[start..];
+                if let Ok(columns) = self.navigate_to_table(candidate) {
+                    parts.drain(..start);
+                    return Ok((parts, columns));
+                }
+            }
+        }
 
         // Use trie to find table
         let reversed_parts: Vec<_> = parts.iter().rev().map(|s| s.as_str()).collect();
@@ -232,7 +249,7 @@ impl MappingSchema {
             }
             TrieResult::Exists => {
                 // Navigate to the table
-                self.navigate_to_table(&parts)
+                self.navigate_to_table(&parts).map(|cols| (parts, cols))
             }
         }
     }
@@ -369,17 +386,14 @@ impl Schema for MappingSchema {
             .collect();
 
         self.add_table_internal(&parts, cols)?;
-        self.column_order.insert(parts.join("."), column_order);
+        self.column_order.insert(parts, column_order);
         self.update_depth();
         Ok(())
     }
 
     fn column_names(&self, table: &str) -> SchemaResult<Vec<String>> {
-        let cols = self.find_table(table)?;
-        let table_key = self.normalize_name(table, true);
-        let ordered_columns = self
-            .column_order
-            .get(&self.parse_table_parts(table).join("."));
+        let (table_key, cols) = self.find_table(table)?;
+        let ordered_columns = self.column_order.get(&table_key);
 
         // Check visibility
         if let Some(visible_cols) = self.visible.get(&table_key) {
@@ -411,7 +425,7 @@ impl Schema for MappingSchema {
     }
 
     fn get_column_type(&self, table: &str, column: &str) -> SchemaResult<DataType> {
-        let cols = self.find_table(table)?;
+        let (_, cols) = self.find_table(table)?;
         let normalized_col = self.normalize_name(column, false);
 
         cols.get(&normalized_col)

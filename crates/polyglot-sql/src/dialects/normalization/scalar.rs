@@ -62,6 +62,7 @@ fn java_to_strptime_format(fmt: &str) -> String {
 #[derive(Debug)]
 pub(super) enum Action {
     GreatestLeastNull,
+    SnowflakeSubstringStart,
     SnowflakeRoundToClickHouse,
     BigQueryFunctionNormalize,
     BigQueryToHexBare,
@@ -97,6 +98,37 @@ pub(super) fn rewrite(
     let e = expression;
     let expression = (|| -> Result<Expression> {
         match action {
+            Action::SnowflakeSubstringStart => {
+                if let Expression::Substring(mut f) = e {
+                    let literal_start = match &f.start {
+                        Expression::Literal(lit) => match lit.as_ref() {
+                            Literal::Number(value) => value.parse::<i64>().ok(),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    f.start = match literal_start {
+                        Some(0) => Expression::number(1),
+                        Some(_) => f.start,
+                        None => Expression::Case(Box::new(Case {
+                            operand: None,
+                            whens: vec![(
+                                Expression::Eq(Box::new(BinaryOp::new(
+                                    f.start.clone(),
+                                    Expression::number(0),
+                                ))),
+                                Expression::number(1),
+                            )],
+                            else_: Some(f.start),
+                            comments: Vec::new(),
+                            inferred_type: None,
+                        })),
+                    };
+                    Ok(Expression::Substring(f))
+                } else {
+                    Ok(e)
+                }
+            }
             Action::GreatestLeastNull => {
                 let f = if let Expression::Function(f) = e {
                     *f
@@ -3113,6 +3145,23 @@ pub(super) fn rewrite(
                                 f.args,
                             )))),
                         },
+                        // Snowflake propagates NULL; DuckDB CONCAT skips NULLs.
+                        "CONCAT"
+                            if !f.args.is_empty()
+                                && matches!(source, DialectType::Snowflake)
+                                && matches!(target, DialectType::DuckDB) =>
+                        {
+                            Ok(f.args
+                                .into_iter()
+                                .reduce(|left, right| {
+                                    Expression::DPipe(Box::new(crate::expressions::DPipe {
+                                        this: Box::new(left),
+                                        expression: Box::new(right),
+                                        safe: None,
+                                    }))
+                                })
+                                .expect("CONCAT has at least one argument"))
+                        }
                         // CONCAT(a, b) -> a || b for PostgreSQL
                         "CONCAT"
                             if f.args.len() == 2
@@ -3486,8 +3535,14 @@ pub(super) fn rewrite(
                                     if let Some(fl) = flags {
                                         new_args.push(fl);
                                     }
+                                    // Snowflake REGEXP_LIKE, like RLIKE, matches the whole string.
+                                    let name = if matches!(source, DialectType::Snowflake) {
+                                        "REGEXP_FULL_MATCH"
+                                    } else {
+                                        "REGEXP_MATCHES"
+                                    };
                                     Ok(Expression::Function(Box::new(Function::new(
-                                        "REGEXP_MATCHES".to_string(),
+                                        name.to_string(),
                                         new_args,
                                     ))))
                                 }
@@ -4237,6 +4292,13 @@ pub(super) fn rewrite(
                             let (val, fmt_expr) = if matches!(source, DialectType::SQLite) {
                                 // SQLite: args[0] = format, args[1] = value
                                 (f.args[1].clone(), &f.args[0])
+                            } else if matches!(source, DialectType::DuckDB)
+                                && duckdb_strftime_format_first(&f.args[0], &f.args[1])
+                            {
+                                // DuckDB also accepts STRFTIME(fmt, val). Its format must be a
+                                // constant and its value a date/timestamp, so a constant string
+                                // in first position is the format.
+                                (f.args[1].clone(), &f.args[0])
                             } else {
                                 // DuckDB and others: args[0] = value, args[1] = format
                                 (f.args[0].clone(), &f.args[1])
@@ -4426,6 +4488,13 @@ pub(super) fn rewrite(
                                             vec![val, fmt_expr.clone()],
                                         ))))
                                     }
+                                }
+                                // SQLite takes the format first: STRFTIME(fmt, val)
+                                DialectType::SQLite => {
+                                    Ok(Expression::Function(Box::new(Function::new(
+                                        "STRFTIME".to_string(),
+                                        vec![fmt_expr.clone(), val],
+                                    ))))
                                 }
                                 _ => Ok(Expression::Function(f)),
                             }
@@ -5327,6 +5396,18 @@ pub(super) fn rewrite(
                                                     vec![Expression::string(&unit_str), dt1, dt2],
                                                 ))))
                                             }
+                                            "HOUR" | "MINUTE" | "SECOND" | "MILLISECOND"
+                                            | "MICROSECOND" => {
+                                                // Sub-day boundaries require the time component.
+                                                // Cast strings, but preserve typed TIME/TIMESTAMP
+                                                // operands (including their time zones).
+                                                let d1 = temporal::ensure_cast_timestamp(arg1);
+                                                let d2 = temporal::ensure_cast_timestamp(arg2);
+                                                Ok(Expression::Function(Box::new(Function::new(
+                                                    "DATE_DIFF".to_string(),
+                                                    vec![Expression::string(&unit_str), d1, d2],
+                                                ))))
+                                            }
                                             _ => {
                                                 // YEAR, MONTH, QUARTER, DAY, etc.: CAST to DATE
                                                 let d1 = temporal::force_cast_date(arg1);
@@ -5664,7 +5745,12 @@ pub(super) fn rewrite(
                             }
                         }
                         // DATEADD(unit, val, date) - 3-arg form
-                        "DATEADD" if f.args.len() == 3 => {
+                        "DATEADD" | "TIMEADD"
+                            if f.args.len() == 3
+                                && (f.name.eq_ignore_ascii_case("DATEADD")
+                                    || (source == DialectType::Snowflake
+                                        && target == DialectType::DuckDB)) =>
+                        {
                             let mut args = f.args;
                             let arg0 = args.remove(0);
                             let arg1 = args.remove(0);
@@ -5803,6 +5889,16 @@ pub(super) fn rewrite(
                                     } else {
                                         // DuckDB: convert to date + INTERVAL syntax with CAST
                                         let iu = temporal::parse_interval_unit_static(&unit_str);
+                                        let preserve_date = source == DialectType::Snowflake
+                                            && matches!(
+                                                iu,
+                                                IntervalUnit::Day
+                                                    | IntervalUnit::Week
+                                                    | IntervalUnit::Month
+                                                    | IntervalUnit::Quarter
+                                                    | IntervalUnit::Year
+                                            )
+                                            && temporal::is_date_value(&arg2);
                                         let interval = Expression::Interval(Box::new(
                                             crate::expressions::Interval {
                                                 this: Some(arg1),
@@ -5834,9 +5930,16 @@ pub(super) fn rewrite(
                                         } else {
                                             arg2
                                         };
-                                        Ok(Expression::Add(Box::new(
+                                        let result = Expression::Add(Box::new(
                                             crate::expressions::BinaryOp::new(arg2, interval),
-                                        )))
+                                        ));
+                                        // Snowflake retains DATE for calendar-unit additions;
+                                        // DuckDB's DATE + INTERVAL promotes it to TIMESTAMP.
+                                        Ok(if preserve_date {
+                                            temporal::force_cast_date(result)
+                                        } else {
+                                            result
+                                        })
                                     }
                                 }
                                 DialectType::Spark => {
@@ -9806,7 +9909,7 @@ pub(super) fn rewrite(
                                 _ => Ok(Expression::Function(f)),
                             }
                         }
-                        // CONCAT_WS from Generic is null-propagating in SQLGlot fixtures.
+                        // CONCAT_WS from Generic and Snowflake propagates NULL.
                         // Trino also requires non-separator arguments cast to VARCHAR.
                         "CONCAT_WS" if f.args.len() >= 2 => {
                             fn concat_ws_null_case(
@@ -9901,7 +10004,9 @@ pub(super) fn rewrite(
                                     ))))
                                 }
                                 DialectType::Spark | DialectType::Hive | DialectType::DuckDB
-                                    if matches!(source, DialectType::Generic) =>
+                                    if matches!(source, DialectType::Generic)
+                                        || (matches!(source, DialectType::Snowflake)
+                                            && matches!(target, DialectType::DuckDB)) =>
                                 {
                                     let args = f.args;
                                     let else_expr = Expression::Function(Box::new(Function::new(
@@ -18294,4 +18399,115 @@ pub(super) fn normalize_source_functions(
         return Ok(Some(Expression::Function(f)));
     }
     Ok(None)
+}
+
+pub(super) fn duckdb_strftime_format_first(first: &Expression, second: &Expression) -> bool {
+    // A string literal, or a concatenation of string literals
+    fn is_constant_string(expr: &Expression) -> bool {
+        match expr {
+            Expression::Literal(lit) => {
+                matches!(lit.as_ref(), crate::expressions::Literal::String(_))
+            }
+            Expression::Paren(p) => is_constant_string(&p.this),
+            Expression::DPipe(d) => {
+                is_constant_string(&d.this) && is_constant_string(&d.expression)
+            }
+            Expression::Concat(op) => is_constant_string(&op.left) && is_constant_string(&op.right),
+            Expression::Function(func) if func.name.eq_ignore_ascii_case("CONCAT") => {
+                func.args.iter().all(is_constant_string)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_value_like(expr: &Expression) -> bool {
+        use crate::traversal::ExpressionWalk;
+        is_temporal(expr) || expr.contains(|e| matches!(e, Expression::Column(_)))
+    }
+
+    // An expression whose result is a date, time or timestamp: a
+    // temporal literal or cast, CURRENT_DATE and the like, or an
+    // expression that keeps such an operand's type.
+    fn is_temporal(expr: &Expression) -> bool {
+        match expr {
+            Expression::Literal(lit) => matches!(
+                lit.as_ref(),
+                crate::expressions::Literal::Date(_)
+                    | crate::expressions::Literal::Time(_)
+                    | crate::expressions::Literal::Timestamp(_)
+                    | crate::expressions::Literal::Datetime(_)
+            ),
+            Expression::Cast(c) => matches!(
+                c.to,
+                DataType::Date | DataType::Time { .. } | DataType::Timestamp { .. }
+            ),
+            Expression::CurrentDate(_)
+            | Expression::CurrentTime(_)
+            | Expression::CurrentTimestamp(_)
+            | Expression::CurrentTimestampLTZ(_)
+            | Expression::CurrentDatetime(_)
+            | Expression::Localtime(_)
+            | Expression::Localtimestamp(_) => true,
+            Expression::Function(func) => {
+                func.name.eq_ignore_ascii_case("NOW")
+                    || func.name.eq_ignore_ascii_case("TODAY")
+                    || func.name.eq_ignore_ascii_case("CURRENT_DATE")
+                    || func.name.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+            }
+            Expression::Paren(p) => is_temporal(&p.this),
+            Expression::Add(op) | Expression::Sub(op) => {
+                is_temporal(&op.left) || is_temporal(&op.right)
+            }
+            Expression::Coalesce(v) | Expression::Greatest(v) | Expression::Least(v) => {
+                v.expressions.iter().any(is_temporal)
+            }
+            Expression::NullIf(b) => is_temporal(&b.this),
+            Expression::Case(c) => {
+                c.whens.iter().any(|(_, then)| is_temporal(then))
+                    || c.else_.as_ref().is_some_and(is_temporal)
+            }
+            _ => false,
+        }
+    }
+
+    // A string expression built from constants only, e.g.
+    // CAST('%Y' AS VARCHAR), COALESCE(NULL, '%Y') or
+    // REPLACE('%Y/%m', '/', '-'): no columns, a string
+    // literal somewhere, and nothing date or time typed.
+    fn is_constant_text(expr: &Expression) -> bool {
+        use crate::traversal::ExpressionWalk;
+        !expr.contains(|e| {
+            matches!(
+                e,
+                Expression::Column(_) | Expression::Subquery(_) | Expression::Interval(_)
+            ) || matches!(e, Expression::Literal(lit) if matches!(
+                lit.as_ref(),
+                crate::expressions::Literal::Date(_)
+                    | crate::expressions::Literal::Time(_)
+                    | crate::expressions::Literal::Timestamp(_)
+                    | crate::expressions::Literal::Datetime(_)
+            )) || matches!(e, Expression::Cast(c) if matches!(
+                c.to,
+                DataType::Date
+                    | DataType::Time { .. }
+                    | DataType::Timestamp { .. }
+            ))
+        }) && expr.contains(|e| {
+            matches!(e, Expression::Literal(lit) if matches!(
+                lit.as_ref(),
+                crate::expressions::Literal::String(_)
+            ))
+        })
+    }
+
+    match (is_value_like(first), is_value_like(second)) {
+        // When exactly one argument is a date, a time or refers to a
+        // column, it is the value: DuckDB's format must be constant.
+        (false, true) => true,
+        (true, false) => false,
+        _ => {
+            (is_constant_string(first) && !is_constant_string(second))
+                || (is_constant_text(first) && !is_constant_text(second))
+        }
+    }
 }

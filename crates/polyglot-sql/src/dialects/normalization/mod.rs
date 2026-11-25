@@ -93,7 +93,7 @@ pub(super) fn normalize(
     };
     let expr = statements::normalize_root(expr, &context);
 
-    transform_recursive(expr, &|e| {
+    let expr = transform_recursive(expr, &|e| {
         // Source-bound nodes share the ordinary AST categories, but their lowering
         // must retain the semantics recorded by the parser through serialization.
         if e.source_dialect().is_some()
@@ -2018,7 +2018,7 @@ pub(super) fn normalize(
                             | "REGEXP_EXTRACT" | "REGEXP_SUBSTR" | "TO_DAYS"
                             | "RLIKE"
                             | "DATEDIFF" | "DATE_DIFF" | "MONTHS_BETWEEN"
-                            | "ADD_MONTHS" | "DATEADD" | "DATE_ADD" | "DATE_SUB" | "DATETRUNC"
+                            | "ADD_MONTHS" | "DATEADD" | "TIMEADD" | "DATE_ADD" | "DATE_SUB" | "DATETRUNC"
                             | "LAST_DAY" | "LAST_DAY_OF_MONTH" | "EOMONTH"
                             | "ARRAY_CONSTRUCT" | "ARRAY_CAT" | "ARRAY_COMPACT"
                             | "ARRAY_FILTER" | "FILTER" | "REDUCE" | "ARRAY_REVERSE"
@@ -2496,6 +2496,11 @@ pub(super) fn normalize(
                 }
                 Expression::WithinGroup(wg) => {
                     if matches!(source, DialectType::Snowflake)
+                        && matches!(target, DialectType::DuckDB)
+                        && matches!(&wg.this, Expression::ListAgg(f) if f.separator.is_none())
+                    {
+                        Action::Aggregates(aggregates::Action::SnowflakeListAggSeparator)
+                    } else if matches!(source, DialectType::Snowflake)
                         && matches!(
                             target,
                             DialectType::DuckDB | DialectType::Presto | DialectType::Trino
@@ -2528,7 +2533,12 @@ pub(super) fn normalize(
                 // because BigQuery's TIMESTAMP is really TIMESTAMPTZ, and
                 // DATETIME is the timezone-unaware type
                 Expression::Cast(ref c) => {
-                    if matches!(source, DialectType::PostgreSQL)
+                    if matches!(source, DialectType::Snowflake)
+                        && matches!(target, DialectType::DuckDB)
+                        && json::is_snowflake_json_text_cast(c)
+                    {
+                        Action::Json(json::Action::SnowflakeJsonCastToText)
+                    } else if matches!(source, DialectType::PostgreSQL)
                         && matches!(target, DialectType::TSQL | DialectType::Fabric)
                         && types::is_postgres_unknown_null_cast(c)
                     {
@@ -3034,7 +3044,7 @@ pub(super) fn normalize(
                 }
                 // Safe-division source -> non-safe target: NULLIF wrapping and/or CAST
                 // Safe-division dialects: MySQL, DuckDB, SingleStore, TiDB, ClickHouse, Doris
-                Expression::Div(ref op)
+                Expression::Div(_)
                     if matches!(
                         source,
                         DialectType::MySQL
@@ -3062,13 +3072,7 @@ pub(super) fn normalize(
                             | DialectType::RisingWave
                     ) =>
                 {
-                    // Only wrap if RHS is not already NULLIF
-                    if !matches!(&op.right, Expression::Function(f) if f.name.eq_ignore_ascii_case("NULLIF"))
-                    {
-                        Action::Operators(operators::Action::MySQLSafeDivide)
-                    } else {
-                        Action::None
-                    }
+                    Action::Operators(operators::Action::MySQLSafeDivide)
                 }
                 // ALTER TABLE ... RENAME TO <schema>.<table> -> strip schema for most targets
                 // For TSQL/Fabric, convert to sp_rename instead
@@ -3099,6 +3103,13 @@ pub(super) fn normalize(
                         Action::None
                     }
                 }
+                // Snowflake treats a substring start of zero as one.
+                Expression::Substring(_)
+                    if matches!(source, DialectType::Snowflake)
+                        && matches!(target, DialectType::DuckDB) =>
+                {
+                    Action::Scalar(scalar::Action::SnowflakeSubstringStart)
+                }
                 // EPOCH(x) expression -> target-specific epoch conversion
                 Expression::Epoch(_) if !matches!(target, DialectType::DuckDB) => {
                     Action::Temporal(temporal::Action::EpochConvert)
@@ -3106,6 +3117,14 @@ pub(super) fn normalize(
                 // EPOCH_MS(x) expression -> target-specific epoch ms conversion
                 Expression::EpochMs(_) if !matches!(target, DialectType::DuckDB) => {
                     Action::Temporal(temporal::Action::EpochMsConvert)
+                }
+                // Snowflake LISTAGG defaults to an empty separator; DuckDB uses a comma.
+                Expression::ListAgg(f)
+                    if f.separator.is_none()
+                        && matches!(source, DialectType::Snowflake)
+                        && matches!(target, DialectType::DuckDB) =>
+                {
+                    Action::Aggregates(aggregates::Action::SnowflakeListAggSeparator)
                 }
                 // STRING_AGG -> GROUP_CONCAT for MySQL/SQLite
                 Expression::StringAgg(_) => {
@@ -3436,15 +3455,6 @@ pub(super) fn normalize(
                         ) =>
                 {
                     Action::Types(types::Action::SparkDateFuncCast)
-                }
-                // $parameter -> @parameter for BigQuery
-                Expression::Parameter(ref p)
-                    if matches!(target, DialectType::BigQuery)
-                        && matches!(source, DialectType::DuckDB)
-                        && (p.style == crate::expressions::ParameterStyle::Dollar
-                            || p.style == crate::expressions::ParameterStyle::DoubleDollar) =>
-                {
-                    Action::Operators(operators::Action::DollarParamConvert)
                 }
                 // EscapeString literal: normalize literal newlines to \n
                 Expression::Literal(lit) if matches!(lit.as_ref(), Literal::EscapeString(ref s) if s.contains('\n') || s.contains('\r') || s.contains('\t'))
@@ -4163,7 +4173,15 @@ pub(super) fn normalize(
         };
 
         Ok(outcome.into_expression())
-    })
+    })?;
+
+    // Division that was fractional in the source must stay fractional in SQLite,
+    // including division introduced above (e.g. by SAFE_DIVIDE).
+    if target == DialectType::SQLite && source != DialectType::SQLite {
+        operators::cast_division_to_real(expr, source)
+    } else {
+        Ok(expr)
+    }
 }
 
 /// Convert source format models while quoted literal text is still available.
@@ -4211,5 +4229,43 @@ pub(super) fn prepare_source_formats(
             }
         }
         Ok(Expression::Function(f))
+    })
+}
+
+/// Assign SQLite bind slots in source-token order before STRFTIME can reorder
+/// its arguments. A single bind, or binds in only one argument, keep plain '?'.
+pub(super) fn sqlite_placeholder_indices(expr: Expression) -> Result<Expression> {
+    use crate::traversal::ExpressionWalk;
+    let placeholder = |e: &Expression| matches!(e, Expression::Placeholder(_));
+    let mut positions = Vec::new();
+    let mut reordered = false;
+    for node in expr.dfs() {
+        match node {
+            Expression::Placeholder(p) => positions.extend(p.index),
+            Expression::Function(f)
+                if f.name.eq_ignore_ascii_case("STRFTIME") && f.args.len() == 2 =>
+            {
+                reordered |= f.args.iter().all(|arg| arg.contains(placeholder))
+                    && !scalar::duckdb_strftime_format_first(&f.args[0], &f.args[1]);
+            }
+            _ => {}
+        }
+    }
+    if positions.is_empty() {
+        return Ok(expr);
+    }
+    positions.sort_unstable();
+    positions.dedup();
+    crate::traversal::transform_all(expr, &|mut node| {
+        if let Expression::Placeholder(p) = &mut node {
+            p.index = p.index.and_then(|pos| {
+                if reordered {
+                    positions.binary_search(&pos).ok().map(|i| i as u32 + 1)
+                } else {
+                    None
+                }
+            });
+        }
+        Ok(node)
     })
 }

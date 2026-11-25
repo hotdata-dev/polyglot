@@ -33,6 +33,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 
+mod explain;
 mod pipes;
 mod routines;
 
@@ -553,6 +554,7 @@ pub static RESERVED_TOKENS: LazyLock<HashSet<TokenType>> = LazyLock::new(|| {
 pub struct Parser {
     tokens: Vec<ParserToken>,
     current: usize,
+    pub(crate) track_placeholder_positions: bool,
     config: ParserConfig,
     /// Original source SQL (used for preserving exact text in Command expressions)
     source: Option<Arc<str>>,
@@ -704,6 +706,7 @@ impl Parser {
             pending_leading_comments: Vec::new(),
             guards_checked: false,
             token_guard_stats: None,
+            track_placeholder_positions: false,
             if_expr_ruled_out: HashSet::new(),
             parsing_duckdb_json_path: false,
             recursion: Arc::default(),
@@ -722,6 +725,7 @@ impl Parser {
             pending_leading_comments: Vec::new(),
             guards_checked: false,
             token_guard_stats: None,
+            track_placeholder_positions: false,
             if_expr_ruled_out: HashSet::new(),
             parsing_duckdb_json_path: false,
             recursion: Arc::default(),
@@ -743,6 +747,7 @@ impl Parser {
             pending_leading_comments: Vec::new(),
             guards_checked: false,
             token_guard_stats: None,
+            track_placeholder_positions: false,
             if_expr_ruled_out: HashSet::new(),
             parsing_duckdb_json_path: false,
             recursion: Arc::default(),
@@ -767,6 +772,7 @@ impl Parser {
             pending_leading_comments: Vec::new(),
             guards_checked: false,
             token_guard_stats: Some(token_guard_stats),
+            track_placeholder_positions: false,
             if_expr_ruled_out: HashSet::new(),
             parsing_duckdb_json_path: false,
             recursion: Arc::default(),
@@ -1616,19 +1622,8 @@ impl Parser {
             {
                 self.fallback_to_command(statement_start)
             }
-            // ClickHouse EXPLAIN has many subforms. Preserve it verbatim for coverage.
-            TokenType::Var
-                if self.peek_text().eq_ignore_ascii_case("EXPLAIN")
-                    && matches!(
-                        self.config.dialect,
-                        Some(crate::dialects::DialectType::ClickHouse)
-                    ) =>
-            {
-                self.fallback_to_command(statement_start)
-            }
-            // EXPLAIN is treated as DESCRIBE (MySQL maps EXPLAIN -> DESCRIBE)
             TokenType::Var if self.peek_text().eq_ignore_ascii_case("EXPLAIN") => {
-                self.parse_describe()
+                self.parse_explain()
             }
             // LOCK TABLES / UNLOCK TABLES (MySQL)
             TokenType::Var
@@ -1993,7 +1988,7 @@ impl Parser {
                             self.config.dialect,
                             Some(crate::dialects::DialectType::ClickHouse)
                         ) {
-                        self.parse_clickhouse_command_until_rparen()?
+                        self.parse_explain()?
                     } else {
                         self.parse_statement()?
                     };
@@ -4316,6 +4311,7 @@ impl Parser {
         } else {
             // No explicit SELECT means SELECT *
             vec![Expression::Star(crate::expressions::Star {
+                ilike: None,
                 table: None,
                 except: None,
                 replace: None,
@@ -4934,7 +4930,7 @@ impl Parser {
                 ) && self.check(TokenType::Var)
                     && self.peek_text().eq_ignore_ascii_case("EXPLAIN")
                 {
-                    self.parse_clickhouse_command_until_rparen()?
+                    self.parse_explain()?
                 } else {
                     self.parse_statement()?
                 };
@@ -7811,7 +7807,7 @@ impl Parser {
                 // emits TokenType::Parameter for '?'; we map it to a
                 // Placeholder AST node so it roundtrips as a bind parameter.
                 self.skip();
-                Expression::Placeholder(Placeholder { index: None })
+                self.consumed_placeholder()
             } else if self.check(TokenType::Dollar) {
                 // $foo style variable - Dollar followed by identifier
                 self.skip(); // consume $
@@ -13078,20 +13074,30 @@ impl Parser {
             Some(crate::dialects::DialectType::ClickHouse)
         ) && self.match_text_seq(&["FORMAT", "VALUES"])
         {
-            let mut all_values = Vec::new();
+            if self.is_at_end() || self.check(TokenType::Semicolon) {
+                // The client may stream Values data separately from the query header.
+                (
+                    Vec::new(),
+                    Some(Expression::Command(Box::new(crate::expressions::Command {
+                        this: format!("FORMAT {}", self.previous_text()),
+                    }))),
+                )
+            } else {
+                let mut all_values = Vec::new();
 
-            loop {
-                self.expect(TokenType::LParen)?;
-                let row = self.parse_expression_list()?;
-                self.expect(TokenType::RParen)?;
-                all_values.push(row);
+                loop {
+                    self.expect(TokenType::LParen)?;
+                    let row = self.parse_expression_list()?;
+                    self.expect(TokenType::RParen)?;
+                    all_values.push(row);
 
-                if !self.match_token(TokenType::Comma) {
-                    break;
+                    if !self.match_token(TokenType::Comma) {
+                        break;
+                    }
                 }
-            }
 
-            (all_values, None)
+                (all_values, None)
+            }
         } else if self.match_token(TokenType::Values)
             || (self.config.dialect == Some(crate::dialects::DialectType::MySQL)
                 && self.match_identifier("VALUE"))
@@ -24597,6 +24603,7 @@ impl Parser {
             };
             Expression::Select(Box::new(Select {
                 expressions: vec![Expression::Star(Star {
+                    ilike: None,
                     table: None,
                     except: None,
                     replace: None,
@@ -25398,81 +25405,14 @@ impl Parser {
 
     /// Parse DESCRIBE statement
     /// DESCRIBE [EXTENDED|FORMATTED|ANALYZE] <table_or_query>
-    /// Also handles EXPLAIN (parsed as Describe)
+    /// MySQL query-plan aliases dispatch to the dedicated EXPLAIN parser.
     fn parse_describe(&mut self) -> Result<Expression> {
-        // Accept DESCRIBE, DESC, and EXPLAIN (Var token)
-        // Capture leading comments from the first token
-        let mut is_explain = false;
-        let leading_comments = if self.check(TokenType::Describe) {
-            let token = self.advance()?;
-            token.comments
-        } else if self.check(TokenType::Desc) {
-            let token = self.advance()?;
-            token.comments
-        } else if self.check(TokenType::Var) && self.peek_text().eq_ignore_ascii_case("EXPLAIN") {
-            is_explain = true;
-            let token = self.advance()?; // consume EXPLAIN
-            token.comments
-        } else {
-            return Err(self.parse_error("Expected DESCRIBE, DESC, or EXPLAIN"));
-        };
-
-        // PostgreSQL-family: EXPLAIN ( option [, ...] ) statement
-        // e.g. EXPLAIN (VERBOSE, COSTS OFF, FORMAT JSON) SELECT ...
-        // These are planner/output directives (COSTS, BUFFERS, VERBOSE, FORMAT,
-        // SETTINGS, WAL, TIMING, SUMMARY, MEMORY, GENERIC_PLAN, SERIALIZE) with no
-        // cross-dialect meaning, so they are parsed and discarded here - consistent
-        // with the way EXPLAIN is normalized to DESCRIBE. ANALYZE is folded into the
-        // DESCRIBE style below so `EXPLAIN (ANALYZE) ...` matches bare `EXPLAIN ANALYZE ...`.
-        // A parenthesized query (`EXPLAIN (SELECT ...)`, `EXPLAIN (VALUES ...)`,
-        // `EXPLAIN (TABLE t)`) is left for the target parser; PostgreSQL option names
-        // must be non-reserved words, so these keywords cannot start an option list.
-        let mut analyze_option = false;
-        if is_explain
-            && self.check(TokenType::LParen)
-            && matches!(
-                self.config.dialect,
-                Some(crate::dialects::DialectType::PostgreSQL)
-                    | Some(crate::dialects::DialectType::CockroachDB)
-                    | Some(crate::dialects::DialectType::RisingWave)
-                    | Some(crate::dialects::DialectType::Materialize)
-            )
-            && !matches!(
-                self.peek_nth(1).map(|t| t.token_type),
-                Some(TokenType::Select)
-                    | Some(TokenType::With)
-                    | Some(TokenType::LParen)
-                    | Some(TokenType::Values)
-                    | Some(TokenType::Table)
-            )
-        {
-            self.advance()?; // consume '('
-            loop {
-                if self.check(TokenType::RParen) || self.is_at_end() {
-                    break;
-                }
-                // option name (identifier or keyword, e.g. ANALYZE, VERBOSE, FORMAT)
-                let name = self.advance()?.text.to_ascii_uppercase();
-                // optional single-token argument (boolean, or a word for FORMAT/SERIALIZE);
-                // every PostgreSQL explain option argument is a single token today —
-                // revisit if PG ever grows a multi-token option argument
-                let value = if !self.check(TokenType::Comma) && !self.check(TokenType::RParen) {
-                    Some(self.advance()?.text.to_ascii_uppercase())
-                } else {
-                    None
-                };
-                if name == "ANALYZE" {
-                    analyze_option = match value.as_deref() {
-                        None => true,
-                        Some(v) => matches!(v, "TRUE" | "ON" | "1"),
-                    };
-                }
-                if !self.match_token(TokenType::Comma) {
-                    break;
-                }
-            }
-            self.expect(TokenType::RParen)?;
+        // In the MySQL family DESCRIBE/DESC also alias query-plan EXPLAIN.
+        // Table inspection remains a Describe node.
+        if self.is_mysql_explain_alias() {
+            return self.parse_explain();
         }
+        let leading_comments = self.advance()?.comments;
 
         // Check for EXTENDED or FORMATTED keywords
         let extended = self.match_identifier("EXTENDED");
@@ -25546,14 +25486,6 @@ impl Parser {
             Some("DETAIL".to_string())
         } else {
             None
-        };
-
-        // Fold a parenthesized ANALYZE option (EXPLAIN (ANALYZE) ...) into the
-        // DESCRIBE style, matching bare `EXPLAIN ANALYZE ...`.
-        let style = if analyze_option && style.is_none() {
-            Some("ANALYZE".to_string())
-        } else {
-            style
         };
 
         // Check for object kind like SEMANTIC VIEW, TABLE, INPUT, OUTPUT, etc.
@@ -26512,7 +26444,7 @@ impl Parser {
             // Handle ? placeholder as source (Snowflake Python connector bind params)
             if self.check(TokenType::Parameter) {
                 self.skip(); // consume ?
-                files.push(Expression::Placeholder(Placeholder { index: None }));
+                files.push(self.consumed_placeholder());
             }
             // Check for subquery: FROM (SELECT ...)
             else if self.check(TokenType::LParen) {
@@ -26565,7 +26497,7 @@ impl Parser {
                 // Handle ? placeholder in file location list
                 if self.check(TokenType::Parameter) {
                     self.skip();
-                    files.push(Expression::Placeholder(Placeholder { index: None }));
+                    files.push(self.consumed_placeholder());
                     continue;
                 }
                 // For COPY INTO ... FROM table_name, handle dotted table references
@@ -26973,7 +26905,7 @@ impl Parser {
 
         // Placeholder ? (used by Snowflake Python connector for bind parameters)
         if self.match_token(TokenType::Parameter) {
-            return Ok(Expression::Placeholder(Placeholder { index: None }));
+            return Ok(self.consumed_placeholder());
         }
 
         Err(self.parse_error("Expected value for COPY parameter"))
@@ -27570,7 +27502,7 @@ impl Parser {
 
         // Parse target stage (@stage_name, ? placeholder, quoted '@stage', or dollar-quoted $$@%"stage"$$)
         let target = if self.match_token(TokenType::Parameter) {
-            Expression::Placeholder(Placeholder { index: None })
+            self.consumed_placeholder()
         } else if self.check(TokenType::String) || self.check(TokenType::DollarString) {
             // Quoted stage: '@SYSTEM$BIND/path' or $$@%"table"$$
             let tok = self.advance()?;
@@ -35043,29 +34975,7 @@ impl Parser {
         }
 
         // Check if this is a subquery (SELECT, WITH, DuckDB FROM-first, or ClickHouse EXPLAIN)
-        let is_explain_subquery = self.check(TokenType::Var)
-            && self.peek_text().eq_ignore_ascii_case("EXPLAIN")
-            && self.peek_nth(1).map_or(false, |t| {
-                matches!(
-                    t.token_type,
-                    TokenType::Select
-                        | TokenType::Insert
-                        | TokenType::Create
-                        | TokenType::Alter
-                        | TokenType::Drop
-                        | TokenType::Set
-                        | TokenType::System
-                        | TokenType::Table
-                ) || matches!(
-                    t.text(self.source.as_deref().unwrap_or_default())
-                        .to_ascii_uppercase()
-                        .as_str(),
-                    "SYNTAX" | "AST" | "PLAN" | "PIPELINE" | "ESTIMATE" | "CURRENT" | "QUERY"
-                ) || (t.token_type == TokenType::Var
-                    && self
-                        .peek_nth(2)
-                        .map_or(false, |t2| t2.token_type == TokenType::Eq))
-            });
+        let is_explain_subquery = self.check_keyword_text("EXPLAIN");
         // ClickHouse: (from, to, ...) -> body is a tuple-lambda with keyword params
         // Detect pattern: (keyword/ident, keyword/ident, ...) ->
         if matches!(
@@ -35164,7 +35074,7 @@ impl Parser {
             || is_explain_subquery
         {
             let query = if is_explain_subquery {
-                self.parse_clickhouse_command_until_rparen()?
+                self.parse_explain()?
             } else {
                 self.parse_statement()?
             };
@@ -36215,6 +36125,7 @@ impl Parser {
                 if count_expr.distinct {
                     let this_expr = count_expr.this.clone().unwrap_or_else(|| {
                         Expression::Star(crate::expressions::Star {
+                            ilike: None,
                             table: None,
                             except: None,
                             replace: None,
@@ -36435,6 +36346,7 @@ impl Parser {
                         // Create an ILike expression with Star as left side
                         Expression::ILike(Box::new(LikeOp {
                             left: Expression::Star(Star {
+                                ilike: None,
                                 table: None,
                                 except: None,
                                 replace: None,
@@ -37247,6 +37159,7 @@ impl Parser {
                     let arg = if self.check(TokenType::Star) {
                         self.skip(); // consume *
                         Expression::Star(Star {
+                            ilike: None,
                             table: None,
                             except: None,
                             replace: None,
@@ -38090,9 +38003,10 @@ impl Parser {
 
         // ?:: placeholder cast (QDColon token = ? + :: fused by tokenizer)
         if self.match_token(TokenType::QDColon) {
+            let placeholder = self.consumed_placeholder();
             let data_type = self.parse_data_type_for_cast()?;
             return Ok(Expression::Cast(Box::new(Cast {
-                this: Expression::Placeholder(Placeholder { index: None }),
+                this: placeholder,
                 to: data_type,
                 trailing_comments: Vec::new(),
                 double_colon_syntax: true,
@@ -38121,7 +38035,7 @@ impl Parser {
                 return self.maybe_parse_subscript(result);
             } else {
                 // Plain ? placeholder
-                return Ok(Expression::Placeholder(Placeholder { index: None }));
+                return Ok(self.consumed_placeholder());
             }
         }
 
@@ -40680,6 +40594,7 @@ impl Parser {
                 let distinct = self.match_token(TokenType::Distinct);
                 let args = if self.match_token(TokenType::Star) {
                     vec![Expression::Star(Star {
+                        ilike: None,
                         table: None,
                         except: None,
                         replace: None,
@@ -49169,12 +49084,23 @@ impl Parser {
         table: Option<Identifier>,
         star_trailing_comments: Vec<String>,
     ) -> Result<Star> {
+        let snowflake = self.config.dialect == Some(crate::dialects::DialectType::Snowflake);
+        let ilike = if snowflake && self.match_token(TokenType::ILike) {
+            Some(self.expect_string()?)
+        } else {
+            None
+        };
+        if ilike.is_some() && self.check(TokenType::Exclude) {
+            return Err(self.parse_error("ILIKE and EXCLUDE cannot be combined on a star"));
+        }
         let mut except = None;
         let mut replace = None;
         let mut rename = None;
 
         // Parse EXCLUDE / EXCEPT clause
-        if self.match_token(TokenType::Exclude) || self.match_token(TokenType::Except) {
+        if self.match_token(TokenType::Exclude)
+            || (ilike.is_none() && self.match_token(TokenType::Except))
+        {
             // ClickHouse: EXCEPT STRICT col1, col2 (STRICT is optional modifier)
             let _ = self.match_text_seq(&["STRICT"]);
             let mut columns = Vec::new();
@@ -49270,7 +49196,11 @@ impl Parser {
             rename = Some(renames);
         }
 
+        if snowflake && self.check(TokenType::ILike) {
+            return Err(self.parse_error("ILIKE must be the first star modifier"));
+        }
         Ok(Star {
+            ilike,
             table,
             except,
             replace,
@@ -49647,56 +49577,6 @@ impl Parser {
         } else {
             source.chars().skip(start).take(end - start).collect()
         }
-    }
-
-    /// Preserve ClickHouse `(EXPLAIN ... SELECT ...)` subqueries as command text.
-    ///
-    /// `fallback_to_command` stops at semicolons, which is correct for statements
-    /// but wrong inside parenthesized FROM subqueries because it consumes the
-    /// closing paren and the outer query. This variant stops before the matching
-    /// top-level `)`, leaving it for the caller to consume.
-    fn parse_clickhouse_command_until_rparen(&mut self) -> Result<Expression> {
-        let start_index = self.current;
-        let start_span = self
-            .tokens
-            .get(start_index)
-            .map(|token| token.span.start)
-            .unwrap_or_default();
-
-        let mut depth = 0usize;
-        while !self.is_at_end() {
-            match self.peek().token_type {
-                TokenType::LParen => {
-                    depth += 1;
-                    self.skip();
-                }
-                TokenType::RParen if depth == 0 => break,
-                TokenType::RParen => {
-                    depth = depth.saturating_sub(1);
-                    self.skip();
-                }
-                TokenType::Semicolon if depth == 0 => break,
-                _ => self.skip(),
-            }
-        }
-
-        let end_span = if self.current > start_index {
-            self.tokens[self.current - 1].span.end
-        } else {
-            start_span
-        };
-
-        let command_text = if self.source.is_some() {
-            self.source_text_range(start_span, end_span)
-                .trim()
-                .to_string()
-        } else {
-            self.tokens_to_sql(start_index, self.current)
-        };
-
-        Ok(Expression::Command(Box::new(Command {
-            this: command_text,
-        })))
     }
 
     /// Convert tokens to SQL for CREATE STAGE, normalizing FILE_FORMAT clause
@@ -59570,6 +59450,7 @@ impl Parser {
                     })));
                 } else if self.match_token(TokenType::Star) {
                     elements.push(Expression::Star(crate::expressions::Star {
+                        ilike: None,
                         table: None,
                         except: None,
                         replace: None,
@@ -59665,6 +59546,7 @@ impl Parser {
                     })));
                 } else if self.match_token(TokenType::Star) {
                     elements.push(Expression::Star(crate::expressions::Star {
+                        ilike: None,
                         table: None,
                         except: None,
                         replace: None,
@@ -59676,6 +59558,7 @@ impl Parser {
                     // Spark/Databricks: UPDATE SET * (update all columns)
                     if self.match_token(TokenType::Star) {
                         elements.push(Expression::Star(crate::expressions::Star {
+                            ilike: None,
                             table: None,
                             except: None,
                             replace: None,
@@ -60845,14 +60728,9 @@ impl Parser {
         }
 
         // Try to parse as subquery first
-        // ClickHouse also allows (EXPLAIN ...) as subquery
-        if matches!(
-            self.config.dialect,
-            Some(crate::dialects::DialectType::ClickHouse)
-        ) && self.check(TokenType::Var)
-            && self.peek_text().eq_ignore_ascii_case("EXPLAIN")
-        {
-            let query = self.parse_clickhouse_command_until_rparen()?;
+        // ClickHouse and Exasol expose EXPLAIN results as a relation.
+        if self.check_keyword_text("EXPLAIN") {
+            let query = self.parse_explain()?;
             self.expect(TokenType::RParen)?;
             return Ok(Some(Expression::Subquery(Box::new(Subquery {
                 this: query,
@@ -61774,6 +61652,7 @@ impl Parser {
         match expressions {
             Some(expr) => Ok(Some(expr)),
             None => Ok(Some(Expression::Star(Star {
+                ilike: None,
                 table: None,
                 except: None,
                 replace: None,
@@ -61929,12 +61808,20 @@ impl Parser {
         }
     }
 
+    fn consumed_placeholder(&self) -> Expression {
+        Expression::Placeholder(Placeholder {
+            index: self
+                .track_placeholder_positions
+                .then_some(self.current as u32),
+        })
+    }
+
     /// parse_placeholder - Parse placeholder token (? or :name)
     /// Python: if self._match_set(self.PLACEHOLDER_PARSERS): return placeholder
     pub fn parse_placeholder(&mut self) -> Result<Option<Expression>> {
         // Match positional placeholder (?)
         if self.match_token(TokenType::Placeholder) {
-            return Ok(Some(Expression::Placeholder(Placeholder { index: None })));
+            return Ok(Some(self.consumed_placeholder()));
         }
         // Match colon placeholder (:name) - handled by Parameter token
         if self.match_token(TokenType::Parameter) {
@@ -64921,6 +64808,10 @@ impl Parser {
             return Ok(None);
         }
 
+        if self.config.dialect == Some(crate::dialects::DialectType::Snowflake) {
+            return Ok(Some(Expression::Star(self.parse_star_modifiers(None)?)));
+        }
+
         // Parse optional EXCEPT/EXCLUDE columns
         let except = self.parse_star_except()?;
 
@@ -64931,6 +64822,7 @@ impl Parser {
         let rename = self.parse_star_rename()?;
 
         Ok(Some(Expression::Star(Star {
+            ilike: None,
             table: None,
             except,
             replace,
@@ -64970,6 +64862,7 @@ impl Parser {
         let pattern = self.parse_bitwise_or()?;
         let except = self.parse_star_except()?;
         let left = Expression::Star(Star {
+            ilike: None,
             table: None,
             except,
             replace: None,
@@ -65198,6 +65091,7 @@ impl Parser {
         let rename: Option<Vec<(Identifier, Identifier)>> = None; // Complex to extract from expressions
 
         Ok(Some(Expression::Star(Star {
+            ilike: None,
             table: None,
             except,
             replace,
@@ -68090,6 +67984,7 @@ impl Parser {
                 // Create a SELECT * FROM <table>
                 let mut select_struct = Select::new();
                 select_struct.expressions = vec![Expression::Star(Star {
+                    ilike: None,
                     table: None,
                     except: None,
                     replace: None,

@@ -8,7 +8,7 @@
 use crate::ast_transforms::get_output_column_names_for_dialect;
 use crate::dialects::{Dialect, DialectType};
 use crate::expressions::{DataType, Expression, Identifier, JoinKind, TableRef, With};
-use crate::lineage::{LineageNode, ScopedLineage};
+use crate::lineage::{ScopedLineage, TraceNode};
 use crate::optimizer::annotate_types::annotate_types;
 use crate::optimizer::qualify_schema_aware_expression;
 use crate::schema::{MappingSchema, Schema};
@@ -21,6 +21,7 @@ use crate::{parse_one_with_options, ComplexityGuardOptions, Error, ParseOptions,
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 mod column_uses;
 
@@ -75,6 +76,8 @@ pub enum ColumnUseContext {
     Order,
     AggregateOrder,
     SetOperationFilter,
+    /// A relation-valued function argument that determines which rows are produced.
+    TableFunctionInput,
 }
 
 /// One resolved dependency of an original column occurrence. Several terminal
@@ -227,7 +230,7 @@ pub enum SetOperationBranchRole {
 }
 
 /// High-level kind of transformation performed by a projection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransformKind {
     Direct,
@@ -269,6 +272,39 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
     ensure_query(&expression)?;
     expression = crate::binding::bind_lambdas(expression, options.dialect);
     let original_expression = expression.clone();
+
+    // Lineage carries column names across scopes as strings. Fold each input
+    // while it still has its quote bit, retaining the original AST for clause SQL.
+    if options.dialect == DialectType::Snowflake {
+        expression = crate::traversal::transform_all(expression, &|mut expr| {
+            match &mut expr {
+                Expression::Column(column) if !column.name.quoted => {
+                    column.name.name.make_ascii_uppercase();
+                }
+                Expression::Select(select) => {
+                    for projection in &mut select.expressions {
+                        if let Expression::Alias(alias) = projection {
+                            if !alias.alias.quoted {
+                                alias.alias.name.make_ascii_uppercase();
+                            }
+                        } else if projection_name(projection).is_none() {
+                            let heading = Dialect::get(options.dialect)
+                                .generate_with_guard(projection, options.complexity_guard)?;
+                            let value = std::mem::replace(
+                                projection,
+                                Expression::Null(crate::expressions::Null),
+                            );
+                            *projection = Expression::Alias(Box::new(
+                                crate::expressions::Alias::new(value, Identifier::quoted(heading)),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(expr)
+        })?;
+    }
 
     let mapping_schema = options
         .schema
@@ -448,7 +484,7 @@ impl AnalysisSchemaInfo {
 }
 
 struct NullabilityContext<'a> {
-    lineage: RefCell<HashMap<*const Scope, ScopedLineage>>,
+    lineage: RefCell<HashMap<*const Scope, ScopedLineage<'a>>>,
     output_types: RefCell<crate::optimizer::set_operation_types::OutputResolver>,
     schema: Option<&'a AnalysisSchemaInfo>,
     mapping_schema: Option<&'a MappingSchema>,
@@ -1117,9 +1153,14 @@ fn projection_fact(
     let is_star = projection_is_star(inner);
     let kind = transform_kind(inner);
     let mut lineage = nullability_context.lineage.borrow_mut();
-    let prepared = lineage
-        .entry(scope as *const Scope)
-        .or_insert_with(|| ScopedLineage::new(scope.clone(), &[], dialect));
+    let prepared = lineage.entry(scope as *const Scope).or_insert_with(|| {
+        ScopedLineage::new(
+            scope.clone(),
+            &[],
+            dialect,
+            nullability_context.mapping_schema.map(|s| s as &dyn Schema),
+        )
+    });
     // A traced node whose leaves are constants has no upstream columns.
     let mut upstream = prepared
         .output(index)
@@ -1247,11 +1288,11 @@ fn combine_uncertainty(
 }
 
 fn lineage_uncertainty(
-    node: &LineageNode,
+    node: &TraceNode,
     uncertain: &HashMap<(usize, usize), ReferenceConfidence>,
 ) -> Option<ReferenceConfidence> {
     combine_uncertainty(
-        node.walk()
+        node.walk_unique()
             .filter_map(|node| expression_uncertainty(&node.expression, uncertain)),
     )
 }
@@ -1794,24 +1835,39 @@ impl NullabilityContext<'_> {
 
 /// Pass a path to report the transforms of each reference on its lineage path.
 fn terminal_references_from_lineage(
-    node: &LineageNode,
+    node: &TraceNode,
     path: Option<&PathTransform>,
 ) -> Vec<ColumnReferenceFact> {
     let mut refs = Vec::new();
-    collect_terminal_references(node, path, &mut refs);
+    collect_terminal_references(node, path, &mut HashSet::new(), &mut refs);
     dedupe_column_refs(refs)
 }
 
 fn collect_terminal_references(
-    node: &LineageNode,
+    node: &TraceNode,
     path: Option<&PathTransform>,
+    visited: &mut HashSet<(*const TraceNode, Option<PathTransform>)>,
     refs: &mut Vec<ColumnReferenceFact>,
 ) {
+    // A shared trace seen again on an equal path only repeats references
+    // that dedupe_column_refs merges without change.
+    if let Some(shared) = &node.shared {
+        if !visited.insert((Arc::as_ptr(shared), path.cloned())) {
+            return;
+        }
+    }
+    let node = node.resolved();
     // A set-operation node only routes to its branches; each branch is a step.
     let stepped;
     let path = match path {
         Some(path) if !is_set_operation(&node.expression) => {
-            stepped = path.step(unwrap_projection_alias(&node.expression));
+            let expression = if node.source_kind == SourceKind::Virtual {
+                table_function_call(&node.source).map(|(call, _)| call)
+            } else {
+                None
+            };
+            stepped =
+                path.step(expression.unwrap_or_else(|| unwrap_projection_alias(&node.expression)));
             Some(&stepped)
         }
         path => path,
@@ -1827,12 +1883,32 @@ fn collect_terminal_references(
     }
 
     for child in &node.downstream {
-        collect_terminal_references(child, path, refs);
+        collect_terminal_references(child, path, visited, refs);
+    }
+}
+
+/// Return the function in relation position and its number of nested `this` fields.
+fn table_function_call(mut expression: &Expression) -> Option<(&Expression, usize)> {
+    let mut depth = 0;
+    loop {
+        expression = match expression {
+            Expression::Alias(alias) => &alias.this,
+            Expression::Paren(paren) => &paren.this,
+            Expression::Lateral(lateral) => &lateral.this,
+            Expression::LateralView(view) => &view.this,
+            Expression::TableFromRows(rows) => &rows.this,
+            Expression::Function(_)
+            | Expression::Unnest(_)
+            | Expression::Explode(_)
+            | Expression::ExplodeOuter(_) => return Some((expression, depth)),
+            _ => return None,
+        };
+        depth += 1;
     }
 }
 
 /// The transforms on one lineage path, from the projection output to a source column.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct PathTransform {
     dialect: DialectType,
     kind: TransformKind,
@@ -1980,7 +2056,7 @@ fn combine_transform_kinds(left: TransformKind, right: TransformKind) -> Transfo
     }
 }
 
-fn column_reference_from_lineage_node(node: &LineageNode) -> Option<ColumnReferenceFact> {
+fn column_reference_from_lineage_node(node: &TraceNode) -> Option<ColumnReferenceFact> {
     match &node.expression {
         Expression::Column(column) => {
             let source_name = non_empty_string(node.source_name.clone());
@@ -2024,7 +2100,7 @@ fn column_reference_from_lineage_node(node: &LineageNode) -> Option<ColumnRefere
     }
 }
 
-fn lineage_node_table(node: &LineageNode) -> Option<String> {
+fn lineage_node_table(node: &TraceNode) -> Option<String> {
     match &node.source {
         Expression::Table(table) => Some(table_name(table)),
         _ => None,
@@ -2269,7 +2345,11 @@ fn source_columns(
 ) -> Vec<String> {
     match &source.expression {
         Expression::Table(table) => mapping_schema
-            .and_then(|schema| schema.column_names(&table_name(table)).ok())
+            .and_then(|schema| {
+                schema
+                    .column_names(&crate::binding::schema_table_name(table))
+                    .ok()
+            })
             .unwrap_or_default(),
         Expression::Select(_)
         | Expression::Union(_)

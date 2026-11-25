@@ -10,7 +10,7 @@
 //! Based on the Python implementation in `sqlglot/optimizer/resolver.py`.
 
 use crate::dialects::DialectType;
-use crate::expressions::{Expression, Identifier, TableRef};
+use crate::expressions::{Expression, Identifier};
 #[cfg(feature = "generate")]
 use crate::generator::Generator;
 use crate::schema::{normalize_name, Schema};
@@ -237,7 +237,7 @@ impl<'a> Resolver<'a> {
                 // For tables, try to get columns from schema.
                 // Build the fully qualified name (catalog.schema.table) to
                 // match how MappingSchema stores hierarchical keys.
-                let table_name = qualified_table_name(table);
+                let table_name = crate::binding::schema_table_name(table);
                 match self.schema.column_names(&table_name) {
                     Ok(cols) => cols,
                     Err(_) => Vec::new(), // Schema might not have this table
@@ -374,23 +374,32 @@ impl<'a> Resolver<'a> {
             return self.get_pivot_unpivot_output_columns(pivot);
         }
 
-        let pre_columns = self.get_source_output_columns(&pivot.this);
-        if pre_columns.is_empty() || pre_columns.iter().any(|column| column == "*") {
+        let Some(mut columns) = self.pivot_implicit_group_columns(pivot) else {
             return Vec::new();
-        }
-
-        let excluded = pivot_excluded_source_columns(pivot, self.dialect);
+        };
         let generated = pivot_generated_output_columns(pivot, self.dialect);
-        if excluded.is_empty() || generated.is_empty() {
+        if generated.is_empty() {
             return Vec::new();
         }
-
-        let mut columns: Vec<String> = pre_columns
-            .into_iter()
-            .filter(|column| !excluded.contains(&normalize_column_name(column, self.dialect)))
-            .collect();
         columns.extend(generated);
         apply_alias_columns(columns, &pivot.alias_columns)
+    }
+
+    pub(crate) fn pivot_implicit_group_columns(
+        &self,
+        pivot: &crate::expressions::Pivot,
+    ) -> Option<Vec<String>> {
+        let columns = self.get_source_output_columns(&pivot.this);
+        let excluded = pivot_excluded_source_columns(pivot, self.dialect);
+        if columns.is_empty() || columns.iter().any(|name| name == "*") || excluded.is_empty() {
+            return None;
+        }
+        Some(
+            columns
+                .into_iter()
+                .filter(|name| !excluded.contains(&normalize_column_name(name, self.dialect)))
+                .collect(),
+        )
     }
 
     fn get_pivot_unpivot_output_columns(&self, pivot: &crate::expressions::Pivot) -> Vec<String> {
@@ -460,7 +469,7 @@ impl<'a> Resolver<'a> {
                     }
                 }
 
-                let table_name = qualified_table_name(table);
+                let table_name = crate::binding::schema_table_name(table);
                 self.schema.column_names(&table_name).unwrap_or_default()
             }
             Expression::Subquery(subquery) => apply_alias_columns(
@@ -493,6 +502,8 @@ impl<'a> Resolver<'a> {
                 }
             }
             Expression::Paren(paren) => self.get_source_output_columns(&paren.this),
+            Expression::Pivot(pivot) => self.get_pivot_output_columns(pivot),
+            Expression::Unpivot(unpivot) => self.get_unpivot_output_columns(unpivot),
             _ => Vec::new(),
         }
     }
@@ -703,7 +714,13 @@ fn unnest_output_columns(unnest: &crate::expressions::UnnestFunc) -> Vec<String>
         .collect()
 }
 
-fn alias_output_columns(alias: &crate::expressions::Alias) -> Vec<String> {
+pub(crate) fn alias_output_columns(alias: &crate::expressions::Alias) -> Vec<String> {
+    if let Some(inner) = crate::scope::table_function_argument(&alias.this) {
+        let columns = default_virtual_output_columns(inner);
+        if !columns.is_empty() || alias.column_aliases.is_empty() {
+            return apply_alias_columns(columns, &alias.column_aliases);
+        }
+    }
     if alias.column_aliases.is_empty() {
         vec![alias.alias.name.clone()]
     } else {
@@ -715,7 +732,7 @@ fn alias_output_columns(alias: &crate::expressions::Alias) -> Vec<String> {
     }
 }
 
-fn lateral_output_columns(lateral: &crate::expressions::Lateral) -> Vec<String> {
+pub(crate) fn lateral_output_columns(lateral: &crate::expressions::Lateral) -> Vec<String> {
     if lateral.column_aliases.is_empty() {
         default_virtual_output_columns(&lateral.this)
     } else {
@@ -738,7 +755,13 @@ fn default_virtual_output_columns(expression: &Expression) -> Vec<String> {
             alias_output_columns(alias)
         }
         Expression::Function(function) if function.name.eq_ignore_ascii_case("FLATTEN") => {
-            ["seq", "key", "path", "index", "value", "this"]
+            ["SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+        Expression::Function(function) if function.name.eq_ignore_ascii_case("SPLIT_TO_TABLE") => {
+            ["SEQ", "INDEX", "VALUE"]
                 .into_iter()
                 .map(String::from)
                 .collect()
@@ -761,11 +784,11 @@ fn pivot_excluded_source_columns(
         .collect()
 }
 
-fn pivot_generated_output_columns(
+pub(crate) fn pivot_generated_output_columns(
     pivot: &crate::expressions::Pivot,
-    _dialect: Option<DialectType>,
+    dialect: Option<DialectType>,
 ) -> Vec<String> {
-    let fields = pivot_field_output_names(pivot);
+    let fields = pivot_field_output_names(pivot, dialect);
     let aggregations = if pivot.using.is_empty() {
         &pivot.expressions
     } else {
@@ -790,7 +813,10 @@ fn pivot_generated_output_columns(
     outputs
 }
 
-fn pivot_field_output_names(pivot: &crate::expressions::Pivot) -> Vec<String> {
+fn pivot_field_output_names(
+    pivot: &crate::expressions::Pivot,
+    dialect: Option<DialectType>,
+) -> Vec<String> {
     pivot
         .fields
         .iter()
@@ -799,7 +825,16 @@ fn pivot_field_output_names(pivot: &crate::expressions::Pivot) -> Vec<String> {
                 in_expr
                     .expressions
                     .iter()
-                    .filter_map(expression_name)
+                    .filter_map(|expr| {
+                        if let (Some(DialectType::Snowflake), Expression::Literal(literal)) =
+                            (dialect, expr)
+                        {
+                            if let crate::expressions::Literal::String(value) = literal.as_ref() {
+                                return Some(format!("'{}'", value.replace("'", "''")));
+                            }
+                        }
+                        expression_name(expr)
+                    })
                     .collect::<Vec<_>>(),
             ),
             _ => None,
@@ -866,19 +901,6 @@ pub fn resolve_column(
 pub fn is_column_ambiguous(scope: &Scope, schema: &dyn Schema, column_name: &str) -> bool {
     let mut resolver = Resolver::new(scope, schema, true);
     resolver.is_ambiguous(column_name)
-}
-
-/// Build the fully qualified table name (catalog.schema.table) from a TableRef.
-fn qualified_table_name(table: &TableRef) -> String {
-    let mut parts = Vec::new();
-    if let Some(catalog) = &table.catalog {
-        parts.push(catalog.name.clone());
-    }
-    if let Some(schema) = &table.schema {
-        parts.push(schema.name.clone());
-    }
-    parts.push(table.name.name.clone());
-    parts.join(".")
 }
 
 #[cfg(test)]

@@ -44,6 +44,249 @@ fn first_index(order: &[String], target: &str) -> usize {
         .unwrap_or_else(|| panic!("missing {target} in visit order: {order:?}"))
 }
 
+#[test]
+fn duckdb_bitwise_xor_uses_function_instead_of_power_operator() {
+    use polyglot_sql::{expressions::BinaryOp, transpile};
+
+    for (input, expected) in [
+        ("SELECT BITXOR(12, 10) AS f", "SELECT XOR(12, 10) AS f"),
+        (
+            "SELECT BITXOR(BITXOR(a, b), 10) + 1 FROM t",
+            "SELECT (XOR(XOR(a, b), 10)) + 1 FROM t",
+        ),
+        ("SELECT BITXOR(NULL, 10)", "SELECT XOR(NULL, 10)"),
+    ] {
+        assert_eq!(
+            transpile(input, DialectType::Snowflake, DialectType::DuckDB).unwrap(),
+            vec![expected],
+            "{input}"
+        );
+    }
+
+    let expr = Expression::BitwiseXor(Box::new(BinaryOp::new(
+        Expression::number(12),
+        Expression::number(10),
+    )));
+    assert_eq!(
+        generate_with_dialect(&expr, DialectType::DuckDB),
+        "XOR(12, 10)"
+    );
+    assert_eq!(
+        generate_with_dialect(&expr, DialectType::PostgreSQL),
+        "12 # 10"
+    );
+}
+
+#[test]
+fn snowflake_concat_preserves_null_arguments_in_duckdb() {
+    for (input, expected) in [
+        ("SELECT CONCAT('a', NULL) AS a", "SELECT 'a' || NULL AS a"),
+        ("SELECT CONCAT(NULL, 'b', 'c')", "SELECT NULL || 'b' || 'c'"),
+        ("SELECT CONCAT('a', 'b', 'c')", "SELECT 'a' || 'b' || 'c'"),
+        ("SELECT CONCAT(NULL), CONCAT('')", "SELECT NULL, ''"),
+        ("SELECT CONCAT(a, b) FROM t", "SELECT a || b FROM t"),
+        ("SELECT CONCAT('a', CONCAT(b, NULL)) FROM t", "SELECT 'a' || b || NULL FROM t"),
+        (
+            "SELECT CONCAT_WS('-', 'a', NULL, 'b') AS c",
+            "SELECT CASE WHEN '-' IS NULL OR 'a' IS NULL OR NULL IS NULL OR 'b' IS NULL THEN NULL ELSE CONCAT_WS('-', 'a', NULL, 'b') END AS c",
+        ),
+        (
+            "SELECT CONCAT_WS(s, a, b) FROM t",
+            "SELECT CASE WHEN s IS NULL OR a IS NULL OR b IS NULL THEN NULL ELSE CONCAT_WS(s, a, b) END FROM t",
+        ),
+        (
+            "SELECT CONCAT_WS(NULL, 'a')",
+            "SELECT CASE WHEN NULL IS NULL OR 'a' IS NULL THEN NULL ELSE CONCAT_WS(NULL, 'a') END",
+        ),
+        (
+            "SELECT CONCAT_WS('-', 'a', '', 'b')",
+            "SELECT CASE WHEN '-' IS NULL OR 'a' IS NULL OR '' IS NULL OR 'b' IS NULL THEN NULL ELSE CONCAT_WS('-', 'a', '', 'b') END",
+        ),
+    ] {
+        assert_eq!(
+            polyglot_sql::transpile(input, DialectType::Snowflake, DialectType::DuckDB).unwrap(),
+            vec![expected],
+            "{input}"
+        );
+    }
+    // DuckDB and PostgreSQL source functions intentionally skip NULL arguments.
+    let input = "SELECT CONCAT('a', NULL), CONCAT_WS('-', 'a', NULL, 'b')";
+    for source in [DialectType::DuckDB, DialectType::PostgreSQL] {
+        assert_eq!(
+            polyglot_sql::transpile(input, source, DialectType::DuckDB).unwrap(),
+            vec![input]
+        );
+    }
+    assert_eq!(
+        polyglot_sql::transpile(input, DialectType::Snowflake, DialectType::Snowflake).unwrap(),
+        vec![input]
+    );
+}
+
+#[test]
+fn snowflake_get_preserves_duckdb_json_array_indexes() {
+    for (input, expected) in [
+        (
+            "SELECT GET(PARSE_JSON('[10, 20, 30]'), 0) AS first",
+            "SELECT JSON('[10, 20, 30]') -> '$[0]' AS first",
+        ),
+        (
+            "SELECT GET(PARSE_JSON('[10, 20, 30]'), 2)",
+            "SELECT JSON('[10, 20, 30]') -> '$[2]'",
+        ),
+        (
+            "SELECT GET(GET(PARSE_JSON('[[10, 20], [30]]'), 0), 1)",
+            "SELECT JSON('[[10, 20], [30]]') -> '$[0]' -> '$[1]'",
+        ),
+        ("SELECT GET(v, 0) FROM t", "SELECT v -> '$[0]' FROM t"),
+        ("SELECT GET([10, 20, 30], 0)", "SELECT [10, 20, 30][1]"),
+        ("SELECT GET(([10, 20, 30]), 0)", "SELECT ([10, 20, 30])[1]"),
+        (
+            "SELECT GET(ARRAY_CONSTRUCT(10, 20, 30), 0)",
+            "SELECT [10, 20, 30][1]",
+        ),
+        (
+            "SELECT GET(SPLIT('a,b', ','), 0)",
+            "SELECT CASE WHEN ',' IS NULL THEN NULL WHEN ',' = '' THEN ['a,b'] ELSE STR_SPLIT('a,b', ',') END -> '$[0]'",
+        ),
+        (
+            "SELECT GET(PARSE_JSON('[10, 20, 30]'), 3)",
+            "SELECT JSON('[10, 20, 30]') -> '$[3]'",
+        ),
+        (
+            "SELECT GET(CAST(v AS ARRAY(INT)), 0) FROM t",
+            "SELECT CAST(v AS INT[])[1] FROM t",
+        ),
+        (
+            "SELECT GET(CAST(v AS MAP(INT, VARCHAR)), 1) FROM t",
+            "SELECT CAST(v AS MAP(INT, TEXT))[1] FROM t",
+        ),
+    ] {
+        assert_eq!(
+            polyglot_sql::transpile(input, DialectType::Snowflake, DialectType::DuckDB).unwrap(),
+            vec![expected],
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn snowflake_datediff_preserves_subday_timestamp_boundaries() {
+    for (function, unit, start, end, data_type) in [
+        (
+            "DATEDIFF",
+            "HOUR",
+            "2026-01-01 23:59:00",
+            "2026-01-02 00:01:00",
+            "TIMESTAMP",
+        ),
+        (
+            "DATEDIFF",
+            "SECOND",
+            "2026-01-01 00:00:00.9",
+            "2026-01-01 00:00:01.1",
+            "TIMESTAMP",
+        ),
+        (
+            "TIMESTAMPDIFF",
+            "MINUTE",
+            "2026-11-16 12:00:00",
+            "2026-11-16 13:30:00",
+            "TIMESTAMP",
+        ),
+        ("TIMEDIFF", "SECOND", "00:00:00.9", "00:00:01.1", "TIME"),
+        (
+            "DATEDIFF",
+            "MILLISECOND",
+            "2026-01-01 00:00:00.0009",
+            "2026-01-01 00:00:00.0011",
+            "TIMESTAMP",
+        ),
+        (
+            "DATEDIFF",
+            "MICROSECOND",
+            "2026-01-01 00:00:00.000001",
+            "2026-01-01 00:00:00.000002",
+            "TIMESTAMP",
+        ),
+    ] {
+        let source_type = if data_type == "TIMESTAMP" {
+            "TIMESTAMP_NTZ"
+        } else {
+            data_type
+        };
+        let input = format!(
+            "SELECT {function}({unit}, '{start}'::{source_type}, '{end}'::{source_type}) AS d"
+        );
+        let expected = format!("SELECT DATE_DIFF('{unit}', CAST('{start}' AS {data_type}), CAST('{end}' AS {data_type})) AS d");
+        assert_eq!(
+            polyglot_sql::transpile(&input, DialectType::Snowflake, DialectType::DuckDB).unwrap(),
+            vec![expected],
+            "{input}"
+        );
+    }
+    for (unit, output_type) in [
+        ("HOUR", "TIMESTAMP"),
+        ("MINUTE", "TIMESTAMP"),
+        ("SECOND", "TIMESTAMP"),
+        ("DAY", "DATE"),
+    ] {
+        let input =
+            format!("SELECT DATEDIFF({unit}, '2026-01-01 23:59:00', '2026-01-02 00:01:00')");
+        let expected = format!("SELECT DATE_DIFF('{unit}', CAST('2026-01-01 23:59:00' AS {output_type}), CAST('2026-01-02 00:01:00' AS {output_type}))");
+        assert_eq!(
+            polyglot_sql::transpile(&input, DialectType::Snowflake, DialectType::DuckDB).unwrap(),
+            vec![expected],
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn snowflake_dateadd_preserves_date_result_type() {
+    for function in ["DATEADD", "TIMEADD", "TIMESTAMPADD"] {
+        for unit in ["DAY", "WEEK", "MONTH", "QUARTER", "YEAR"] {
+            let input = format!("SELECT {function}({unit}, 1, '2026-01-31'::DATE) AS d");
+            let expected =
+                format!("SELECT CAST(CAST('2026-01-31' AS DATE) + INTERVAL 1 {unit} AS DATE) AS d");
+            assert_eq!(
+                polyglot_sql::transpile(&input, DialectType::Snowflake, DialectType::DuckDB)
+                    .unwrap(),
+                vec![expected],
+                "{input}"
+            );
+        }
+    }
+    for (input, expected) in [
+        (
+            "SELECT DATEADD(DAY, n, CAST(d AS DATE)) FROM t",
+            "SELECT CAST(CAST(d AS DATE) + INTERVAL (n) DAY AS DATE) FROM t",
+        ),
+        (
+            "SELECT DATEADD(DAY, 1, DATEADD(MONTH, 1, '2026-01-31'::DATE))",
+            "SELECT CAST(CAST(CAST('2026-01-31' AS DATE) + INTERVAL 1 MONTH AS DATE) + INTERVAL 1 DAY AS DATE)",
+        ),
+        (
+            "SELECT DATEADD(DAY, 1, CURRENT_DATE)",
+            "SELECT CAST(CURRENT_DATE + INTERVAL 1 DAY AS DATE)",
+        ),
+        (
+            "SELECT DATEADD(HOUR, 1, '2026-01-31'::DATE)",
+            "SELECT CAST('2026-01-31' AS DATE) + INTERVAL 1 HOUR",
+        ),
+        (
+            "SELECT DATEADD(DAY, 1, '2026-01-31 12:30:00'::TIMESTAMP_NTZ)",
+            "SELECT CAST('2026-01-31 12:30:00' AS TIMESTAMP) + INTERVAL 1 DAY",
+        ),
+    ] {
+        assert_eq!(
+            polyglot_sql::transpile(input, DialectType::Snowflake, DialectType::DuckDB).unwrap(),
+            vec![expected],
+            "{input}"
+        );
+    }
+}
+
 fn rename_predicate_children(node: Expression) -> Expression {
     match node {
         Expression::Table(mut table) => {
@@ -834,4 +1077,35 @@ fn qualify_rebinds_distinct_on_expressions_to_outer_outputs() {
         output.starts_with("SELECT DISTINCT ON (a) a, rn FROM"),
         "{output}"
     );
+}
+
+#[test]
+fn explain_children_participate_in_walks_and_transformations() {
+    use polyglot_sql::expressions::{ExplainExecution, ExplainTarget};
+    let sql = "EXPLAIN (ANALYZE FALSE, FORMAT JSON) WITH changed AS (UPDATE src.t SET x = 1 RETURNING x) SELECT x FROM changed";
+    let ast = parse_one_dialect(sql, DialectType::PostgreSQL);
+    assert!(ast.dfs().any(|n| matches!(n, Expression::Update(_))));
+    let transformed =
+        transform_recursive(ast, &|node| Ok(rename_predicate_children(node))).unwrap();
+    let Expression::Explain(explain) = &transformed else {
+        panic!("Expected Explain")
+    };
+    assert_eq!(explain.execution_mode(), ExplainExecution::PlanOnly);
+    assert!(matches!(explain.target, ExplainTarget::Statement(_)));
+    let output = generate_with_dialect(&transformed, DialectType::PostgreSQL);
+    assert!(output.contains("UPDATE \"dst\".t"), "{output}");
+    assert!(output.contains("SELECT lhs"), "{output}");
+    // Dialect transformations must also reach functions inside the explained query.
+    let output = polyglot_sql::transpile(
+        "EXPLAIN SELECT IFNULL(x, 1) FROM t",
+        DialectType::MySQL,
+        DialectType::PostgreSQL,
+    )
+    .unwrap();
+    assert_eq!(output, ["EXPLAIN SELECT COALESCE(x, 1) FROM t"]);
+    let ast = parse_one_dialect(
+        "SELECT * FROM (EXPLAIN VIRTUAL SELECT * FROM virtual_table) AS plan",
+        DialectType::Exasol,
+    );
+    assert!(ast.dfs().any(|n| matches!(n, Expression::Explain(_))));
 }

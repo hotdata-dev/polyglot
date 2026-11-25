@@ -4,6 +4,210 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.14.4] - 2026-11-23
+
+### Added
+
+- Snowflake wildcard projections support `ILIKE` patterns, including qualified
+  stars such as `t.* ILIKE 'sales_%'`. Query analysis applies the pattern before
+  `REPLACE` and `RENAME` when expanding known columns.
+  ([#561](https://github.com/tobilg/polyglot/issues/561))
+
+### Changed
+
+- Query analysis uses less memory for chains of CTEs that repeatedly read the
+  same columns and for wide unions over many CTEs.
+  ([#555](https://github.com/tobilg/polyglot/pull/555))
+- The Rust `transpile` feature now enables `semantic` so the transpiler can
+  resolve operand types through CTEs and derived tables.
+  ([#532](https://github.com/tobilg/polyglot/pull/532))
+- Column-use facts inside a scalar subquery in the select list now identify the
+  containing projection in `scopePath`. For example, a subquery in the second
+  projection reports `root.expressions[1].subqueries[0]`.
+  ([#562](https://github.com/tobilg/polyglot/issues/562))
+
+### Fixed
+
+- Generic `DATE_TRUNC` transpiles to Spark and Databricks `DATE_TRUNC` for
+  `DAY`, `DD`, and sub-day units, including milliseconds and microseconds.
+  Previously these units could produce `NULL` because the generated SQL used `TRUNC`.
+  ([#531](https://github.com/tobilg/polyglot/pull/531))
+- SQLite-to-DuckDB division preserves both integer and fractional results,
+  including `7 / 2 = 3` and `7.0 / 2 = 3.5`.
+  PostgreSQL-to-SQLite division preserves fractional results for known decimal
+  operands, including columns projected through CTEs and derived tables.
+  T-SQL-to-SQLite division respects the integer result types of `NULLIF` and
+  `AVG` when their first argument is an integer.
+  ([#532](https://github.com/tobilg/polyglot/pull/532))
+- DuckDB-to-SQLite transpilation accepts both argument orders for `STRFTIME`
+  and emits the format first. Positional parameters keep their original
+  bindings when the arguments swap.
+  ([#533](https://github.com/tobilg/polyglot/pull/533))
+- Snowflake lineage traces wildcard inputs to `OBJECT_CONSTRUCT` and `HASH`
+  back to their source columns, including qualified inputs such as `t.*`.
+  ([#556](https://github.com/tobilg/polyglot/issues/556))
+- Snowflake schema validation resolves columns through aliases on
+  `TABLE(FLATTEN(...))` and `TABLE(SPLIT_TO_TABLE(...))`. Query analysis
+  expands qualified stars over these functions in their declared column order,
+  including in lateral queries without a supplied schema.
+  ([#557](https://github.com/tobilg/polyglot/issues/557), [#567](https://github.com/tobilg/polyglot/issues/567))
+- Snowflake query analysis folds unquoted column names and aliases to uppercase
+  and preserves quoted names, so `id` and `"id"` retain distinct lineage through CTEs.
+  ([#558](https://github.com/tobilg/polyglot/issues/558))
+- Query analysis reports the input columns that `PIVOT` implicitly groups by,
+  including when pivot values are determined dynamically.
+  ([#559](https://github.com/tobilg/polyglot/issues/559))
+- Snowflake and DuckDB `UNPIVOT` lineage distinguishes generated labels from
+  values read from source columns. Query analysis also reports the implicit
+  null filter when the operation excludes nulls.
+  ([#560](https://github.com/tobilg/polyglot/issues/560))
+- A merged `USING` key traces directly to the preserved side of a left or
+  right outer join. Full outer joins retain both sources.
+  ([#563](https://github.com/tobilg/polyglot/issues/563))
+- Grouping validation accepts columns that order aggregate inputs, such as
+  `LISTAGG(b, ',') WITHIN GROUP (ORDER BY a)`. For `GROUP BY ALL`, validation
+  infers the grouping keys and flags ungrouped references in clauses such as `HAVING`.
+  ([#564](https://github.com/tobilg/polyglot/issues/564), [#565](https://github.com/tobilg/polyglot/issues/565))
+- Snowflake query analysis uses expression text for unaliased output headings
+  and retains single quotes in headings generated from string-valued `PIVOT`
+  labels. A plain `SELECT` preserves duplicate headings.
+  ([#566](https://github.com/tobilg/polyglot/issues/566))
+- With `check_types` enabled, schema validation detects column-count
+  mismatches in `IN` and `NOT IN` subqueries, including a scalar compared
+  with a two-column result. Row comparisons with matching widths remain valid.
+  ([#568](https://github.com/tobilg/polyglot/issues/568))
+
+## [0.14.3] - 2026-11-20
+
+### Added
+
+- Query analysis reports columns used as table-function arguments under the new
+  `table_function_input` context. For Snowflake `LATERAL FLATTEN(input => t.items)`,
+  the lineage of `VALUE` now records `FLATTEN` as the transformation on `t.items`.
+  Rust callers matching `ColumnUseContext` exhaustively need to handle
+  `TableFunctionInput`. The TypeScript, Python, and Go SDKs expose the new context.
+  ([#553](https://github.com/tobilg/polyglot/issues/553))
+
+### Fixed
+
+- Catalog-qualified table references resolve against shorter names in the supplied
+  schema. Validation reports unknown columns, and `SELECT *` inside a CTE
+  retains lineage to the underlying table.
+  ([#546](https://github.com/tobilg/polyglot/issues/546))
+- A qualified star such as `t.*` in a `JOIN ... USING` traces the join key
+  directly to `t`. An unqualified `*` retains the merged join key.
+  ([#547](https://github.com/tobilg/polyglot/issues/547))
+- Projected columns retain their output names and lineage through CTEs when the
+  projection includes a line or block comment.
+  ([#548](https://github.com/tobilg/polyglot/issues/548))
+- Schema validation checks `PIVOT` and `UNPIVOT` operands against the input
+  relation and resolves outer projections against the resulting columns.
+  ([#549](https://github.com/tobilg/polyglot/issues/549))
+- Schema validation preserves the case of quoted table and column names and
+  applies the dialect’s case-folding rules to unquoted names, including in
+  `INSERT` and `UPDATE` statements.
+  ([#550](https://github.com/tobilg/polyglot/issues/550))
+- Aggregate output lineage includes columns used to order the aggregate’s
+  inputs, including DuckDB’s inline `ORDER BY` and Snowflake’s
+  `WITHIN GROUP (ORDER BY ...)`.
+  ([#551](https://github.com/tobilg/polyglot/issues/551))
+- Query analysis reports the grouping columns inferred by `GROUP BY ALL` in
+  DuckDB and Snowflake, including columns from expanded stars.
+  ([#552](https://github.com/tobilg/polyglot/issues/552))
+
+## [0.14.2] - 2026-11-18
+
+### Fixed
+
+- ClickHouse accepts `INSERT INTO ... FORMAT Values` headers without inline
+  rows when data is supplied separately. Parsing preserves the structured
+  `INSERT`, format spelling, column list, and statement boundaries.
+  ([#530](https://github.com/tobilg/polyglot/issues/530))
+- DuckDB generation uses `XOR(left, right)` for bitwise exclusive OR instead of
+  `^`, which DuckDB interprets as exponentiation.
+  ([#534](https://github.com/tobilg/polyglot/issues/534))
+- Snowflake-to-DuckDB `GET` preserves zero-based JSON array indexes for numeric
+  literals. Known native arrays receive the one-based offset required by
+  DuckDB; native map keys retain their values.
+  ([#535](https://github.com/tobilg/polyglot/issues/535))
+- Snowflake-to-DuckDB `DATEDIFF` retains time components for hour, minute,
+  second, millisecond, and microsecond units instead of truncating operands
+  to dates before calculating the difference.
+  ([#536](https://github.com/tobilg/polyglot/issues/536))
+- Snowflake-to-DuckDB `DATEADD`, `TIMEADD`, and `TIMESTAMPADD` preserve `DATE`
+  results for known `DATE` inputs when adding days, weeks, months, quarters,
+  or years, instead of promoting the result to `TIMESTAMP`.
+  ([#537](https://github.com/tobilg/polyglot/issues/537))
+- Snowflake-to-DuckDB `CONCAT` and `CONCAT_WS` propagate SQL `NULL` arguments,
+  including a NULL separator, rather than skipping them.
+  ([#538](https://github.com/tobilg/polyglot/issues/538))
+- Snowflake-to-DuckDB `LISTAGG` uses an empty separator when none is specified,
+  including ordered, distinct, and windowed aggregates.
+  ([#539](https://github.com/tobilg/polyglot/issues/539))
+- Snowflake-to-DuckDB `REGEXP_LIKE` uses full-string matching through
+  `REGEXP_FULL_MATCH`, preserving pattern flags instead of matching substrings.
+  ([#540](https://github.com/tobilg/polyglot/issues/540))
+- Snowflake-to-DuckDB `SUBSTR` and `SUBSTRING` treat a start position of zero as
+  one, including dynamically computed positions.
+  ([#541](https://github.com/tobilg/polyglot/issues/541))
+- Snowflake-to-DuckDB `OBJECT_CONSTRUCT` omits entries whose key or value is
+  SQL `NULL`, including dynamic keys and values, while retaining JSON null
+  values and heterogeneous value types.
+  ([#542](https://github.com/tobilg/polyglot/issues/542))
+- Snowflake-to-DuckDB explicit string casts of known JSON expressions extract
+  text instead of serializing JSON: strings lose their surrounding JSON quotes,
+  and JSON null or missing paths produce SQL `NULL`.
+  ([#543](https://github.com/tobilg/polyglot/issues/543))
+- DuckDB generation maps Snowflake `TIMESTAMP_LTZ` and `TIMESTAMP_NTZ` aliases
+  to supported types in column definitions, casts, and nested types. LTZ uses
+  `TIMESTAMPTZ` without a precision modifier; NTZ uses `TIMESTAMP` and retains
+  explicit precision. Default target timestamps use microsecond precision.
+  ([#544](https://github.com/tobilg/polyglot/issues/544))
+- Linux ARM64 FFI release builds split code generation and limit compiler
+  concurrency to reduce peak memory usage while retaining ThinLTO.
+
+## [0.14.1] - 2026-11-08
+
+### Added
+
+- Dedicated `Expression::Explain` AST nodes with structured statements or native
+  inspection targets, ordered typed options, and execution-mode classification.
+  TypeScript AST types and a Python `Explain` expression subclass expose the new
+  representation.
+  ([#524](https://github.com/tobilg/polyglot/issues/524))
+
+### Changed
+
+- Production playground builds load version-pinned WASM from jsDelivr with an
+  UNPKG fallback instead of bundling the WASM asset. Startup verifies the engine
+  version against the SDK; local development continues to use local WASM builds.
+- `EXPLAIN` statements now produce `Explain` rather than `Describe` nodes.
+  Consumers inspecting serialized AST kinds or matching Rust `Expression`
+  variants exhaustively may need to update their code.
+
+### Fixed
+
+- `EXPLAIN` parsing and generation preserve command identity, native options,
+  and the underlying statement, including DML. Execution classification
+  distinguishes planning, target execution, existing-plan inspection, and
+  unknown behavior. DuckDB's `ANALYZE FALSE` correctly counts as target execution.
+  Cross-dialect conversions reject options or inspection targets that cannot
+  retain their meaning. Schema-oriented `DESCRIBE` remains separate; planning
+  classification is not a read-only guarantee.
+  ([#524](https://github.com/tobilg/polyglot/issues/524))
+- DuckDB-to-BigQuery transpilation preserves numbered parameter identities:
+  `$1` becomes `@p1`, including repeated and out-of-order references. Callers
+  bind values under the corresponding `p1`, `p2`, etc. names. Named parameters
+  retain their names, anonymous-only queries remain positional, and mixed
+  parameter styles return explicit errors instead of invalid or ambiguous SQL.
+  ([#523](https://github.com/tobilg/polyglot/issues/523))
+- DuckDB `DATE_TRUNC` and `DATETRUNC` convert to BigQuery's value-first argument
+  order with unquoted canonical units and `WEEK(MONDAY)` for DuckDB weeks. Known
+  `DATE` inputs are promoted to `DATETIME` to preserve the timestamp result.
+  Dynamic or unsupported granularities report errors; strict mode also rejects
+  unresolved operand types and truncation that depends on the session time zone.
+  ([#523](https://github.com/tobilg/polyglot/issues/523))
+
 ## [0.14.0] - 2026-11-03
 
 ### Added
@@ -2317,6 +2521,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - removed problematic doc-comment patterns that broke generated JSDoc parsing
   - removed `Index.ts` renaming in binding copy flow to avoid case-sensitive import conflicts
 
+[0.14.4]: https://github.com/tobilg/polyglot/compare/v0.14.3...main
+[0.14.3]: https://github.com/tobilg/polyglot/compare/v0.14.2...v0.14.3
+[0.14.2]: https://github.com/tobilg/polyglot/compare/v0.14.1...v0.14.2
+[0.14.1]: https://github.com/tobilg/polyglot/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/tobilg/polyglot/compare/v0.13.5...v0.14.0
 [0.13.5]: https://github.com/tobilg/polyglot/compare/v0.13.4...v0.13.5
 [0.13.4]: https://github.com/tobilg/polyglot/compare/v0.13.3...v0.13.4

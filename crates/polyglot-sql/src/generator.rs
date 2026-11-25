@@ -20,6 +20,7 @@ use crate::guard::{enforce_generate_ast, ComplexityGuardOptions};
 use crate::DialectType;
 use serde::{Deserialize, Serialize};
 
+mod explain;
 mod pipes;
 mod routines;
 
@@ -3671,12 +3672,16 @@ impl Generator {
                 }
             }
             Expression::BitwiseXor(op) => {
-                // Presto/Trino use BITWISE_XOR function, PostgreSQL uses #, others use ^
+                // DuckDB's ^ means exponentiation; bitwise XOR is a function.
                 if matches!(
                     self.config.dialect,
-                    Some(DialectType::Presto) | Some(DialectType::Trino)
+                    Some(DialectType::Presto | DialectType::Trino | DialectType::DuckDB)
                 ) {
-                    self.write_keyword("BITWISE_XOR");
+                    self.write_keyword(if self.config.dialect == Some(DialectType::DuckDB) {
+                        "XOR"
+                    } else {
+                        "BITWISE_XOR"
+                    });
                     self.write("(");
                     self.generate_expression(&op.left)?;
                     self.write(", ");
@@ -3924,6 +3929,7 @@ impl Generator {
             Expression::CreateType(ct) => self.generate_create_type(ct),
             Expression::DropType(dt) => self.generate_drop_type(dt),
             Expression::Describe(d) => self.generate_describe(d),
+            Expression::Explain(e) => self.generate_explain(e),
             Expression::Show(s) => self.generate_show(s),
 
             // CACHE/UNCACHE/LOAD TABLE (Spark/Hive)
@@ -5279,6 +5285,7 @@ impl Generator {
 
                 // Build the outer select: SELECT * EXCLUDE (cols) FROM (inner)
                 let star = Expression::Star(crate::expressions::Star {
+                    ilike: None,
                     table: None,
                     except: Some(
                         exclude
@@ -7822,6 +7829,7 @@ impl Generator {
         let mut outer_select = Select {
             vertica: None,
             expressions: vec![Expression::Star(Star {
+                ilike: None,
                 table: None,
                 except: None,
                 replace: None,
@@ -19141,6 +19149,13 @@ impl Generator {
         }
         self.write("*");
 
+        if let Some(pattern) = &star.ilike {
+            self.write_space();
+            self.write_keyword("ILIKE");
+            self.write_space();
+            self.generate_literal(&Literal::String(pattern.clone()))?;
+        }
+
         // Generate EXCLUDE/EXCEPT clause based on dialect
         if let Some(except) = &star.except {
             if !except.is_empty() {
@@ -23867,6 +23882,15 @@ impl Generator {
     }
 
     fn generate_date_trunc(&mut self, f: &DateTruncFunc) -> Result<()> {
+        if self.config.dialect == Some(DialectType::BigQuery) {
+            self.write_keyword("DATE_TRUNC");
+            self.write("(");
+            self.generate_expression(&f.this)?;
+            self.write(", ");
+            self.write_datetime_field(&f.unit);
+            self.write(")");
+            return Ok(());
+        }
         if matches!(
             self.config.dialect,
             Some(DialectType::TSQL) | Some(DialectType::Fabric)
@@ -26286,7 +26310,15 @@ impl Generator {
         // Parameter spelling is a rendering concern. Use the source dialect so
         // MySQL/TSQL @variables retain their meaning, and render nested BigQuery
         // parameters even in nodes outside the legacy dialect transform coverage.
-        let style = if self.config.source_dialect == Some(DialectType::BigQuery)
+        let duckdb_to_bigquery = self.config.source_dialect == Some(DialectType::DuckDB)
+            && self.config.dialect == Some(DialectType::BigQuery);
+        let style = if duckdb_to_bigquery
+            && matches!(
+                f.style,
+                ParameterStyle::Dollar | ParameterStyle::DoubleDollar
+            ) {
+            ParameterStyle::At
+        } else if self.config.source_dialect == Some(DialectType::BigQuery)
             && self.config.dialect == Some(DialectType::DuckDB)
             && f.style == ParameterStyle::At
         {
@@ -26342,7 +26374,10 @@ impl Generator {
             }
             ParameterStyle::At => {
                 self.write("@");
-                if let Some(ref name) = f.name {
+                if let Some(index) = f.index.filter(|_| duckdb_to_bigquery) {
+                    self.write("p");
+                    self.write(&index.to_string());
+                } else if let Some(ref name) = f.name {
                     if f.string_quoted {
                         self.write("'");
                         self.write(name);
@@ -30704,6 +30739,22 @@ impl Generator {
                         };
 
                         match base_upper.as_str() {
+                            // Embedded CAST/column types do not visit the
+                            // dialect's standalone DataType transform.
+                            "TIMESTAMPNTZ" | "TIMESTAMP_NTZ"
+                                if self.config.dialect == Some(DialectType::DuckDB) =>
+                            {
+                                self.write_keyword("TIMESTAMP");
+                                if let Some(args) = _args_str {
+                                    self.write(args);
+                                }
+                            }
+                            "TIMESTAMPLTZ" | "TIMESTAMP_LTZ"
+                                if self.config.dialect == Some(DialectType::DuckDB) =>
+                            {
+                                // DuckDB does not accept TIMESTAMPTZ(p).
+                                self.write_keyword("TIMESTAMPTZ");
+                            }
                             "INT64"
                                 if !matches!(self.config.dialect, Some(DialectType::BigQuery)) =>
                             {

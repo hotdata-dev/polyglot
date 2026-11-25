@@ -397,7 +397,6 @@ impl TypeFamily {
 #[derive(Debug, Clone)]
 struct TableSchemaEntry {
     columns: HashMap<String, TypeFamily>,
-    column_order: Vec<String>,
 }
 
 fn lower(s: &str) -> String {
@@ -509,16 +508,12 @@ fn build_schema_map(schema: &ValidationSchema) -> HashMap<String, TableSchemaEnt
     let mut map = HashMap::new();
 
     for table in &schema.tables {
-        let column_order: Vec<String> = table.columns.iter().map(|c| lower(&c.name)).collect();
         let columns: HashMap<String, TypeFamily> = table
             .columns
             .iter()
             .map(|c| (lower(&c.name), canonical_type_family(&c.data_type)))
             .collect();
-        let entry = TableSchemaEntry {
-            columns,
-            column_order,
-        };
+        let entry = TableSchemaEntry { columns };
 
         let simple_name = lower(&table.name);
         map.insert(simple_name, entry.clone());
@@ -585,48 +580,13 @@ fn type_family_to_data_type(family: TypeFamily) -> DataType {
     }
 }
 
-fn build_resolver_schema(schema: &ValidationSchema) -> MappingSchema {
-    let mut mapping = MappingSchema::new();
-
-    for table in &schema.tables {
-        let columns: Vec<(String, DataType)> = table
-            .columns
-            .iter()
-            .map(|column| {
-                (
-                    lower(&column.name),
-                    type_family_to_data_type(canonical_type_family(&column.data_type)),
-                )
-            })
-            .collect();
-
-        let mut table_names = Vec::new();
-        table_names.push(lower(&table.name));
-        if let Some(table_schema) = &table.schema {
-            table_names.push(format!("{}.{}", lower(table_schema), lower(&table.name)));
-        }
-        for alias in &table.aliases {
-            table_names.push(lower(alias));
-        }
-
-        let mut dedup = HashSet::new();
-        for table_name in table_names {
-            if dedup.insert(table_name.clone()) {
-                let _ = mapping.add_table(&table_name, &columns, None);
-            }
-        }
-    }
-
-    mapping
-}
-
 /// Build a `MappingSchema` from a `ValidationSchema` payload.
 ///
 /// This is useful for APIs that already accept `ValidationSchema`-shaped input
 /// (for example JSON wrappers) and need to run schema-aware lineage or other
 /// resolver-based analysis.
 pub fn mapping_schema_from_validation_schema(schema: &ValidationSchema) -> MappingSchema {
-    build_resolver_schema(schema)
+    build_resolver_schema(schema, None)
 }
 
 /// Build a dialect-aware `MappingSchema` while preserving nested types such
@@ -637,22 +597,26 @@ pub fn mapping_schema_from_validation_schema_with_dialect(
     schema: &ValidationSchema,
     dialect: DialectType,
 ) -> MappingSchema {
-    let broad_schema = build_resolver_schema(schema);
-    let dialect_impl = Dialect::get(dialect);
-    let mut mapping = MappingSchema::with_dialect(dialect);
+    build_resolver_schema(schema, Some(dialect))
+}
+
+fn build_resolver_schema(schema: &ValidationSchema, dialect: Option<DialectType>) -> MappingSchema {
+    let dialect_impl = dialect.map(Dialect::get);
+    let mut mapping = dialect
+        .map(MappingSchema::with_dialect)
+        .unwrap_or_default()
+        .with_table_suffix_lookup();
 
     for table in &schema.tables {
-        let fallback_table = lower(&table.name);
         let columns: Vec<(String, DataType)> = table
             .columns
             .iter()
             .map(|column| {
                 let data_type = dialect_impl
-                    .parse_data_type(column.data_type.trim())
-                    .unwrap_or_else(|_| {
-                        broad_schema
-                            .get_column_type(&fallback_table, &column.name)
-                            .unwrap_or(DataType::Unknown)
+                    .as_ref()
+                    .and_then(|d| d.parse_data_type(column.data_type.trim()).ok())
+                    .unwrap_or_else(|| {
+                        type_family_to_data_type(canonical_type_family(&column.data_type))
                     });
                 (column.name.clone(), data_type)
             })
@@ -666,8 +630,8 @@ pub fn mapping_schema_from_validation_schema_with_dialect(
 
         let mut seen = HashSet::new();
         for table_name in table_names {
-            if seen.insert(lower(&table_name)) {
-                let _ = mapping.add_table(&table_name, &columns, Some(dialect));
+            if seen.insert(table_name.clone()) {
+                let _ = mapping.add_table(&table_name, &columns, dialect);
             }
         }
     }
@@ -2020,6 +1984,16 @@ fn are_assignment_compatible(target: TypeFamily, source: TypeFamily) -> bool {
     }
 }
 
+fn projection_wildcard(expr: &Expression) -> bool {
+    match expr {
+        Expression::Star(_) | Expression::BracedWildcard(_) => true,
+        Expression::Column(column) => column.name.name == "*",
+        Expression::Alias(alias) => projection_wildcard(&alias.this),
+        Expression::Annotated(annotated) => projection_wildcard(&annotated.this),
+        _ => false,
+    }
+}
+
 fn projection_families(
     query: &Expression,
     schema_map: &HashMap<String, TableSchemaEntry>,
@@ -2063,12 +2037,11 @@ fn projection_families(
         };
     }
     match query {
+        Expression::Select(select) if select.kind.as_deref() == Some("STRUCT") => {
+            Some(vec![TypeFamily::Struct])
+        }
         Expression::Select(select) => {
-            if select
-                .expressions
-                .iter()
-                .any(|e| matches!(e, Expression::Star(_) | Expression::BracedWildcard(_)))
-            {
+            if select.expressions.iter().any(projection_wildcard) {
                 return None;
             }
             let context = collect_type_check_context(query, schema_map);
@@ -2191,45 +2164,33 @@ fn check_insert_assignments(
     dialect: DialectType,
     stmt: &Expression,
     insert: &Insert,
+    resolver_schema: &MappingSchema,
     schema_map: &HashMap<String, TableSchemaEntry>,
     strict: bool,
     errors: &mut Vec<ValidationError>,
 ) {
-    let Some((target_table_key, table_schema)) =
-        resolve_table_schema_entry(&insert.table, schema_map)
-    else {
+    let target_table_key = crate::binding::schema_table_name(&insert.table);
+    let Ok(ordered) = resolver_schema.column_names(&target_table_key) else {
         return;
     };
-
-    let mut target_columns = Vec::new();
-    if insert.columns.is_empty() {
-        target_columns.extend(table_schema.column_order.iter().cloned());
+    let names: Vec<_> = if insert.columns.is_empty() {
+        // The schema returns canonical identifiers, including case-sensitive names.
+        ordered
+            .into_iter()
+            .map(crate::expressions::Identifier::quoted)
+            .collect()
     } else {
-        for column in &insert.columns {
-            let col_name = lower(&column.name);
-            if table_schema.columns.contains_key(&col_name) {
-                target_columns.push(col_name);
-            } else {
-                errors.push(if strict {
-                    ValidationError::error(
-                        format!(
-                            "Unknown column '{}' in table '{}'",
-                            column.name, target_table_key
-                        ),
-                        validation_codes::E_UNKNOWN_COLUMN,
-                    )
-                } else {
-                    ValidationError::warning(
-                        format!(
-                            "Unknown column '{}' in table '{}'",
-                            column.name, target_table_key
-                        ),
-                        validation_codes::E_UNKNOWN_COLUMN,
-                    )
-                });
-            }
-        }
-    }
+        insert.columns.clone()
+    };
+    let target_columns: Vec<_> = names
+        .iter()
+        .filter_map(|column| {
+            let data_type = resolver_schema
+                .get_column_type(&target_table_key, &crate::binding::identifier_name(column))
+                .ok()?;
+            Some((&column.name, data_type_family(&data_type)))
+        })
+        .collect();
 
     if target_columns.is_empty() {
         return;
@@ -2254,12 +2215,9 @@ fn check_insert_assignments(
                 continue;
             }
 
-            for (value, target_column) in row.iter().zip(target_columns.iter()) {
-                let Some(target_family) = table_schema.columns.get(target_column).copied() else {
-                    continue;
-                };
+            for (value, (target_column, target_family)) in row.iter().zip(target_columns.iter()) {
                 let source_family = infer_expression_type_family(value, schema_map, &context);
-                if !are_assignment_compatible(target_family, source_family) {
+                if !are_assignment_compatible(*target_family, source_family) {
                     errors.push(type_issue(
                         strict,
                         validation_codes::E_INVALID_ASSIGNMENT_TYPE,
@@ -2268,7 +2226,7 @@ fn check_insert_assignments(
                             "INSERT assignment type mismatch for '{}.{}': expected {}, found {}",
                             target_table_key,
                             target_column,
-                            type_family_name(target_family),
+                            type_family_name(*target_family),
                             type_family_name(source_family)
                         ),
                     ));
@@ -2301,13 +2259,10 @@ fn check_insert_assignments(
             return;
         }
 
-        for (source_family, target_column) in
+        for (source_family, (target_column, target_family)) in
             source_projection.into_iter().zip(target_columns.iter())
         {
-            let Some(target_family) = table_schema.columns.get(target_column).copied() else {
-                continue;
-            };
-            if !are_assignment_compatible(target_family, source_family) {
+            if !are_assignment_compatible(*target_family, source_family) {
                 errors.push(type_issue(
                     strict,
                     validation_codes::E_INVALID_ASSIGNMENT_TYPE,
@@ -2316,7 +2271,7 @@ fn check_insert_assignments(
                         "INSERT assignment type mismatch for '{}.{}': expected {}, found {}",
                         target_table_key,
                         target_column,
-                        type_family_name(target_family),
+                        type_family_name(*target_family),
                         type_family_name(source_family)
                     ),
                 ));
@@ -2328,41 +2283,19 @@ fn check_insert_assignments(
 fn check_update_assignments(
     stmt: &Expression,
     update: &Update,
+    resolver_schema: &MappingSchema,
     schema_map: &HashMap<String, TableSchemaEntry>,
     strict: bool,
     errors: &mut Vec<ValidationError>,
 ) {
-    let Some((target_table_key, table_schema)) =
-        resolve_table_schema_entry(&update.table, schema_map)
-    else {
-        return;
-    };
-
+    let target_table_key = crate::binding::schema_table_name(&update.table);
     let context = collect_type_check_context(stmt, schema_map);
-
     for (column, value) in &update.set {
-        let col_name = lower(&column.name);
-        let Some(target_family) = table_schema.columns.get(&col_name).copied() else {
-            errors.push(if strict {
-                ValidationError::error(
-                    format!(
-                        "Unknown column '{}' in table '{}'",
-                        column.name, target_table_key
-                    ),
-                    validation_codes::E_UNKNOWN_COLUMN,
-                )
-            } else {
-                ValidationError::warning(
-                    format!(
-                        "Unknown column '{}' in table '{}'",
-                        column.name, target_table_key
-                    ),
-                    validation_codes::E_UNKNOWN_COLUMN,
-                )
-            });
+        let col_name = crate::binding::identifier_name(column);
+        let Ok(target_type) = resolver_schema.get_column_type(&target_table_key, &col_name) else {
             continue;
         };
-
+        let target_family = data_type_family(&target_type);
         let source_family = infer_expression_type_family(value, schema_map, &context);
         if !are_assignment_compatible(target_family, source_family) {
             errors.push(type_issue(
@@ -2384,6 +2317,7 @@ fn check_update_assignments(
 fn check_types(
     stmt: &Expression,
     dialect: DialectType,
+    resolver_schema: &MappingSchema,
     schema_map: &HashMap<String, TableSchemaEntry>,
     function_catalog: Option<&dyn FunctionCatalog>,
     strict: bool,
@@ -2408,10 +2342,25 @@ fn check_types(
         }
         match node {
             Expression::Insert(insert) => {
-                check_insert_assignments(dialect, stmt, insert, schema_map, strict, &mut errors);
+                check_insert_assignments(
+                    dialect,
+                    stmt,
+                    insert,
+                    resolver_schema,
+                    schema_map,
+                    strict,
+                    &mut errors,
+                );
             }
             Expression::Update(update) => {
-                check_update_assignments(stmt, update, schema_map, strict, &mut errors);
+                check_update_assignments(
+                    stmt,
+                    update,
+                    resolver_schema,
+                    schema_map,
+                    strict,
+                    &mut errors,
+                );
             }
             Expression::Union(union) => {
                 check_set_operation_compatibility(
@@ -2540,6 +2489,32 @@ fn check_types(
             }
             Expression::In(in_expr) => {
                 let this_family = infer_expression_type_family(&in_expr.this, schema_map, &context);
+                if let Some(outputs) = in_expr
+                    .query
+                    .as_ref()
+                    .and_then(|query| projection_families(query, schema_map, dialect))
+                {
+                    let left = crate::scope::scope_query(&in_expr.this);
+                    let width = match left {
+                        Expression::Tuple(tuple) => tuple.expressions.len(),
+                        Expression::Function(f) if f.name.eq_ignore_ascii_case("ROW") => {
+                            f.args.len()
+                        }
+                        // A composite value may match a single composite output or a row.
+                        _ if this_family == TypeFamily::Struct => continue,
+                        _ => 1,
+                    };
+                    let possible_composite = width > 1
+                        && matches!(
+                            outputs.as_slice(),
+                            [TypeFamily::Struct | TypeFamily::Unknown]
+                        );
+                    if width != outputs.len() && !possible_composite {
+                        errors.push(type_issue(strict, validation_codes::E_INCOMPATIBLE_COMPARISON_TYPES,
+                            validation_codes::W_IMPLICIT_CAST_COMPARISON,
+                            format!("IN compares {width} column(s) with a subquery returning {} column(s)", outputs.len())));
+                    }
+                }
                 for value in &in_expr.expressions {
                     let item_family = infer_expression_type_family(value, schema_map, &context);
                     if !are_comparable(this_family, item_family) {
@@ -2956,6 +2931,20 @@ fn source_has_column(
 ) -> bool {
     let strategy = get_normalization_strategy(Some(dialect));
     let expected = normalize_identifier(column.clone(), strategy).name;
+    if let Some(Expression::Table(table)) =
+        scope.sources.get(source).map(|source| &source.expression)
+    {
+        if table.column_aliases.is_empty() {
+            // MappingSchema has already normalized each declared physical column.
+            let expected = crate::schema::normalize_name(
+                &crate::binding::identifier_name(column),
+                Some(dialect),
+                false,
+                true,
+            );
+            return columns.iter().any(|name| name == "*" || *name == expected);
+        }
+    }
     columns.iter().any(|name| {
         if name == "*" {
             return true;
@@ -3388,7 +3377,6 @@ fn order_by_validation_columns(
 fn validate_scope_columns(
     scope: &crate::scope::Scope,
     ancestors: &[&crate::scope::Scope],
-    schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
     options: ReferenceValidationOptions,
 ) -> Vec<ValidationError> {
@@ -3453,15 +3441,53 @@ fn validate_scope_columns(
         .flat_map(|join| join.using.iter().map(|id| lower(&id.name)))
         .collect();
 
-    let input_columns = walk_in_scope(&expression, false).filter_map(|node| match node {
-        Expression::Column(column) => Some((column.as_ref(), OutputNameResolution::InputOnly)),
-        _ => None,
-    });
+    let mut input_columns = Vec::new();
+    for node in crate::scope::walk_in_scope_pruned(&expression, false, |node| {
+        matches!(node, Expression::Pivot(_) | Expression::Unpivot(_))
+    }) {
+        let (source, operands) = match node {
+            Expression::Column(column) => {
+                input_columns.push((column.as_ref(), OutputNameResolution::InputOnly));
+                continue;
+            }
+            Expression::Pivot(pivot) => (
+                &pivot.this,
+                pivot
+                    .expressions
+                    .iter()
+                    .chain(&pivot.fields)
+                    .chain(&pivot.using)
+                    .chain(pivot.group.as_deref())
+                    .chain(pivot.default_on_null.as_deref())
+                    .cloned()
+                    .collect(),
+            ),
+            Expression::Unpivot(unpivot) => (&unpivot.this, unpivot.columns.clone()),
+            _ => continue,
+        };
+        // The operator can read only its own input relation. Resolve these
+        // operands like projections on that relation, including its CTE bindings.
+        let mut input = crate::expressions::Select::new();
+        input.expressions = operands;
+        input.from = Some(crate::expressions::From {
+            expressions: vec![source.clone()],
+        });
+        let input = crate::scope::build_scope_with_ctes(
+            &Expression::Select(Box::new(input)),
+            &scope.cte_sources,
+        );
+        errors.extend(validate_scope_columns(
+            &input,
+            &[],
+            resolver_schema,
+            options,
+        ));
+    }
     let order_columns = order_by
         .as_ref()
         .into_iter()
         .flat_map(|order| order_by_validation_columns(order, dialect));
-    for (column, resolution) in input_columns.chain(order_columns) {
+    for (column, resolution) in input_columns.into_iter().chain(order_columns) {
         let output_matches =
             if resolution != OutputNameResolution::InputOnly && column.table.is_none() {
                 let name = normalize_identifier(column.name.clone(), strategy).name;
@@ -3560,10 +3586,9 @@ fn validate_scope_columns(
             // the query has actual sources or an enclosing query context.
             if scope.sources.is_empty()
                 && ancestors.is_empty()
-                && (schema_map.is_empty()
-                    || schema_map
-                        .values()
-                        .any(|table| table.columns.contains_key(&name)))
+                && (resolver_schema.is_empty()
+                    || resolver_schema
+                        .contains_column(&crate::binding::identifier_name(&column.name)))
             {
                 continue;
             }
@@ -3594,7 +3619,6 @@ fn validate_scope_columns(
 fn validate_scope_tree(
     scope: &crate::scope::Scope,
     ancestors: &[&crate::scope::Scope],
-    schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
     options: ReferenceValidationOptions,
     errors: &mut Vec<ValidationError>,
@@ -3628,7 +3652,6 @@ fn validate_scope_tree(
         validate_scope_tree(
             child,
             lateral_ancestors.as_deref().unwrap_or(ancestors),
-            schema_map,
             resolver_schema,
             options,
             &mut child_errors,
@@ -3642,7 +3665,6 @@ fn validate_scope_tree(
         validate_scope_tree(
             child,
             &outer,
-            schema_map,
             resolver_schema,
             options,
             &mut child_errors,
@@ -3668,29 +3690,46 @@ fn validate_scope_tree(
                 .keys()
                 .any(|name| name.eq_ignore_ascii_case(&table.name.name));
         if !is_cte {
-            validate_schema_table(table, schema_map, options.strict, errors);
+            validate_schema_table(table, resolver_schema, options.strict, errors);
         }
     }
     errors.extend(validate_scope_columns(
         &selected,
         ancestors,
-        schema_map,
         resolver_schema,
         options,
     ));
     errors.extend(child_errors);
 }
 
-fn validate_schema_table(
+fn validate_target_column(
+    schema: &MappingSchema,
     table: &TableRef,
-    schema_map: &HashMap<String, TableSchemaEntry>,
+    column: &crate::expressions::Identifier,
     strict: bool,
     errors: &mut Vec<ValidationError>,
 ) {
-    if !table_ref_candidates(table)
-        .iter()
-        .any(|key| schema_map.contains_key(key))
-    {
+    let name = crate::binding::schema_table_name(table);
+    if schema.missing_column(&name, &crate::binding::identifier_name(column)) {
+        errors.push(reference_diagnostic(
+            format!(
+                "Unknown column '{}' in table '{}'",
+                column.name, table.name.name
+            ),
+            validation_codes::E_UNKNOWN_COLUMN,
+            strict,
+            column.span,
+        ));
+    }
+}
+
+fn validate_schema_table(
+    table: &TableRef,
+    resolver_schema: &MappingSchema,
+    strict: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !resolver_schema.contains_table(&crate::binding::schema_table_name(table)) {
         errors.push(reference_diagnostic(
             format!("Unknown table '{}'", table_ref_display_name(table)),
             validation_codes::E_UNKNOWN_TABLE,
@@ -3702,7 +3741,6 @@ fn validate_schema_table(
 
 fn validate_statement_with_schema(
     stmt: &Expression,
-    schema_map: &HashMap<String, TableSchemaEntry>,
     resolver_schema: &MappingSchema,
     options: ReferenceValidationOptions,
     bindings: &mut ProjectionAliasBindings,
@@ -3714,15 +3752,7 @@ fn validate_statement_with_schema(
         if let Some(select) = crate::binding::dml_scope(expression) {
             let query = Expression::Select(Box::new(select));
             let scope = build_scope(&query);
-            validate_scope_tree(
-                &scope,
-                &[],
-                schema_map,
-                resolver_schema,
-                options,
-                &mut errors,
-                bindings,
-            );
+            validate_scope_tree(&scope, &[], resolver_schema, options, &mut errors, bindings);
             let target_columns = match expression {
                 Expression::Insert(insert) => {
                     Some((&insert.table, insert.columns.iter().collect::<Vec<_>>()))
@@ -3734,23 +3764,14 @@ fn validate_statement_with_schema(
                 _ => None,
             };
             if let Some((table, columns)) = target_columns {
-                if let Some((_, entry)) = resolve_table_schema_entry(table, schema_map) {
-                    for column in columns {
-                        if !entry.columns.is_empty()
-                            && !entry.columns.contains_key("*")
-                            && !entry.columns.contains_key(&lower(&column.name))
-                        {
-                            errors.push(reference_diagnostic(
-                                format!(
-                                    "Unknown column '{}' in table '{}'",
-                                    column.name, table.name.name
-                                ),
-                                validation_codes::E_UNKNOWN_COLUMN,
-                                options.strict,
-                                column.span,
-                            ));
-                        }
-                    }
+                for column in columns {
+                    validate_target_column(
+                        resolver_schema,
+                        table,
+                        column,
+                        options.strict,
+                        &mut errors,
+                    );
                 }
             }
             if let Expression::Insert(insert) = expression {
@@ -3782,7 +3803,6 @@ fn validate_statement_with_schema(
                     validate_scope_tree(
                         &source,
                         &[&outer],
-                        schema_map,
                         resolver_schema,
                         options,
                         &mut errors,
@@ -3799,9 +3819,7 @@ fn validate_statement_with_schema(
                     },
                     _ => None,
                 };
-                if let Some((table, (_, entry))) = target.and_then(|table| {
-                    resolve_table_schema_entry(table, schema_map).map(|entry| (table, entry))
-                }) {
+                if let Some(table) = target {
                     if let Some(whens) = &merge.whens {
                         for node in whens.dfs() {
                             let Expression::When(when) = node else {
@@ -3834,20 +3852,13 @@ fn validate_statement_with_schema(
                                     Expression::Column(column) => &column.name,
                                     _ => continue,
                                 };
-                                if !entry.columns.is_empty()
-                                    && !entry.columns.contains_key("*")
-                                    && !entry.columns.contains_key(&lower(&identifier.name))
-                                {
-                                    errors.push(reference_diagnostic(
-                                        format!(
-                                            "Unknown column '{}' in table '{}'",
-                                            identifier.name, table.name.name
-                                        ),
-                                        validation_codes::E_UNKNOWN_COLUMN,
-                                        options.strict,
-                                        identifier.span,
-                                    ));
-                                }
+                                validate_target_column(
+                                    resolver_schema,
+                                    table,
+                                    identifier,
+                                    options.strict,
+                                    &mut errors,
+                                );
                             }
                         }
                     }
@@ -3863,15 +3874,7 @@ fn validate_statement_with_schema(
                 | Expression::Except(_)
         ) {
             let scope = build_scope(expression);
-            validate_scope_tree(
-                &scope,
-                &[],
-                schema_map,
-                resolver_schema,
-                options,
-                &mut errors,
-                bindings,
-            );
+            validate_scope_tree(&scope, &[], resolver_schema, options, &mut errors, bindings);
         } else {
             // DDL may declare a new table; only its query inputs are references.
             if let Expression::CreateTable(create) = expression {
@@ -3879,12 +3882,12 @@ fn validate_statement_with_schema(
                     pending.push(query);
                 }
                 if let Some(source) = &create.clone_source {
-                    validate_schema_table(source, schema_map, options.strict, &mut errors);
+                    validate_schema_table(source, resolver_schema, options.strict, &mut errors);
                 }
                 continue;
             }
             if let Expression::Table(table) = expression {
-                validate_schema_table(table, schema_map, options.strict, &mut errors);
+                validate_schema_table(table, resolver_schema, options.strict, &mut errors);
             }
             pending.extend(expression.children().into_iter().rev());
         }
@@ -3947,7 +3950,6 @@ pub fn validate_with_schema(
         let mut bindings = ProjectionAliasBindings::new();
         all_errors.extend(validate_statement_with_schema(
             &statement,
-            &schema_map,
             &resolver_schema,
             ReferenceValidationOptions {
                 dialect,
@@ -3965,10 +3967,8 @@ pub fn validate_with_schema(
                 matches!(
                     node,
                     Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
-                )
-            }) && statement
-                .dfs()
-                .any(|node| matches!(node, Expression::Star(_)))
+                ) || matches!(node, Expression::In(predicate) if predicate.query.is_some())
+            }) && statement.dfs().any(projection_wildcard)
             {
                 if let Ok(qualified) = crate::optimizer::qualify_schema_aware_expression(
                     statement.clone(),
@@ -3985,6 +3985,7 @@ pub fn validate_with_schema(
             all_errors.extend(check_types(
                 stmt,
                 dialect,
+                &resolver_schema,
                 &schema_map,
                 effective_function_catalog,
                 strict,

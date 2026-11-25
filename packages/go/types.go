@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.14.0"
+const sdkVersion = "0.14.4"
 
 func Version() string {
 	return sdkVersion
@@ -287,6 +287,7 @@ const (
 	ColumnUseOrder              ColumnUseContext = "order"
 	ColumnUseAggregateOrder     ColumnUseContext = "aggregate_order"
 	ColumnUseSetOperationFilter ColumnUseContext = "set_operation_filter"
+	ColumnUseTableFunctionInput ColumnUseContext = "table_function_input"
 )
 
 // ColumnUseFact groups references by their containing expression. Paths identify

@@ -312,6 +312,29 @@ impl DialectType {
                 | DialectType::Spark
         )
     }
+
+    /// Whether `/` between two integers truncates in this dialect (`7 / 2` is 3).
+    /// Elsewhere `/` divides fractionally (`7 / 2` is 3.5).
+    pub(crate) const fn truncates_integer_division(self) -> bool {
+        matches!(
+            self,
+            DialectType::SQLite
+                | DialectType::PostgreSQL
+                | DialectType::Redshift
+                | DialectType::Materialize
+                | DialectType::RisingWave
+                | DialectType::TSQL
+                | DialectType::Fabric
+                | DialectType::Teradata
+                | DialectType::Drill
+                | DialectType::Dremio
+                | DialectType::DataFusion
+                | DialectType::Presto
+                | DialectType::Trino
+                | DialectType::Athena
+                | DialectType::Dune
+        )
+    }
 }
 
 impl Default for DialectType {
@@ -891,7 +914,7 @@ where
     // semantics even though all physical children are visible to traversal APIs.
     fn uses_generated_dispatch(expression: &Expression) -> bool {
         match expression {
-            Expression::CreateTable(_) => true,
+            Expression::CreateTable(_) | Expression::Explain(_) => true,
             Expression::Select(select) => {
                 select.joins.is_empty()
                     && select.with.is_none()
@@ -4124,6 +4147,15 @@ impl Dialect {
         sql: &str,
         complexity_guard: ComplexityGuardOptions,
     ) -> Result<Vec<Expression>> {
+        self.parse_tracking_placeholders(sql, complexity_guard, false)
+    }
+
+    fn parse_tracking_placeholders(
+        &self,
+        sql: &str,
+        complexity_guard: ComplexityGuardOptions,
+        track: bool,
+    ) -> Result<Vec<Expression>> {
         enforce_input(sql, &complexity_guard)?;
         let source: Arc<str> = Arc::from(sql);
         let (tokens, token_guard_stats) = self.tokenizer.tokenize_for_parser(&source)?;
@@ -4133,6 +4165,7 @@ impl Dialect {
             ..Default::default()
         };
         let mut parser = Parser::with_parser_tokens(tokens, token_guard_stats, config, source);
+        parser.track_placeholder_positions = track;
         parser.parse()
     }
 
@@ -4690,7 +4723,10 @@ impl Dialect {
         {
             self.reject_pgvector_distance_operators_for_sqlite(sql)?;
         }
-        let expressions = self.parse_with_guard(sql, opts.complexity_guard)?;
+        let track = self.dialect_type == DialectType::DuckDB
+            && target == DialectType::SQLite
+            && sql.contains('?');
+        let expressions = self.parse_tracking_placeholders(sql, opts.complexity_guard, track)?;
         let generic_identity =
             self.dialect_type == DialectType::Generic && target == DialectType::Generic;
 
@@ -4707,6 +4743,7 @@ impl Dialect {
         expressions
             .into_iter()
             .map(|expr| {
+                let expr = if track { normalization::sqlite_placeholder_indices(expr)? } else { expr };
                 // Reject unsupported source semantics before normalization can
                 // erase them. This AST-only pass shares conversion decisions with
                 // the generator and never renders throwaway SQL.
@@ -4734,6 +4771,12 @@ impl Dialect {
                     expr,
                     self.dialect_type,
                     target,
+                )?;
+                let expr = normalization::duckdb::prepare_bigquery_conversion(
+                    expr,
+                    self.dialect_type,
+                    target,
+                    matches!(opts.unsupported_level, UnsupportedLevel::Raise | UnsupportedLevel::Immediate),
                 )?;
                 // DuckDB source: normalize VARCHAR/CHAR to TEXT (DuckDB doesn't support
                 // VARCHAR length constraints). This emulates Python sqlglot's DuckDB parser
@@ -5255,6 +5298,7 @@ impl Dialect {
                             // Build COUNT_BIG(...) as an AggregateFunction
                             let args = if c.star {
                                 vec![Expression::Star(crate::expressions::Star {
+                                    ilike: None,
                                     table: None,
                                     except: None,
                                     replace: None,
@@ -10806,6 +10850,7 @@ impl Dialect {
 
         // Outer: SELECT ARRAY_AGG(*) FROM (inner_subquery)
         let star = Expression::Star(Star {
+            ilike: None,
             table: None,
             except: None,
             replace: None,

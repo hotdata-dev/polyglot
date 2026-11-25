@@ -1,5 +1,34 @@
 [
   {
+    "source": "snowflake",
+    "target": "duckdb",
+    "sql": "SELECT DATE_PART(NANOSECOND, CAST('2026-01-06 11:45:00.123456789' AS TIMESTAMPNTZ))",
+    "upstream_expected": "SELECT CAST(STRFTIME(CAST(CAST('2026-01-06 11:45:00.123456789' AS TIMESTAMP) AS TIMESTAMP_NS), '%n') AS BIGINT)",
+    "reason": "Snowflake TIMESTAMP_NTZ defaults to nanosecond precision. SQLGlot's intermediate DuckDB TIMESTAMP cast truncates .123456789 before extracting nanoseconds, producing 123456000 instead of 123456789. Verified with local SQLGlot and DuckDB 2.0 while fixing timestamp type compatibility (#544); do not assert this precision-losing upstream expectation. https://docs.snowflake.com/en/sql-reference/data-types-datetime"
+  },
+  {
+    "source": "snowflake",
+    "target": "duckdb",
+    "sql": "SELECT EXTRACT(NANOSECOND FROM CAST('2026-01-06 11:45:00.123456789' AS TIMESTAMP_NTZ))",
+    "upstream_expected": "SELECT CAST(STRFTIME(CAST(CAST('2026-01-06 11:45:00.123456789' AS TIMESTAMP) AS TIMESTAMP_NS), '%n') AS BIGINT)",
+    "reason": "Snowflake TIMESTAMP_NTZ defaults to nanosecond precision. SQLGlot's intermediate DuckDB TIMESTAMP cast truncates .123456789 before extracting nanoseconds, producing 123456000 instead of 123456789. Verified with local SQLGlot and DuckDB 2.0 while fixing timestamp type compatibility (#544); do not assert this precision-losing upstream expectation. https://docs.snowflake.com/en/sql-reference/data-types-datetime"
+  },
+  {
+    "source": "snowflake",
+    "target": "duckdb",
+    "sql": "WITH t AS (SELECT PARSE_JSON('{\"c\": [{\"r\": {\"d\": 1}}]}') AS v), s AS (SELECT 0 AS x) SELECT t.v:c[s.x]:r:d::varchar FROM t, s",
+    "upstream_expected": "WITH t AS (SELECT JSON('{\"c\": [{\"r\": {\"d\": 1}}]}') AS v), s AS (SELECT 0 AS x) SELECT CAST((t.v -> '$.c')[s.x] -> '$.r.d' AS TEXT) FROM t, s",
+    "vendor_expected": "WITH t AS (SELECT JSON('{\"c\": [{\"r\": {\"d\": 1}}]}') AS v), s AS (SELECT 0 AS x) SELECT CAST((t.v -> '$.c')[s.x] -> '$.r.d' ->> '$' AS TEXT) FROM t, s",
+    "reason": "The upstream fixture's numeric value still gives the correct result, but explicit Snowflake JSON-to-text casts now use JSON_EXTRACT_STRING to also handle strings and JSON null correctly (issue #543). Keep testing this equivalent numeric case with the corrected general cast translation. https://docs.snowflake.com/en/user-guide/querying-semistructured"
+  },
+  {
+    "source": "snowflake",
+    "target": "duckdb",
+    "sql": "OBJECT_CONSTRUCT('a', b, 'c', d)",
+    "upstream_expected": "{'a': b, 'c': d}",
+    "reason": "Snowflake OBJECT_CONSTRUCT omits pairs whose key or value is SQL NULL; the upstream DuckDB struct retains fields when b or d is NULL (issue #542). Verified with local SQLGlot and DuckDB 2.0. https://docs.snowflake.com/en/sql-reference/functions/object_construct"
+  },
+  {
     "source": "generic",
     "target": "mysql",
     "sql": "SELECT * FROM t QUALIFY COUNT(*) OVER () > 1",
@@ -809,5 +838,13 @@
     "upstream_expected": "CAST(x AS BIGNUMERIC)",
     "reason": "Trino DECIMAL(p,s) constrains precision and scale; an unparameterized BigQuery BIGNUMERIC cast does not retain these rounding/overflow checks. https://trino.io/docs/current/language/types.html#decimal https://cloud.google.com/bigquery/docs/reference/standard-sql/data-types#parameterized_data_types",
     "vendor_error": "Wide decimal casts require precision and scale enforcement"
+  },
+  {
+    "source": "generic",
+    "target": "spark",
+    "sql": "DATE_TRUNC('DAY', x)",
+    "upstream_expected": "TRUNC(x, 'DAY')",
+    "reason": "Spark's TRUNC takes only YEAR, QUARTER, MONTH and WEEK and returns NULL for DAY; DATE_TRUNC supports DAY/DD and finer timestamp units and returns NULL for unsupported units. https://spark.apache.org/docs/latest/api/sql/index.html#trunc https://spark.apache.org/docs/latest/api/sql/index.html#date_trunc",
+    "vendor_expected": "DATE_TRUNC('DAY', x)"
   }
 ]
