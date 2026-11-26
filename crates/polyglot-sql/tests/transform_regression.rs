@@ -500,11 +500,10 @@ fn transform_recursive_applies_ordered_wrapper_transform() {
 }
 
 #[test]
-fn transform_recursive_preserves_ordered_original_when_wrapper_transform_errors() {
+fn transform_recursive_propagates_ordered_wrapper_transform_errors() {
     let expr = parse_one("SELECT * FROM a ORDER BY x NULLS LAST");
-    let original_sql = expr.sql();
 
-    let transformed = transform_recursive(expr, &|node| match node {
+    let err = transform_recursive(expr, &|node| match node {
         Expression::Ordered(_) => Err(polyglot_sql::Error::Parse {
             message: "ordered wrapper failure".to_string(),
             line: 0,
@@ -514,9 +513,66 @@ fn transform_recursive_preserves_ordered_original_when_wrapper_transform_errors(
         }),
         other => Ok(other),
     })
-    .expect("ordered wrapper failure should fall back to original");
+    .expect_err("ordered wrapper failure should be returned");
 
-    assert_eq!(transformed.sql(), original_sql);
+    assert!(err.to_string().contains("ordered wrapper failure"));
+}
+
+#[test]
+fn transform_recursive_propagates_order_by_child_transform_errors() {
+    for sql in [
+        "SELECT * FROM a ORDER BY 1",
+        "SELECT * FROM a UNION SELECT * FROM b ORDER BY 1",
+        "SELECT * FROM a INTERSECT SELECT * FROM b ORDER BY 1",
+        "SELECT * FROM a EXCEPT SELECT * FROM b ORDER BY 1",
+        "SELECT SUM(x) OVER (ORDER BY 1) FROM a",
+        "SELECT * FROM a WINDOW w AS (ORDER BY 1)",
+        "SELECT STRING_AGG(x, ',' ORDER BY 1) FROM a",
+        "SELECT STRING_AGG(x, ',') WITHIN GROUP (ORDER BY 1) FROM a",
+    ] {
+        let expr = parse_one(sql);
+        let err = transform_recursive(expr, &|node| match node {
+            Expression::Literal(_) => Err(polyglot_sql::Error::Parse {
+                message: "literal transform failure".to_string(),
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            }),
+            other => Ok(other),
+        })
+        .expect_err(sql);
+        assert!(
+            err.to_string().contains("literal transform failure"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn transform_recursive_propagates_case_and_update_set_transform_errors() {
+    for sql in [
+        "SELECT CASE WHEN x = 1 THEN y END FROM a",
+        "SELECT CASE WHEN x THEN 2 END FROM a",
+        "UPDATE a SET x = 1",
+    ] {
+        let expr = parse_one(sql);
+        let err = transform_recursive(expr, &|node| match node {
+            Expression::Literal(_) => Err(polyglot_sql::Error::Parse {
+                message: "literal transform failure".to_string(),
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            }),
+            other => Ok(other),
+        })
+        .expect_err(sql);
+        assert!(
+            err.to_string().contains("literal transform failure"),
+            "{sql}"
+        );
+    }
 }
 
 #[test]

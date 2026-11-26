@@ -1182,11 +1182,11 @@ where
         .expressions
         .into_iter()
         .map(|mut ordered| {
-            let original = ordered.this.clone();
-            ordered.this = transform_recursive(ordered.this, transform_fn).unwrap_or(original);
+            ordered.this = transform_recursive(ordered.this, transform_fn)?;
             match transform_fn(Expression::Ordered(Box::new(ordered.clone()))) {
                 Ok(Expression::Ordered(transformed)) => Ok(*transformed),
-                Ok(_) | Err(_) => Ok(ordered),
+                Ok(_) => Ok(ordered),
+                Err(e) => Err(e),
             }
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1378,15 +1378,15 @@ where
                     .into_iter()
                     .map(|o| {
                         let mut o = o;
-                        let original = o.this.clone();
-                        o.this = transform_recursive(o.this, transform_fn).unwrap_or(original);
+                        o.this = transform_recursive(o.this, transform_fn)?;
                         // Also apply transform to the Ordered wrapper itself (for NULLS FIRST etc.)
                         match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
-                            Ok(Expression::Ordered(transformed)) => *transformed,
-                            Ok(_) | Err(_) => o,
+                            Ok(Expression::Ordered(transformed)) => Ok(*transformed),
+                            Ok(_) => Ok(o),
+                            Err(e) => Err(e),
                         }
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 select.order_by = Some(order);
             }
 
@@ -1397,14 +1397,14 @@ where
                         .into_iter()
                         .map(|o| {
                             let mut o = o;
-                            let original = o.this.clone();
-                            o.this = transform_recursive(o.this, transform_fn).unwrap_or(original);
+                            o.this = transform_recursive(o.this, transform_fn)?;
                             match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
-                                Ok(Expression::Ordered(transformed)) => *transformed,
-                                Ok(_) | Err(_) => o,
+                                Ok(Expression::Ordered(transformed)) => Ok(*transformed),
+                                Ok(_) => Ok(o),
+                                Err(e) => Err(e),
                             }
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>>>()?;
                 }
             }
 
@@ -1771,11 +1771,11 @@ where
                 .whens
                 .into_iter()
                 .map(|(cond, then)| {
-                    let new_cond = transform_recursive(cond.clone(), transform_fn).unwrap_or(cond);
-                    let new_then = transform_recursive(then.clone(), transform_fn).unwrap_or(then);
-                    (new_cond, new_then)
+                    let new_cond = transform_recursive(cond, transform_fn)?;
+                    let new_then = transform_recursive(then, transform_fn)?;
+                    Ok((new_cond, new_then))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             if let Some(else_expr) = c.else_ {
                 c.else_ = Some(transform_recursive(else_expr, transform_fn)?);
             }
@@ -1858,14 +1858,14 @@ where
                     .into_iter()
                     .map(|o| {
                         let mut o = o;
-                        let original = o.this.clone();
-                        o.this = transform_recursive(o.this, transform_fn).unwrap_or(original);
+                        o.this = transform_recursive(o.this, transform_fn)?;
                         match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
-                            Ok(Expression::Ordered(transformed)) => *transformed,
-                            Ok(_) | Err(_) => o,
+                            Ok(Expression::Ordered(transformed)) => Ok(*transformed),
+                            Ok(_) => Ok(o),
+                            Err(e) => Err(e),
                         }
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 u.order_by = Some(order);
             }
             if let Some(mut with) = u.with.take() {
@@ -1892,14 +1892,14 @@ where
                     .into_iter()
                     .map(|o| {
                         let mut o = o;
-                        let original = o.this.clone();
-                        o.this = transform_recursive(o.this, transform_fn).unwrap_or(original);
+                        o.this = transform_recursive(o.this, transform_fn)?;
                         match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
-                            Ok(Expression::Ordered(transformed)) => *transformed,
-                            Ok(_) | Err(_) => o,
+                            Ok(Expression::Ordered(transformed)) => Ok(*transformed),
+                            Ok(_) => Ok(o),
+                            Err(e) => Err(e),
                         }
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 i.order_by = Some(order);
             }
             if let Some(mut with) = i.with.take() {
@@ -1926,14 +1926,14 @@ where
                     .into_iter()
                     .map(|o| {
                         let mut o = o;
-                        let original = o.this.clone();
-                        o.this = transform_recursive(o.this, transform_fn).unwrap_or(original);
+                        o.this = transform_recursive(o.this, transform_fn)?;
                         match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
-                            Ok(Expression::Ordered(transformed)) => *transformed,
-                            Ok(_) | Err(_) => o,
+                            Ok(Expression::Ordered(transformed)) => Ok(*transformed),
+                            Ok(_) => Ok(o),
+                            Err(e) => Err(e),
                         }
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 e.order_by = Some(order);
             }
             if let Some(mut with) = e.with.take() {
@@ -1998,10 +1998,10 @@ where
                 .set
                 .into_iter()
                 .map(|(id, val)| {
-                    let new_val = transform_recursive(val.clone(), transform_fn).unwrap_or(val);
-                    (id, new_val)
+                    let new_val = transform_recursive(val, transform_fn)?;
+                    Ok((id, new_val))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             upd.assignments = upd
                 .assignments
                 .into_iter()
@@ -2194,12 +2194,11 @@ where
                     order_by
                         .into_iter()
                         .map(|mut ordered| {
-                            let original = ordered.this.clone();
-                            ordered.this =
-                                transform_recursive(ordered.this, transform_fn).unwrap_or(original);
+                            ordered.this = transform_recursive(ordered.this, transform_fn)?;
                             match transform_fn(Expression::Ordered(Box::new(ordered.clone()))) {
                                 Ok(Expression::Ordered(transformed)) => Ok(*transformed),
-                                Ok(_) | Err(_) => Ok(ordered),
+                                Ok(_) => Ok(ordered),
+                                Err(e) => Err(e),
                             }
                         })
                         .collect::<Result<Vec<_>>>()?,
@@ -2463,14 +2462,14 @@ where
                 .order_by
                 .into_iter()
                 .map(|mut o| {
-                    let original = o.this.clone();
-                    o.this = transform_recursive(o.this, transform_fn).unwrap_or(original);
+                    o.this = transform_recursive(o.this, transform_fn)?;
                     match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
-                        Ok(Expression::Ordered(transformed)) => *transformed,
-                        Ok(_) | Err(_) => o,
+                        Ok(Expression::Ordered(transformed)) => Ok(*transformed),
+                        Ok(_) => Ok(o),
+                        Err(e) => Err(e),
                     }
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             Expression::WithinGroup(wg)
         }
 
