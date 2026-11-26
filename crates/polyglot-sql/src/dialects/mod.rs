@@ -1768,11 +1768,11 @@ where
                 .whens
                 .into_iter()
                 .map(|(cond, then)| {
-                    let new_cond = transform_recursive(cond.clone(), transform_fn).unwrap_or(cond);
-                    let new_then = transform_recursive(then.clone(), transform_fn).unwrap_or(then);
-                    (new_cond, new_then)
+                    let new_cond = transform_recursive(cond, transform_fn)?;
+                    let new_then = transform_recursive(then, transform_fn)?;
+                    Ok((new_cond, new_then))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             if let Some(else_expr) = c.else_ {
                 c.else_ = Some(transform_recursive(else_expr, transform_fn)?);
             }
@@ -1992,10 +1992,10 @@ where
                 .set
                 .into_iter()
                 .map(|(id, val)| {
-                    let new_val = transform_recursive(val.clone(), transform_fn).unwrap_or(val);
-                    (id, new_val)
+                    let new_val = transform_recursive(val, transform_fn)?;
+                    Ok((id, new_val))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             upd.assignments = upd
                 .assignments
                 .into_iter()

@@ -551,6 +551,32 @@ fn transform_recursive_propagates_order_by_child_transform_errors() {
 }
 
 #[test]
+fn transform_recursive_propagates_case_and_update_set_transform_errors() {
+    for sql in [
+        "SELECT CASE WHEN x = 1 THEN y END FROM a",
+        "SELECT CASE WHEN x THEN 2 END FROM a",
+        "UPDATE a SET x = 1",
+    ] {
+        let expr = parse_one(sql);
+        let err = transform_recursive(expr, &|node| match node {
+            Expression::Literal(_) => Err(polyglot_sql::Error::Parse {
+                message: "literal transform failure".to_string(),
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            }),
+            other => Ok(other),
+        })
+        .expect_err(sql);
+        assert!(
+            err.to_string().contains("literal transform failure"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn transform_recursive_propagates_cte_child_transform_errors() {
     let expr = parse_one("WITH cte AS (SELECT 1) SELECT * FROM cte");
 
