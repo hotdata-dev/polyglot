@@ -520,6 +520,37 @@ fn transform_recursive_preserves_ordered_original_when_wrapper_transform_errors(
 }
 
 #[test]
+fn transform_recursive_propagates_order_by_child_transform_errors() {
+    for sql in [
+        "SELECT * FROM a ORDER BY 1",
+        "SELECT * FROM a UNION SELECT * FROM b ORDER BY 1",
+        "SELECT * FROM a INTERSECT SELECT * FROM b ORDER BY 1",
+        "SELECT * FROM a EXCEPT SELECT * FROM b ORDER BY 1",
+        "SELECT SUM(x) OVER (ORDER BY 1) FROM a",
+        "SELECT * FROM a WINDOW w AS (ORDER BY 1)",
+        "SELECT STRING_AGG(x, ',' ORDER BY 1) FROM a",
+        "SELECT STRING_AGG(x, ',') WITHIN GROUP (ORDER BY 1) FROM a",
+    ] {
+        let expr = parse_one(sql);
+        let err = transform_recursive(expr, &|node| match node {
+            Expression::Literal(_) => Err(polyglot_sql::Error::Parse {
+                message: "literal transform failure".to_string(),
+                line: 0,
+                column: 0,
+                start: 0,
+                end: 0,
+            }),
+            other => Ok(other),
+        })
+        .expect_err(sql);
+        assert!(
+            err.to_string().contains("literal transform failure"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn transform_recursive_propagates_cte_child_transform_errors() {
     let expr = parse_one("WITH cte AS (SELECT 1) SELECT * FROM cte");
 
