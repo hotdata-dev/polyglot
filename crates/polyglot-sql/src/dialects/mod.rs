@@ -1185,7 +1185,8 @@ where
             ordered.this = transform_recursive(ordered.this, transform_fn)?;
             match transform_fn(Expression::Ordered(Box::new(ordered.clone()))) {
                 Ok(Expression::Ordered(transformed)) => Ok(*transformed),
-                Ok(_) | Err(_) => Ok(ordered),
+                Ok(_) => Ok(ordered),
+                Err(e) => Err(e),
             }
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1381,7 +1382,8 @@ where
                         // Also apply transform to the Ordered wrapper itself (for NULLS FIRST etc.)
                         match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
                             Ok(Expression::Ordered(transformed)) => Ok(*transformed),
-                            Ok(_) | Err(_) => Ok(o),
+                            Ok(_) => Ok(o),
+                            Err(e) => Err(e),
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1398,7 +1400,8 @@ where
                             o.this = transform_recursive(o.this, transform_fn)?;
                             match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
                                 Ok(Expression::Ordered(transformed)) => Ok(*transformed),
-                                Ok(_) | Err(_) => Ok(o),
+                                Ok(_) => Ok(o),
+                                Err(e) => Err(e),
                             }
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -1858,7 +1861,8 @@ where
                         o.this = transform_recursive(o.this, transform_fn)?;
                         match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
                             Ok(Expression::Ordered(transformed)) => Ok(*transformed),
-                            Ok(_) | Err(_) => Ok(o),
+                            Ok(_) => Ok(o),
+                            Err(e) => Err(e),
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1891,7 +1895,8 @@ where
                         o.this = transform_recursive(o.this, transform_fn)?;
                         match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
                             Ok(Expression::Ordered(transformed)) => Ok(*transformed),
-                            Ok(_) | Err(_) => Ok(o),
+                            Ok(_) => Ok(o),
+                            Err(e) => Err(e),
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1924,7 +1929,8 @@ where
                         o.this = transform_recursive(o.this, transform_fn)?;
                         match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
                             Ok(Expression::Ordered(transformed)) => Ok(*transformed),
-                            Ok(_) | Err(_) => Ok(o),
+                            Ok(_) => Ok(o),
+                            Err(e) => Err(e),
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -2191,7 +2197,8 @@ where
                             ordered.this = transform_recursive(ordered.this, transform_fn)?;
                             match transform_fn(Expression::Ordered(Box::new(ordered.clone()))) {
                                 Ok(Expression::Ordered(transformed)) => Ok(*transformed),
-                                Ok(_) | Err(_) => Ok(ordered),
+                                Ok(_) => Ok(ordered),
+                                Err(e) => Err(e),
                             }
                         })
                         .collect::<Result<Vec<_>>>()?,
@@ -2458,7 +2465,8 @@ where
                     o.this = transform_recursive(o.this, transform_fn)?;
                     match transform_fn(Expression::Ordered(Box::new(o.clone()))) {
                         Ok(Expression::Ordered(transformed)) => Ok(*transformed),
-                        Ok(_) | Err(_) => Ok(o),
+                        Ok(_) => Ok(o),
+                        Err(e) => Err(e),
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;

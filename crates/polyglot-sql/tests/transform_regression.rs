@@ -500,11 +500,10 @@ fn transform_recursive_applies_ordered_wrapper_transform() {
 }
 
 #[test]
-fn transform_recursive_preserves_ordered_original_when_wrapper_transform_errors() {
+fn transform_recursive_propagates_ordered_wrapper_transform_errors() {
     let expr = parse_one("SELECT * FROM a ORDER BY x NULLS LAST");
-    let original_sql = expr.sql();
 
-    let transformed = transform_recursive(expr, &|node| match node {
+    let err = transform_recursive(expr, &|node| match node {
         Expression::Ordered(_) => Err(polyglot_sql::Error::Parse {
             message: "ordered wrapper failure".to_string(),
             line: 0,
@@ -514,9 +513,9 @@ fn transform_recursive_preserves_ordered_original_when_wrapper_transform_errors(
         }),
         other => Ok(other),
     })
-    .expect("ordered wrapper failure should fall back to original");
+    .expect_err("ordered wrapper failure should be returned");
 
-    assert_eq!(transformed.sql(), original_sql);
+    assert!(err.to_string().contains("ordered wrapper failure"));
 }
 
 #[test]
