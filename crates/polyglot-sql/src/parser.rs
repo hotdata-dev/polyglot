@@ -61853,7 +61853,21 @@ impl Parser {
         let start = self.current;
         self.skip(); // consume {
 
-        if !(self.is_identifier_token() || self.is_safe_keyword_as_identifier()) {
+        // ClickHouse takes any word as a parameter name, a reserved one too:
+        // `{from:DateTime}`, `{limit:UInt32}`. Such a word is a name here only
+        // when the `:` follows it; a string, as in the map `{'from': 1}`, is not.
+        let word = |text: &str| {
+            let mut chars = text.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        let reserved_name = !self.is_at_end()
+            && !self.check(TokenType::String)
+            && self.check_next(TokenType::Colon)
+            && word(self.peek_text());
+        if !(self.is_identifier_token() || self.is_safe_keyword_as_identifier() || reserved_name) {
             self.current = start;
             return Ok(None);
         }
